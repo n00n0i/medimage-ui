@@ -4,6 +4,7 @@ import TrainModel from './pages/TrainModel'
 import Datasets from './pages/Datasets'
 import Projects from './pages/Projects'
 import Jobs from './pages/Jobs'
+import Models from './pages/Models'
 import RayCluster from './pages/RayCluster'
 import Storage from './pages/Storage'
 import Sidebar from './components/Sidebar'
@@ -35,6 +36,7 @@ export default function App() {
             <Route path="/datasets"  element={<Datasets />} />
             <Route path="/train"     element={<TrainModel />} />
             <Route path="/jobs"      element={<Jobs />} />
+            <Route path="/models"    element={<Models />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/ray-cluster" element={<RayCluster />} />
             <Route path="/storage" element={<Storage />} />

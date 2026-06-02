@@ -284,6 +284,24 @@ def get_job(job_id: str):
     return dict(row)
 
 
+class PatchJobRequest(BaseModel):
+    name: str | None = None
+    notes: str | None = None
+
+@app.patch("/api/jobs/{job_id}")
+def patch_job(job_id: str, req: PatchJobRequest):
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if req.name is not None:
+            conn.execute("UPDATE jobs SET name = ? WHERE id = ?", (req.name, job_id))
+        if req.notes is not None:
+            conn.execute("UPDATE jobs SET notes = ? WHERE id = ?", (req.notes, job_id))
+        conn.commit()
+    return {"ok": True}
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str):
     with get_db() as conn:
