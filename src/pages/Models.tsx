@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react'
 
 interface Model {
   id: string
@@ -55,6 +56,7 @@ const TYPE_COLORS: Record<string, string> = {
 }
 
 export default function Models() {
+  const navigate = useNavigate()
   const [models, setModels] = useState<Model[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -280,7 +282,7 @@ export default function Models() {
               </div>
 
               {/* Expanded detail */}
-              {expanded && <ModelExpanded modelId={m.id} onLog={() => openLog(m)} onEdit={() => openEdit(m)} onDelete={() => setDeleteId(m.id)} />}
+              {expanded && <ModelExpanded modelId={m.id} onLog={() => openLog(m)} onEdit={() => openEdit(m)} onDelete={() => setDeleteId(m.id)} onRetrain={() => navigate(`/train?retrain=${m.id}`)} />}
             </div>
           )
         })}
@@ -412,11 +414,12 @@ export default function Models() {
 }
 
 // Expanded detail sub-component: fetches full model details when opened
-function ModelExpanded({ modelId, onLog, onEdit, onDelete }: {
+function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
   modelId: string
   onLog: () => void
   onEdit: () => void
   onDelete: () => void
+  onRetrain: () => void
 }) {
   const [detail, setDetail] = useState<ModelDetail | null>(null)
 
@@ -466,6 +469,9 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete }: {
 
       {/* Actions */}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onRetrain}>
+          <RotateCcw size={13} /> Re-train
+        </button>
         <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onLog}>
           <Terminal size={13} /> View Log
         </button>

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-
-import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown } from 'lucide-react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
+import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCcw } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
 type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'export-edge' | 'self-supervised'
@@ -114,6 +114,9 @@ const DATA_TYPE_LABELS: Record<DataType, string> = {
 const STEPS = ['Training Type', 'Data & Target', 'Model', 'Config & Launch']
 
 export default function TrainModel() {
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const [retrainSource, setRetrainSource] = useState<{ id: string; name: string } | null>(null)
   const [step, setStep] = useState(0)
   const [config, setConfig] = useState<TrainingConfig>({
     trainingType: 'classification',
@@ -132,6 +135,32 @@ export default function TrainModel() {
   const [toast, setToast] = useState<{msg: string; type: 'success' | 'error'} | null>(null)
   const [launching, setLaunching] = useState(false)
   const [jobId, setJobId] = useState('')
+
+  // Re-train: detect ?retrain=<jobId>, fetch job, pre-fill config
+  useEffect(() => {
+    const retrainId = searchParams.get('retrain')
+    if (!retrainId) return
+    fetch(`/api/jobs/${retrainId}`)
+      .then(r => r.json())
+      .then(job => {
+        setRetrainSource({ id: job.id, name: job.name })
+        setConfig(prev => ({
+          ...prev,
+          trainingType: (job.training_type as TrainingType) || prev.trainingType,
+          datasetId:    job.project_id || prev.datasetId,
+          model:        job.model_name || prev.model,
+          engine:       job.engine || prev.engine,
+          epochs:       job.epochs || prev.epochs,
+          batchSize:    job.batch_size || prev.batchSize,
+          learningRate: job.learning_rate || prev.learningRate,
+          optimizer:    job.optimizer || prev.optimizer,
+          imgsz:        job.imgsz || prev.imgsz,
+          notes:        job.notes ? `Re-train of: ${job.name}\n${job.notes}` : `Re-train of: ${job.name}`,
+        }))
+        setStep(3)
+      })
+      .catch(() => {})
+  }, [])
 
   // Fetch projects for dataset dropdown
   const [projects, setProjects] = useState<Array<{id: number; name: string}>>([])
@@ -549,6 +578,31 @@ export default function TrainModel() {
         <div>
           <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>Config & Launch</h2>
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>ตั้งค่า hyperparameters แล้ว launch training ไปที่ Ray cluster</p>
+
+          {/* Re-train banner */}
+          {retrainSource && (
+            <div style={{
+              display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 16px',
+              borderRadius: 10, background: 'var(--warning-dim)', border: '1px solid var(--warning)',
+              marginBottom: 20,
+            }}>
+              <RotateCcw size={16} color="var(--warning)" style={{ flexShrink: 0, marginTop: 1 }} />
+              <div style={{ flex: 1 }}>
+                <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>Re-train mode</p>
+                <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  Config pre-filled จาก <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--warning)' }}>{retrainSource.name}</span>
+                  {' '}— ปรับ hyperparameters ตามต้องการแล้วกด Launch
+                </p>
+              </div>
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ fontSize: 11, flexShrink: 0 }}
+                onClick={() => { setRetrainSource(null); navigate('/train') }}
+              >
+                ✕ Clear
+              </button>
+            </div>
+          )}
 
           {/* Summary */}
           <div className="card mb-6" style={{ background: 'var(--primary-dim)', borderColor: 'var(--primary-border)' }}>
