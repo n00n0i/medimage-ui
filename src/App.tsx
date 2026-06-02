@@ -5,6 +5,7 @@ import Datasets from './pages/Datasets'
 import Projects from './pages/Projects'
 import Jobs from './pages/Jobs'
 import RayCluster from './pages/RayCluster'
+import Storage from './pages/Storage'
 import Sidebar from './components/Sidebar'
 import './index.css'
 
@@ -36,6 +37,7 @@ export default function App() {
             <Route path="/jobs"      element={<Jobs />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/ray-cluster" element={<RayCluster />} />
+            <Route path="/storage" element={<Storage />} />
           </Routes>
         </main>
       </div>

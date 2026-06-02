@@ -1,9 +1,37 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check } from 'lucide-react'
+import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal } from 'lucide-react'
 
 const DEFAULT_RAY_URL = 'http://100.68.53.118:8265'
-const STORAGE_KEY = 'ray_head_url'
-const MAX_HISTORY = 40  // 40 × 10 s ≈ 6.7 min
+const STORAGE_KEY     = 'ray_head_url'
+const MAX_HISTORY     = 40  // 40 × 10 s ≈ 6.7 min
+const SETTINGS_API    = '/api/settings'
+
+// ──────────────── Persistent settings (backend SQLite → localStorage cache) ────
+
+async function loadRayUrl(): Promise<string> {
+  try {
+    const res = await fetch(`${SETTINGS_API}/ray_head_url`)
+    if (res.ok) {
+      const d = await res.json()
+      if (d?.value) {
+        localStorage.setItem(STORAGE_KEY, d.value)
+        return d.value
+      }
+    }
+  } catch { /* backend down — fall through to cache */ }
+  return localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL
+}
+
+async function saveRayUrl(url: string): Promise<void> {
+  localStorage.setItem(STORAGE_KEY, url)   // instant cache
+  try {
+    await fetch(`${SETTINGS_API}/ray_head_url`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: url }),
+    })
+  } catch { /* offline — localStorage is the fallback */ }
+}
 
 // ──────────────── Ray Dashboard REST API types ────────────────
 
@@ -34,7 +62,9 @@ interface RayNodeSummary {
     nodeId: string
     state: string            // "ALIVE" | "DEAD"
     numWorkers: number
-    resourcesTotal?: Record<string, number>  // { CPU: 80, GPU: 2, ... }
+    isHeadNode?: boolean     // Ray API: true on head node
+    resourcesTotal?: Record<string, number>     // { CPU: 80, GPU: 2, ... }
+    resourcesAvailable?: Record<string, number> // free resources
   }
 }
 
@@ -257,6 +287,129 @@ function StatCard({ icon, label, value, sub, accent = false }: {
 
 // ──────────────── Settings modal ─────────────────────────────
 
+// ──────────────── Add Worker tab ─────────────────────────────
+
+const inputStyle: React.CSSProperties = {
+  width: '100%', boxSizing: 'border-box',
+  padding: '7px 10px', borderRadius: 7,
+  border: '1px solid var(--border)',
+  background: 'var(--bg-elevated)',
+  color: 'var(--text-primary)',
+  fontSize: 13, fontFamily: 'var(--font-mono)',
+  outline: 'none',
+}
+
+function AddWorkerTab({ headUrl }: { headUrl: string }) {
+  const headHost = (() => {
+    try { return new URL(headUrl).hostname } catch { return headUrl.replace(/https?:\/\//, '').split(':')[0] }
+  })()
+
+  const [cpus, setCpus]       = useState('8')
+  const [gpus, setGpus]       = useState('0')
+  const [block, setBlock]     = useState(true)
+  const [copied, setCopied]   = useState(false)
+
+  const cpuFlag  = cpus.trim()  ? ` --num-cpus=${cpus.trim()}`  : ''
+  const gpuFlag  = gpus.trim() !== '0' && gpus.trim() ? ` --num-gpus=${gpus.trim()}` : ''
+  const blockFlag = block ? ' --block' : ''
+  const cmd = `ray start --address=${headHost}:6379${cpuFlag}${gpuFlag}${blockFlag}`
+
+  const copy = async () => {
+    await navigator.clipboard.writeText(cmd)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <div>
+      {/* Prerequisites note */}
+      <div style={{
+        padding: '8px 12px', borderRadius: 7, marginBottom: 16,
+        background: 'color-mix(in oklch, var(--primary) 8%, transparent)',
+        border: '1px solid color-mix(in oklch, var(--primary) 20%, transparent)',
+        fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6,
+      }}>
+        Worker must have <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--primary)' }}>ray</code> installed
+        and network access to <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--primary)' }}>{headHost}:6379</code> (GCS port).
+      </div>
+
+      {/* Resource inputs */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+        <div>
+          <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 5 }}>CPUs</label>
+          <input
+            type="number" min={1} max={256} value={cpus}
+            onChange={e => setCpus(e.target.value)}
+            style={inputStyle}
+          />
+        </div>
+        <div>
+          <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 5 }}>GPUs</label>
+          <input
+            type="number" min={0} max={32} value={gpus}
+            onChange={e => setGpus(e.target.value)}
+            style={inputStyle}
+          />
+        </div>
+      </div>
+
+      {/* --block toggle */}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
+        <input type="checkbox" checked={block} onChange={e => setBlock(e.target.checked)}
+          style={{ accentColor: 'var(--primary)', width: 14, height: 14 }} />
+        <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+          <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--primary)' }}>--block</code>
+          {' '}(keep process in foreground / systemd/screen)
+        </span>
+      </label>
+
+      {/* Generated command */}
+      <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+        <Terminal size={11} style={{ display: 'inline', marginRight: 4, verticalAlign: 'middle' }} />
+        Command to run on worker machine
+      </label>
+      <div style={{ position: 'relative' }}>
+        <pre style={{
+          margin: 0, padding: '10px 44px 10px 12px',
+          borderRadius: 7, border: '1px solid var(--border)',
+          background: 'var(--bg-elevated)',
+          fontSize: 12, fontFamily: 'var(--font-mono)',
+          color: 'var(--text-primary)',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+          lineHeight: 1.6,
+        }}>{cmd}</pre>
+        <button
+          onClick={copy}
+          style={{
+            position: 'absolute', top: 8, right: 8,
+            background: copied
+              ? 'color-mix(in oklch, var(--success) 15%, transparent)'
+              : 'color-mix(in oklch, var(--primary) 10%, transparent)',
+            border: `1px solid ${copied ? 'color-mix(in oklch, var(--success) 30%, transparent)' : 'var(--border)'}`,
+            borderRadius: 5, padding: '3px 8px',
+            cursor: 'pointer', fontSize: 11,
+            color: copied ? 'var(--success)' : 'var(--text-secondary)',
+            display: 'flex', alignItems: 'center', gap: 4,
+            transition: 'all 0.2s ease',
+          }}
+        >
+          {copied ? <Check size={11} /> : <Copy size={11} />}
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+
+      {/* Step list */}
+      <ol style={{ margin: '14px 0 0', padding: '0 0 0 18px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 2 }}>
+        <li>SSH into the worker machine</li>
+        <li>Run the command above (as the same user that has <code style={{ fontFamily: 'var(--font-mono)' }}>ray</code> in PATH)</li>
+        <li>Refresh this page — node appears in the list within ~15 s</li>
+      </ol>
+    </div>
+  )
+}
+
+// ──────────────── Settings modal ─────────────────────────────
+
 function SettingsModal({
   currentUrl, onSave, onClose,
 }: {
@@ -264,14 +417,29 @@ function SettingsModal({
   onSave: (url: string) => void
   onClose: () => void
 }) {
+  const [tab, setTab]     = useState<'head' | 'worker'>('head')
   const [value, setValue] = useState(currentUrl)
+  const [saving, setSaving] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => { inputRef.current?.focus() }, [])
+  useEffect(() => { if (tab === 'head') inputRef.current?.focus() }, [tab])
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const trimmed = value.trim().replace(/\/$/, '')
-    if (trimmed) onSave(trimmed)
+    if (!trimmed) return
+    setSaving(true)
+    await saveRayUrl(trimmed)
+    setSaving(false)
+    onSave(trimmed)
   }
+
+  const tabBtn = (active: boolean): React.CSSProperties => ({
+    flex: 1, padding: '7px 0', fontSize: 12, fontWeight: active ? 600 : 400,
+    background: active ? 'var(--bg-card)' : 'transparent',
+    border: 'none', borderRadius: 6,
+    color: active ? 'var(--text-primary)' : 'var(--text-muted)',
+    cursor: 'pointer', transition: 'all 0.15s',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+  })
 
   return (
     <div style={{
@@ -281,47 +449,70 @@ function SettingsModal({
     }} onClick={onClose}>
       <div style={{
         background: 'var(--bg-card)', border: '1px solid var(--border)',
-        borderRadius: 12, padding: 24, width: 420, maxWidth: '90vw',
+        borderRadius: 12, padding: 24, width: 520, maxWidth: '94vw',
+        maxHeight: '90vh', overflowY: 'auto',
         boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
       }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>Ray Head Configuration</h3>
+
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>Cluster Configuration</h3>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 4 }}>
             <X size={16} />
           </button>
         </div>
 
-        <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
-          Ray Dashboard URL
-        </label>
-        <input
-          ref={inputRef}
-          type="text"
-          value={value}
-          onChange={e => setValue(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') handleSave(); if (e.key === 'Escape') onClose() }}
-          placeholder="http://100.68.x.x:8265"
-          style={{
-            width: '100%', boxSizing: 'border-box',
-            padding: '8px 12px', borderRadius: 7,
-            border: '1px solid var(--border)',
-            background: 'var(--bg-elevated)',
-            color: 'var(--text-primary)',
-            fontSize: 13, fontFamily: 'var(--font-mono)',
-            outline: 'none',
-          }}
-        />
-        <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>
-          Port 8265 (Ray Dashboard). Saved to localStorage.
-        </p>
-
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 20 }}>
-          <button className="btn btn-secondary btn-sm" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary btn-sm" onClick={handleSave}
-            style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <Check size={13} /> Save
+        {/* Tab bar */}
+        <div style={{
+          display: 'flex', gap: 4, padding: 4, borderRadius: 8, marginBottom: 20,
+          background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+        }}>
+          <button style={tabBtn(tab === 'head')} onClick={() => setTab('head')}>
+            <Settings size={12} /> Head URL
+          </button>
+          <button style={tabBtn(tab === 'worker')} onClick={() => setTab('worker')}>
+            <Plus size={12} /> Add Worker Node
           </button>
         </div>
+
+        {/* Tab: Head URL */}
+        {tab === 'head' && (
+          <>
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+              Ray Dashboard URL
+            </label>
+            <input
+              ref={inputRef}
+              type="text"
+              value={value}
+              onChange={e => setValue(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleSave(); if (e.key === 'Escape') onClose() }}
+              placeholder="http://100.68.x.x:8265"
+              style={inputStyle}
+            />
+            <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>
+              Port 8265 (Ray Dashboard). Persisted to SQLite via backend; localStorage used as cache.
+            </p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 20 }}>
+              <button className="btn btn-secondary btn-sm" onClick={onClose} disabled={saving}>Cancel</button>
+              <button className="btn btn-primary btn-sm" onClick={handleSave} disabled={saving}
+                style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                {saving ? <RefreshCw size={12} className="animate-spin" /> : <Check size={13} />}
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* Tab: Add Worker Node */}
+        {tab === 'worker' && (
+          <>
+            <AddWorkerTab headUrl={currentUrl} />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 20 }}>
+              <button className="btn btn-secondary btn-sm" onClick={onClose}>Close</button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
@@ -330,6 +521,7 @@ function SettingsModal({
 // ──────────────── component ───────────────────────────────────
 
 export default function RayCluster() {
+  // Init synchronously from localStorage cache; async override from backend on mount
   const [rayUrl, setRayUrl] = useState<string>(
     () => localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL
   )
@@ -343,6 +535,13 @@ export default function RayCluster() {
   const [showSettings, setShowSettings] = useState(false)
   const historyRef = useRef<MetricPoint[]>([])
   const [history, setHistory] = useState<MetricPoint[]>([])
+
+  // Load authoritative URL from backend on mount
+  useEffect(() => {
+    loadRayUrl().then(url => {
+      if (url !== (localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL)) setRayUrl(url)
+    })
+  }, [])
 
   const fetchData = useCallback(async (manual = false) => {
     if (manual) setRefreshing(true)
@@ -395,7 +594,6 @@ export default function RayCluster() {
   }, [fetchData, rayUrl])
 
   const handleSaveUrl = (url: string) => {
-    localStorage.setItem(STORAGE_KEY, url)
     setRayUrl(url)
     setShowSettings(false)
   }
@@ -410,6 +608,13 @@ export default function RayCluster() {
   const aliveNodes = nodes.filter(n => n.raylet?.state === 'ALIVE').length
   const isConnected = !error && result !== null
   const pythonVersion = extractPythonVersion(nodes)
+
+  // Identify head node by isHeadNode flag or IP match against configured URL
+  const headIp = (() => {
+    try { return new URL(rayUrl).hostname } catch { return rayUrl.replace(/https?:\/\//, '').split(':')[0] }
+  })()
+  const isHead = (node: RayNodeSummary) =>
+    node.raylet?.isHeadNode === true || node.ip === headIp
 
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 240 }}>
@@ -597,19 +802,33 @@ export default function RayCluster() {
           {/* Node list */}
           {nodes.length > 0 && (
             <div className="card">
-              <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 14 }}>
-                Nodes{' '}
-                <span style={{ color: 'var(--text-muted)', fontWeight: 400, fontSize: 12 }}>({nodes.length})</span>
-              </h3>
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 14 }}>
+                <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+                  Nodes{' '}
+                  <span style={{ color: 'var(--text-muted)', fontWeight: 400, fontSize: 12 }}>({nodes.length})</span>
+                </h3>
+                {aliveNodes === 1 && (
+                  <span style={{
+                    fontSize: 11,
+                    padding: '2px 10px', borderRadius: 20,
+                    background: 'color-mix(in oklch, var(--warning) 10%, transparent)',
+                    border: '1px solid color-mix(in oklch, var(--warning) 25%, transparent)',
+                    color: 'var(--warning)',
+                  }}>
+                    Head only · no workers connected
+                  </span>
+                )}
+              </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {nodes.map((node) => {
                   const alive = node.raylet?.state === 'ALIVE'
                   const gpuCount = node.gpus?.length ?? 0
+                  const head = isHead(node)
                   return (
                     <div key={node.raylet?.nodeId ?? node.ip} style={{
                       padding: '12px 14px', borderRadius: 8,
                       background: 'var(--bg-elevated)',
-                      border: '1px solid var(--border)',
+                      border: `1px solid ${head ? 'color-mix(in oklch, var(--primary) 30%, var(--border))' : 'var(--border)'}`,
                     }}>
                       {/* Node header row */}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: gpuCount > 0 ? 10 : 8 }}>
@@ -617,6 +836,21 @@ export default function RayCluster() {
                           width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
                           background: alive ? 'var(--success)' : 'var(--danger)',
                         }} />
+                        {/* HEAD / WORKER badge */}
+                        <span style={{
+                          fontSize: 10, fontWeight: 600, padding: '1px 7px', borderRadius: 4,
+                          letterSpacing: '0.04em',
+                          background: head
+                            ? 'color-mix(in oklch, var(--primary) 15%, transparent)'
+                            : 'color-mix(in oklch, var(--accent) 10%, transparent)',
+                          color: head ? 'var(--primary)' : 'var(--accent)',
+                          border: `1px solid ${head
+                            ? 'color-mix(in oklch, var(--primary) 30%, transparent)'
+                            : 'color-mix(in oklch, var(--accent) 20%, transparent)'}`,
+                          flexShrink: 0,
+                        }}>
+                          {head ? 'HEAD' : 'WORKER'}
+                        </span>
                         <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
                           {node.hostname}
                         </span>
@@ -669,6 +903,16 @@ export default function RayCluster() {
               </div>
             </div>
           )}
+
+          {/* Add Worker Node card */}
+          <div className="card" style={{ marginTop: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+              <Plus size={14} style={{ color: 'var(--accent)' }} />
+              <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>Add Worker Node</h3>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>— join this cluster via Ray</span>
+            </div>
+            <AddWorkerTab headUrl={rayUrl} />
+          </div>
         </>
       )}
     </div>

@@ -5,9 +5,10 @@ import tailwindcss from '@tailwindcss/vite'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const BACKEND_URL = env.BACKEND_URL || 'http://localhost:8000'
-  const LS_URL      = env.LS_URL      || 'http://100.68.221.236:8080'
-  const SYNC_URL    = env.SYNC_URL    || 'http://100.68.221.236:8084'
+  const LS_URL      = env.LS_URL      || 'http://localhost:8085'
+  const SYNC_URL    = env.SYNC_URL    || 'http://localhost:8084'
   const RAY_URL     = env.RAY_URL     || 'http://100.68.53.118:8265'
+  const MINIO_URL   = env.MINIO_URL   || 'http://localhost:9000'
 
   return {
   plugins: [
@@ -35,6 +36,12 @@ export default defineConfig(({ mode }) => {
         target: SYNC_URL,
         changeOrigin: true,
         rewrite: (path: string) => path.replace(/^\/api\/sync\/(\d+)\/?$/, '/sync/$1'),
+      },
+      // MinIO S3 API — must come before generic /api catch-all
+      '/api/minio': {
+        target: MINIO_URL,
+        changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/api\/minio/, ''),
       },
       // Backend API (projects, jobs, cluster, train …)
       '/api': {

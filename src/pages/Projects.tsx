@@ -1,579 +1,704 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import axios from 'axios'
+import { listBuckets, createBucket as s3CreateBucket } from '../lib/minioClient'
 import {
   FolderSync, Plus, RefreshCw, ChevronDown, ChevronUp,
   Database, ExternalLink, CheckCircle2, XCircle, AlertCircle,
-  Clock, HardDrive, ArrowRight, Loader2, Image
+  Clock, Loader2, HardDrive, Trash2, ImageIcon, Layers,
 } from 'lucide-react'
 
-const LS_API = '/api/ls'
-const LS_TOKEN = '160d2644f4d45f84cd09f8931d20891e52f5e4cf'
+const LS_API   = '/api/ls'
+const LS_TOKEN = 'medimage-ls-token-2026'
+const LS_BASE  = 'http://localhost:8085'
 
-interface Storage {
+async function fetchLSCreds(): Promise<{ email: string; password: string } | null> {
+  try {
+    const r = await fetch('/api/ls-config')
+    if (!r.ok) return null
+    return await r.json()
+  } catch { return null }
+}
+
+function deriveBucket(title: string, fallback: string) {
+  return title.replace(/-bucket$/i, '').toLowerCase() || fallback
+}
+
+interface RawStorage {
   id: number
   title: string
   bucket: string
   prefix: string
   status: string
   last_sync: string | null
-  last_sync_count: number
+  last_sync_count: number | null
 }
+interface Storage extends RawStorage { derivedBucket: string }
 
 interface Project {
   id: number
   title: string
-  ls_url?: string
   storages: Storage[]
+  uniqueStorages: Storage[]
   taskCount: number
-  storageIds: number[]
   lastSync: string | null
-  status: string
+  syncStatus: string
 }
 
 interface Toast { id: number; msg: string; type: 'success' | 'error' | 'info' }
 
-// ─── Status Badge ───────────────────────────────────────────────
 function StatusBadge({ status }: { status: string }) {
-  const cfg: Record<string, { cls: string; icon: React.ReactNode; label: string }> = {
-    completed: { cls: 'badge badge-success', icon: <CheckCircle2 size={11} />, label: 'Completed' },
-    failed:    { cls: 'badge badge-danger',  icon: <XCircle size={11} />,       label: 'Failed' },
+  const map: Record<string, { cls: string; icon: React.ReactNode; label: string }> = {
+    completed: { cls: 'badge badge-success', icon: <CheckCircle2 size={11} />, label: 'Synced'  },
+    failed:    { cls: 'badge badge-danger',  icon: <XCircle size={11} />,      label: 'Failed'  },
     started:   { cls: 'badge badge-warning', icon: <Loader2 size={11} className="animate-spin" />, label: 'Syncing' },
-    unknown:   { cls: 'badge badge-neutral', icon: <AlertCircle size={11} />,   label: 'Unknown' },
+    unknown:   { cls: 'badge badge-neutral', icon: <AlertCircle size={11} />,  label: 'No sync' },
   }
-  const c = cfg[status] || cfg.unknown
-  return (
-    <span className={c.cls}>
-      {c.icon}
-      {c.label}
-    </span>
-  )
+  const c = map[status] ?? map.unknown
+  return <span className={c.cls}>{c.icon}{c.label}</span>
 }
 
-// ─── Sync Result Row ─────────────────────────────────────────────
-function SyncResultRow({ sid, label, result }: { sid: number; label: string; result: { status: string; data?: any; msg?: string } | null }) {
-  const ok = result?.status === 'ok'
-  return (
-    <div className="flex items-center justify-between py-2 px-3 rounded-lg bg-[var(--bg-elevated)]">
-      <div className="flex items-center gap-2.5">
-        {ok
-          ? <CheckCircle2 size={15} className="text-[var(--success)] flex-shrink-0" />
-          : <XCircle size={15} className="text-[var(--danger)] flex-shrink-0" />
-        }
-        <div>
-          <div className="text-sm font-medium text-[var(--text-primary)]">{label}</div>
-          <div className="text-xs text-[var(--text-muted)] font-mono">Storage #{sid}</div>
-        </div>
-      </div>
-      {result?.status === 'ok'
-        ? <span className="text-xs text-[var(--success)] font-medium">{result.data?.status ?? 'OK'}</span>
-        : <span className="text-xs text-[var(--danger)]">{result?.msg || 'Error'}</span>
-      }
-    </div>
-  )
-}
-
-// ─── Main Component ──────────────────────────────────────────────
 export default function Projects() {
-  const [projects, setProjects] = useState<Project[]>([])
-  const [loading, setLoading] = useState(true)
-  const [expandedProject, setExpandedProject] = useState<number | null>(null)
-  const [toasts, setToasts] = useState<Toast[]>([])
-  const [showCreate, setShowCreate] = useState(false)
-  const [createForm, setCreateForm] = useState({ name: '', bucket: '', prefix: '' })
-  const [creating, setCreating] = useState(false)
-  const [syncingProject, setSyncingProject] = useState<number | null>(null)
-  const [syncResults, setSyncResults] = useState<Record<number, { status: string; data?: any; msg?: string }>>({})
+  const [projects,    setProjects]    = useState<Project[]>([])
+  const [loading,     setLoading]     = useState(true)
+  const [expanded,    setExpanded]    = useState<number | null>(null)
+  const [toasts,      setToasts]      = useState<Toast[]>([])
+  const [showCreate,  setShowCreate]  = useState(false)
+  const [createForm,  setCreateForm]  = useState({ name: '', prefix: '' })
+  const [creating,    setCreating]    = useState(false)
+  const [syncingId,   setSyncingId]   = useState<number | null>(null)
+  const [syncResults, setSyncResults] = useState<Record<number, { ok: boolean; msg?: string }>>({})
+  const [minioBuckets,    setMinioBuckets]    = useState<string[]>([])
+  const [bucketsLoading,  setBucketsLoading]  = useState(false)
+  const [selectedBuckets, setSelectedBuckets] = useState<string[]>([])
+  const [confirmDelete,   setConfirmDelete]   = useState<Project | null>(null)
+  const [deleting,        setDeleting]        = useState(false)
+  const [newBucketInline, setNewBucketInline] = useState('')
+  const [creatingBucket,  setCreatingBucket]  = useState(false)
 
-  const addToast = (msg: string, type: Toast['type']) => {
+  const openInLS = useCallback(async (projectId: number) => {
+    // Open popup before any await to pass browser popup-blocker check.
+    // Use unique name to avoid cross-origin reuse of a previous ls-N popup.
+    const win = window.open('about:blank', `ls-${projectId}-${Date.now()}`)
+    if (!win) return
+    try {
+      const creds = await fetchLSCreds()
+      if (!creds?.password) {
+        win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
+        return
+      }
+      // Step 1: GET login page via nginx proxy (same-origin) → sets csrftoken cookie for localhost
+      const html = await fetch('/api/ls-login/').then(r => r.text())
+      const csrf = html.match(/name="csrfmiddlewaretoken"\s+value="([^"]+)"/)?.[1]
+      if (!csrf) throw new Error('CSRF not found')
+      // Step 2: POST login via nginx proxy (same-origin) → sets sessionid cookie for localhost
+      // Cookies are host-only for 'localhost' (port-agnostic per RFC 6265),
+      // so sessionid will be sent to localhost:8085 as well.
+      await fetch('/api/ls-login/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          csrfmiddlewaretoken: csrf,
+          email: creds.email,
+          password: creds.password,
+        }).toString(),
+      })
+      // Step 3: Navigate popup to LS — sessionid cookie is valid for all localhost ports
+      win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
+    } catch {
+      win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
+    }
+  }, [])
+
+  const toast = useCallback((msg: string, type: Toast['type']) => {
     const id = Date.now()
     setToasts(t => [...t, { id, msg, type }])
-    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4200)
-  }
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000)
+  }, [])
 
-  useEffect(() => { fetchProjects() }, [])
+  const enrichProject = useCallback(async (id: number, title: string): Promise<Project> => {
+    const [storRes, taskRes] = await Promise.all([
+      axios.get(`${LS_API}/storages/s3?project=${id}`, {
+        headers: { Authorization: `Token ${LS_TOKEN}` },
+      }).catch(() => ({ data: [] })),
+      axios.get(`${LS_API}/tasks?project=${id}&page_size=1`, {
+        headers: { Authorization: `Token ${LS_TOKEN}` },
+      }).catch(() => ({ data: { count: 0 } })),
+    ])
+    const storages: Storage[] = (storRes.data as RawStorage[]).map(s => ({
+      ...s, derivedBucket: deriveBucket(s.title, s.bucket),
+    }))
+    const seen = new Set<string>()
+    const uniqueStorages = storages.filter(s => {
+      if (seen.has(s.derivedBucket)) return false
+      seen.add(s.derivedBucket)
+      return true
+    })
+    return {
+      id, title, storages, uniqueStorages,
+      taskCount:  taskRes.data.count || 0,
+      lastSync:   storages[0]?.last_sync  || null,
+      syncStatus: storages[0]?.status     || 'unknown',
+    }
+  }, [])
 
-  const fetchProjects = async () => {
+  const fetchProjects = useCallback(async () => {
     setLoading(true)
     try {
-      // Get ls_url from backend, then enrich with LS storage/task data
-      const backendRes = await axios.get('/api/projects').catch(() => ({ data: [] }))
-      const backendProjects: any[] = Array.isArray(backendRes.data) ? backendRes.data : (backendRes.data.projects || [])
-
-      const withDetails = await Promise.all(backendProjects.map(async (p: any) => {
-        const [storRes, taskRes] = await Promise.all([
-          axios.get(`${LS_API}/storages/s3?project=${p.id}`, {
-            headers: { Authorization: `Token ${LS_TOKEN}` },
-          }).catch(() => ({ data: [] })),
-          axios.get(`${LS_API}/tasks?project=${p.id}&page_size=1`, {
-            headers: { Authorization: `Token ${LS_TOKEN}` },
-          }).catch(() => ({ data: { count: 0 } })),
-        ])
-        const storages = storRes.data
-        const taskCount = taskRes.data.count || 0
-        return {
-          id: p.id,
-          title: p.name,
-          ls_url: p.ls_url || `http://100.68.221.236:8080/projects/${p.id}/settings`,
-          storages,
-          taskCount,
-          storageIds: storages.map((s: any) => s.id),
-          lastSync: storages[0]?.last_sync || null,
-          status: storages[0]?.status || 'unknown',
-        }
-      }))
-
-      if (withDetails.length === 0) {
-        const [storRes, taskRes] = await Promise.all([
-          axios.get(`${LS_API}/storages/s3?project=1`, {
-            headers: { Authorization: `Token ${LS_TOKEN}` },
-          }).catch(() => ({ data: [] })),
-          axios.get(`${LS_API}/tasks?project=1&page_size=1`, {
-            headers: { Authorization: `Token ${LS_TOKEN}` },
-          }).catch(() => ({ data: { count: 0 } })),
-        ])
-        const storages = storRes.data
-        withDetails.push({
-          id: 1, title: 'Project 1', ls_url: 'http://100.68.221.236:8080/projects/1/settings', storages, taskCount: taskRes.data.count || 0,
-          storageIds: storages.map((s: any) => s.id),
-          lastSync: storages[0]?.last_sync || null,
-          status: storages[0]?.status || 'unknown',
-        })
-      }
-
-      setProjects(withDetails)
+      const lsRes = await axios.get(`${LS_API}/projects/`, {
+        headers: { Authorization: `Token ${LS_TOKEN}` },
+      })
+      const raw: any[] = lsRes.data?.results ?? (Array.isArray(lsRes.data) ? lsRes.data : [])
+      const list: Project[] = await Promise.all(
+        raw.map((p: any) => enrichProject(p.id, p.title || `Project ${p.id}`))
+      )
+      setProjects(list)
     } catch (e: any) {
-      addToast(`Error: ${e.message}`, 'error')
+      toast(`Error loading projects: ${e.message}`, 'error')
     } finally {
       setLoading(false)
     }
-  }
+  }, [enrichProject, toast])
 
-  const triggerSyncAll = async (project: Project) => {
-    if (project.storageIds.length === 0) {
-      addToast('No storage to sync', 'info')
-      return
-    }
-    setSyncingProject(project.id)
+  useEffect(() => { fetchProjects() }, [fetchProjects])
+
+  async function syncAll(project: Project) {
+    if (project.uniqueStorages.length === 0) { toast('No storage to sync', 'info'); return }
+    setSyncingId(project.id)
     setSyncResults({})
-    const results: Record<number, { status: string; data?: any; msg?: string }> = {}
-
-    for (const sid of project.storageIds) {
+    const res: Record<number, { ok: boolean; msg?: string }> = {}
+    for (const s of project.uniqueStorages) {
       try {
-        const res = await axios.post(`/api/sync/${sid}/`, {}, {
-          headers: { Authorization: `Token ${LS_TOKEN}` },
-        })
-        results[sid] = { status: 'ok', data: res.data }
+        await axios.post(`${LS_API}/storages/s3/${s.id}/sync`, {}, { headers: { Authorization: `Token ${LS_TOKEN}` } })
+        res[s.id] = { ok: true }
       } catch (e: any) {
-        results[sid] = { status: 'error', msg: e.message }
+        res[s.id] = { ok: false, msg: e.message }
       }
-      setSyncResults({ ...results })
+      setSyncResults({ ...res })
     }
-
-    const ok = Object.values(results).filter(r => r.status === 'ok').length
-    const fail = Object.values(results).filter(r => r.status === 'error').length
-    addToast(
-      fail === 0
-        ? `Synced ${ok}/${project.storageIds.length} storage(s) successfully`
-        : `${ok} synced, ${fail} failed`,
+    const ok   = Object.values(res).filter(r => r.ok).length
+    const fail = Object.values(res).filter(r => !r.ok).length
+    toast(
+      fail === 0 ? `Synced ${ok} storage${ok !== 1 ? 's' : ''} ✓` : `${ok} synced · ${fail} failed`,
       fail === 0 ? 'success' : 'error'
     )
-    setSyncingProject(null)
-    setTimeout(fetchProjects, 2500)
+    setSyncingId(null)
+    setTimeout(fetchProjects, 2000)
   }
 
-  const triggerSyncSingle = async (sid: number, label: string) => {
+  async function syncOne(s: Storage) {
     try {
-      await axios.post(`/api/sync/${sid}/`, {}, {
+      await axios.post(`${LS_API}/storages/s3/${s.id}/sync`, {}, { headers: { Authorization: `Token ${LS_TOKEN}` } })
+      toast(`"${s.derivedBucket}" synced ✓`, 'success')
+      setTimeout(fetchProjects, 2000)
+    } catch (e: any) {
+      toast(`Sync failed: ${e.message}`, 'error')
+    }
+  }
+
+  async function handleDelete(project: Project) {
+    setDeleting(true)
+    try {
+      // Delete all S3 storages first
+      for (const s of project.storages) {
+        await axios.delete(`${LS_API}/storages/s3/${s.id}/`, {
+          headers: { Authorization: `Token ${LS_TOKEN}` },
+        }).catch(() => {})
+      }
+      // Delete the project
+      await axios.delete(`${LS_API}/projects/${project.id}/`, {
         headers: { Authorization: `Token ${LS_TOKEN}` },
       })
-      addToast(`Storage "${label}" synced ✓`, 'success')
-      setTimeout(fetchProjects, 2500)
+      toast(`Project "${project.title}" deleted`, 'success')
+      setConfirmDelete(null)
+      setExpanded(null)
+      fetchProjects()
     } catch (e: any) {
-      addToast(`Sync failed: ${e.message}`, 'error')
+      toast('Delete failed: ' + (e.response?.data?.detail || e.message), 'error')
+    } finally {
+      setDeleting(false)
     }
   }
 
-  const handleCreateProject = async () => {
-    const { name, bucket, prefix } = createForm
-    if (!name.trim() || !bucket.trim()) {
-      addToast('Please enter project name and bucket', 'error')
-      return
-    }
+  async function handleCreate() {
+    const { name, prefix } = createForm
+    if (!name.trim() || selectedBuckets.length === 0) { toast('Project name and at least one bucket are required', 'error'); return }
     setCreating(true)
     try {
-      addToast('Creating MinIO bucket...', 'info')
-      await axios.post('http://100.68.221.236:9000/minio/upload/fname', null, {
-        params: { bucket, prefix },
-      }).catch(() => null)
-
-      addToast('Creating Label Studio project...', 'info')
+      toast('Creating Label Studio project…', 'info')
       const projRes = await axios.post(
         `${LS_API}/projects/`,
         { title: name.trim(), organization: 1 },
         { headers: { Authorization: `Token ${LS_TOKEN}`, 'Content-Type': 'application/json' } }
       )
       const newId = projRes.data.id
-
-      addToast('Creating S3 storage...', 'info')
-      await axios.post(
-        `${LS_API}/storages/s3/`,
-        {
-          project: newId,
-          title: name.trim(),
-          bucket,
-          prefix: prefix || '',
-          s3_endpoint: 'http://100.68.221.236:9000',
-          region_name: 'us-east-1',
-          use_blob_urls: true,
-          presign: true,
-        },
-        { headers: { Authorization: `Token ${LS_TOKEN}`, 'Content-Type': 'application/json' } }
-      )
-
-      addToast(`Project "${name}" created successfully`, 'success')
+      toast(`Attaching ${selectedBuckets.length} bucket(s)…`, 'info')
+      for (const bucket of selectedBuckets) {
+        await axios.post(
+          `${LS_API}/storages/s3/`,
+          {
+            project: newId,
+            title:   `${bucket}-bucket`,
+            bucket,  prefix: prefix || '',
+            s3_endpoint: 'http://minio:9000', region_name: 'us-east-1',
+            aws_access_key_id: 'minioadmin', aws_secret_access_key: 'minioadmin',
+            use_blob_urls: true, presign: true,
+          },
+          { headers: { Authorization: `Token ${LS_TOKEN}`, 'Content-Type': 'application/json' } }
+        )
+      }
+      toast(`Project "${name}" created ✓`, 'success')
       setShowCreate(false)
-      setCreateForm({ name: '', bucket: '', prefix: '' })
+      setCreateForm({ name: '', prefix: '' })
+      setSelectedBuckets([])
       setTimeout(fetchProjects, 1000)
     } catch (e: any) {
-      addToast('Error: ' + (e.response?.data?.detail || e.message), 'error')
+      const errDetail = e.response?.data?.detail
+        || (e.response?.data ? JSON.stringify(e.response.data) : null)
+        || e.message
+      toast('Error: ' + errDetail, 'error')
     } finally {
       setCreating(false)
     }
   }
 
-  const formatDate = (d: string | null) =>
-    d ? new Date(d).toLocaleString('th-TH', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'
+  async function handleInlineCreateBucket() {
+    const name = newBucketInline.trim()
+    if (!name) return
+    setCreatingBucket(true)
+    try {
+      await s3CreateBucket(name)
+      setMinioBuckets(prev => [...prev, name])
+      setSelectedBuckets(prev => [...prev, name])
+      setNewBucketInline('')
+    } catch (e: any) {
+      toast('Failed to create bucket: ' + (e?.message ?? 'unknown error'), 'error')
+    } finally {
+      setCreatingBucket(false)
+    }
+  }
 
-  const totalImages = projects.reduce((sum, p) => sum + p.taskCount, 0)
-  const completedSyncs = projects.filter(p => p.status === 'completed').length
+  const fmt = (d: string | null) =>
+    d ? new Date(d).toLocaleString('th-TH', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    }) : '—'
+
+  const totalImages = projects.reduce((s, p) => s + p.taskCount, 0)
+  const syncedCount = projects.filter(p => p.syncStatus === 'completed').length
 
   return (
     <div style={{ maxWidth: '100%' }}>
 
-      {/* ── Header ──────────────────────────────────────────── */}
-      <div className="flex items-start justify-between mb-8">
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24 }}>
         <div>
-          <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>Projects</h1>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>Manage datasets and sync from MinIO storage</p>
+          <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)', letterSpacing: '-0.02em' }}>Projects</h1>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 3 }}>Label Studio annotation projects · synced from MinIO</p>
         </div>
-        <div className="flex gap-3">
-          <button className="btn btn-secondary btn-sm" onClick={fetchProjects}>
-            <RefreshCw size={14} />
-            Refresh
-          </button>
-          <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
-            <Plus size={14} />
-            New Project
-          </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-secondary btn-sm" onClick={fetchProjects}><RefreshCw size={14} />Refresh</button>
+          <button className="btn btn-primary btn-sm" onClick={() => {
+            setShowCreate(true)
+            setSelectedBuckets([])
+            setNewBucketInline('')
+            setMinioBuckets([])
+            setBucketsLoading(true)
+            listBuckets().then(bs => {
+              setMinioBuckets(bs.map(b => b.name))
+            }).catch(() => {}).finally(() => setBucketsLoading(false))
+          }}><Plus size={14} />New Project</button>
         </div>
       </div>
 
-      {/* ── Stat Row ─────────────────────────────────────────── */}
+      {/* Stat cards */}
       {!loading && projects.length > 0 && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+        <div className="grid grid-cols-3 gap-4" style={{ marginBottom: 24 }}>
           <div className="stat-card">
-            <span className="stat-label">Projects</span>
-            <span className="stat-value">{projects.length}</span>
-            <span className="stat-sub">Total projects</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', marginBottom: 6 }}>
+              <Layers size={15} />
+              <span className="stat-label">Projects</span>
+            </div>
+            <div className="stat-value">{projects.length}</div>
           </div>
           <div className="stat-card">
-            <span className="stat-label">Total Images</span>
-            <span className="stat-value">{totalImages.toLocaleString()}</span>
-            <span className="stat-sub">Across all storages</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', marginBottom: 6 }}>
+              <ImageIcon size={15} />
+              <span className="stat-label">Total Images</span>
+            </div>
+            <div className="stat-value">{totalImages.toLocaleString()}</div>
           </div>
           <div className="stat-card">
-            <span className="stat-label">Completed Syncs</span>
-            <span className="stat-value">{completedSyncs}<span style={{fontSize:'14px',fontWeight:500,color:'var(--text-muted)'}}>/{projects.length}</span></span>
-            <span className="stat-sub">Storages synced</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', marginBottom: 6 }}>
+              <CheckCircle2 size={15} />
+              <span className="stat-label">Synced</span>
+            </div>
+            <div className="stat-value">
+              <span style={{ color: syncedCount === projects.length ? 'var(--success)' : 'var(--text-primary)' }}>
+                {syncedCount}
+              </span>
+              <span style={{ fontSize: 16, color: 'var(--text-muted)', fontWeight: 500 }}>/{projects.length}</span>
+            </div>
           </div>
         </div>
       )}
 
-      {/* ── Loading ──────────────────────────────────────────── */}
+      {/* Skeleton */}
       {loading && (
-        <div className="space-y-4">
-          {[1,2,3].map(i => (
-            <div key={i} className="card" style={{padding:'20px'}}>
-              <div className="flex items-center justify-between">
-                <div className="space-y-2 flex-1">
-                  <div className="skeleton h-4 w-48" />
-                  <div className="skeleton h-3 w-32" />
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+          {[1, 2, 3].map(i => (
+            <div key={i} className="card" style={{ padding: '20px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+                <div className="skeleton" style={{ width: 40, height: 40, borderRadius: 10, flexShrink: 0 }} />
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div className="skeleton" style={{ height: 13, width: 160 }} />
+                  <div className="skeleton" style={{ height: 10, width: 80 }} />
                 </div>
-                <div className="skeleton h-9 w-28 rounded-lg" />
               </div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                <div className="skeleton" style={{ height: 22, width: 90, borderRadius: 4 }} />
+                <div className="skeleton" style={{ height: 22, width: 70, borderRadius: 4 }} />
+              </div>
+              <div className="skeleton" style={{ height: 32, borderRadius: 8 }} />
             </div>
           ))}
         </div>
       )}
 
-      {/* ── Project Cards Grid ───────────────────────────────────── */}
+      {/* Project grid */}
       {!loading && projects.length > 0 && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-8">
-          {projects.map(p => (
-            <div key={p.id} className="card flex flex-col" style={{ padding: 0, overflow: 'hidden', minHeight: 160 }}>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+          {projects.map(p => {
+            const isExpanded = expanded === p.id
+            const isSyncing  = syncingId === p.id
+            return (
+              <div key={p.id} className="card" style={{ padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
 
-              {/* Card Header */}
-              <div className="flex items-center justify-between p-5">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
-                    style={{background:'var(--primary-dim)'}}>
-                    <FolderSync size={18} style={{color:'var(--primary)'}} />
-                  </div>
-                  <div className="min-w-0">
-                    <h2 className="text-[var(--text-primary)] font-semibold text-[15px] truncate">
-                      {p.title}
-                    </h2>
-                    <div className="flex items-center gap-3 mt-1">
-                      <span className="flex items-center gap-1 text-xs text-[var(--text-muted)]">
-                        <HardDrive size={11} />
-                        {p.storages.length} storage{p.storages.length !== 1 ? 's' : ''}
-                      </span>
-                      <span className="flex items-center gap-1 text-xs text-[var(--text-muted)]">
-                        <Image size={11} />
-                        {p.taskCount.toLocaleString()} images
-                      </span>
-                      <span className="flex items-center gap-1 text-xs text-[var(--text-muted)]">
-                        <Clock size={11} />
-                        {formatDate(p.lastSync)}
-                      </span>
+                {/* Card header */}
+                <div style={{ padding: '18px 18px 14px' }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, flex: 1 }}>
+                      <div style={{ width: 38, height: 38, borderRadius: 10, flexShrink: 0, background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <FolderSync size={17} style={{ color: 'var(--primary)' }} />
+                      </div>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.title}</div>
+                        <div style={{ marginTop: 4 }}><StatusBadge status={p.syncStatus} /></div>
+                      </div>
+                    </div>
+                    {/* Action icons */}
+                    <div style={{ display: 'flex', gap: 2, flexShrink: 0, marginLeft: 8 }} onClick={e => e.stopPropagation()}>
+                      <button
+                        className="btn-icon"
+                        onClick={() => setConfirmDelete(p)}
+                        data-tooltip="Delete project"
+                        style={{ color: 'var(--danger)', opacity: 0.65 }}
+                      >
+                        <Trash2 size={15} />
+                      </button>
                     </div>
                   </div>
-                </div>
 
-                <div className="flex items-center gap-2 flex-shrink-0 ml-4">
-                  <StatusBadge status={p.status} />
-                  {p.storageIds.length > 0 && (
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={() => triggerSyncAll(p)}
-                      disabled={syncingProject === p.id}
-                    >
-                      {syncingProject === p.id
-                        ? <><Loader2 size={13} className="animate-spin" /> Syncing...</>
-                        : <><FolderSync size={13} /> Sync All ({p.storageIds.length})</>
-                      }
-                    </button>
+                  {/* Bucket chips — 2 column grid */}
+                  {p.uniqueStorages.length > 0 && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, marginBottom: 12 }}>
+                      {p.uniqueStorages.map(s => (
+                        <span key={s.derivedBucket} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--primary-hover)', background: 'var(--primary-dim)', border: '1px solid var(--primary-border)', borderRadius: 4, padding: '3px 8px', overflow: 'hidden', minWidth: 0 }}>
+                          <HardDrive size={9} style={{ flexShrink: 0 }} />
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.derivedBucket}</span>
+                        </span>
+                      ))}
+                    </div>
                   )}
-                  <button
-                    className="btn-icon"
-                    onClick={() => setExpandedProject(expandedProject === p.id ? null : p.id)}
-                    data-tooltip={expandedProject === p.id ? 'Collapse' : 'Show details'}
-                  >
-                    {expandedProject === p.id ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-                  </button>
-                </div>
-              </div>
 
-              {/* Sync Results */}
-              {syncingProject === p.id && Object.keys(syncResults).length > 0 && (
-                <div className="px-5 pb-4 space-y-2">
-                  {p.storageIds.map(sid => {
-                    const s = p.storages.find((s: any) => s.id === sid)
-                    const label = s?.title || s?.bucket || `Storage ${sid}`
-                    return (
-                      <SyncResultRow key={sid} sid={sid} label={label} result={syncResults[sid]} />
-                    )
-                  })}
-                </div>
-              )}
-
-              {/* Expanded Details */}
-              {expandedProject === p.id && (
-                <div className="border-t" style={{borderColor:'var(--border-subtle)'}}>
-                  <div className="p-5">
-                    {p.storages.length === 0 ? (
-                      <div className="text-center py-8">
-                        <Database size={32} className="mx-auto mb-3 opacity-30" />
-                        <p className="text-sm text-[var(--text-muted)]">No storage connected</p>
-                        <p className="text-xs text-[var(--text-muted)] mt-1">
-                          Go to Label Studio to add an S3 storage
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        <table className="data-table">
-                          <thead>
-                            <tr>
-                              <th>Storage</th>
-                              <th>Bucket / Prefix</th>
-                              <th>Status</th>
-                              <th>Synced</th>
-                              <th>Last Sync</th>
-                              <th></th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {p.storages.map((s: any) => (
-                              <tr key={s.id}>
-                                <td>
-                                  <span className="font-medium text-[var(--text-primary)]">
-                                    {s.title || s.bucket}
-                                  </span>
-                                </td>
-                                <td>
-                                  <span className="font-mono text-xs text-[var(--text-muted)]">
-                                    {s.bucket}{s.prefix ? `/${s.prefix}` : ''}
-                                  </span>
-                                </td>
-                                <td><StatusBadge status={s.status} /></td>
-                                <td className="text-xs text-[var(--text-secondary)]">
-                                  {s.last_sync_count?.toLocaleString() ?? '—'}
-                                </td>
-                                <td className="text-xs text-[var(--text-muted)]">
-                                  {formatDate(s.last_sync)}
-                                </td>
-                                <td>
-                                  <button
-                                    className="btn btn-secondary btn-sm"
-                                    onClick={() => triggerSyncSingle(s.id, s.title || s.bucket)}
-                                    disabled={s.status === 'started' || syncingProject !== null}
-                                  >
-                                    {s.status === 'started'
-                                      ? <><Loader2 size={11} className="animate-spin" /> Syncing</>
-                                      : <><RefreshCw size={11} /> Sync</>
-                                    }
-                                  </button>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-
-                        <div className="flex items-center justify-between pt-3 mt-3"
-                          style={{borderTop:'1px solid var(--border-subtle)'}}>
-                          <a
-                            href={p.ls_url || `/ls/projects/${p.id}/settings`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex items-center gap-1.5 text-xs text-[var(--primary)] hover:text-[var(--primary-hover)] transition-colors"
-                          >
-                            <ExternalLink size={12} />
-                            Open Label Studio
-                            <ArrowRight size={11} />
-                          </a>
-                          <span className="text-xs text-[var(--text-muted)]">
-                            Project ID: {p.id}
-                          </span>
+                  {/* Stats row */}
+                  <div style={{ display: 'flex', gap: 20, paddingTop: 12, borderTop: '1px solid var(--border-subtle)' }}>
+                    <div>
+                      <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>{p.taskCount.toLocaleString()}</div>
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>Images</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>{p.uniqueStorages.length}</div>
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>Buckets</div>
+                    </div>
+                    {p.lastSync && (
+                      <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end' }}>
+                          <Clock size={10} />Last sync
                         </div>
+                        <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 3, fontVariantNumeric: 'tabular-nums' }}>{fmt(p.lastSync)}</div>
                       </div>
                     )}
                   </div>
                 </div>
+
+                {/* Sync progress */}
+                {isSyncing && Object.keys(syncResults).length > 0 && (
+                  <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {p.uniqueStorages.map(s => {
+                      const r = syncResults[s.id]
+                      if (!r) return null
+                      return (
+                        <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', borderRadius: 6, background: 'var(--bg-elevated)' }}>
+                          {r.ok
+                            ? <CheckCircle2 size={12} style={{ color: 'var(--success)', flexShrink: 0 }} />
+                            : <XCircle      size={12} style={{ color: 'var(--danger)',  flexShrink: 0 }} />
+                          }
+                          <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>{s.derivedBucket}</span>
+                          <span style={{ fontSize: 11, marginLeft: 'auto', color: r.ok ? 'var(--success)' : 'var(--danger)' }}>{r.ok ? 'OK' : r.msg}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+
+                {/* Footer buttons */}
+                <div style={{ display: 'flex', gap: 8, padding: '12px 16px', marginTop: 'auto', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}>
+                  {p.uniqueStorages.length > 0 && (
+                    <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={() => syncAll(p)} disabled={isSyncing || syncingId !== null}>
+                      {isSyncing
+                        ? <><Loader2 size={12} className="animate-spin" />Syncing…</>
+                        : <><FolderSync size={12} />Sync All</>
+                      }
+                    </button>
+                  )}
+                  <button className="btn btn-secondary btn-sm" style={{ flex: 1 }} onClick={() => openInLS(p.id)}>
+                    <ExternalLink size={12} />Open in LS
+                  </button>
+                  <button
+                    className="btn-icon"
+                    onClick={() => setExpanded(isExpanded ? null : p.id)}
+                    data-tooltip={isExpanded ? 'Hide details' : 'Show details'}
+                    style={{ flexShrink: 0 }}
+                  >
+                    {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                  </button>
+                </div>
+
+                {/* Expanded storage table */}
+                {isExpanded && (
+                  <div style={{ borderTop: '1px solid var(--border-subtle)', padding: '14px 16px' }}>
+                    {p.uniqueStorages.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--text-muted)' }}>
+                        <Database size={24} style={{ margin: '0 auto 8px', opacity: 0.25, display: 'block' }} />
+                        <p style={{ fontSize: 12 }}>No storage connected</p>
+                      </div>
+                    ) : (
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th>Bucket</th>
+                            <th>Status</th>
+                            <th>Synced</th>
+                            <th>Last sync</th>
+                            <th></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {p.uniqueStorages.map(s => (
+                            <tr key={s.derivedBucket}>
+                              <td>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-primary)' }}>{s.derivedBucket}</span>
+                                {s.prefix && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', marginLeft: 5 }}>/{s.prefix}</span>}
+                              </td>
+                              <td><StatusBadge status={s.status} /></td>
+                              <td style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{s.last_sync_count?.toLocaleString() ?? '—'}</td>
+                              <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>{fmt(s.last_sync)}</td>
+                              <td>
+                                <button className="btn btn-secondary btn-sm" onClick={() => syncOne(s)} disabled={s.status === 'started' || syncingId !== null}>
+                                  {s.status === 'started'
+                                    ? <><Loader2 size={11} className="animate-spin" />Syncing</>
+                                    : <><RefreshCw size={11} />Sync</>
+                                  }
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!loading && projects.length === 0 && (
+        <div className="card" style={{ textAlign: 'center', padding: '60px 24px' }}>
+          <div style={{ width: 56, height: 56, borderRadius: 16, background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+            <FolderSync size={24} style={{ color: 'var(--primary)' }} />
+          </div>
+          <h3 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>No projects yet</h3>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', maxWidth: 320, margin: '0 auto 20px' }}>
+            Create a project to start managing annotation datasets and syncing from MinIO.
+          </p>
+          <button className="btn btn-primary" onClick={() => {
+            setShowCreate(true)
+            setSelectedBuckets([])
+            setNewBucketInline('')
+            setMinioBuckets([])
+            setBucketsLoading(true)
+            listBuckets().then(bs => {
+              setMinioBuckets(bs.map(b => b.name))
+            }).catch(() => {}).finally(() => setBucketsLoading(false))
+          }}><Plus size={15} />Create First Project</button>
+        </div>
+      )}
+
+      {/* Confirm delete modal */}
+      {confirmDelete && (
+        <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !deleting) setConfirmDelete(null) }}>
+          <div className="modal" style={{ maxWidth: 420 }}>
+            <div style={{ padding: '24px 24px 20px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+                <div style={{ width: 40, height: 40, borderRadius: 10, background: 'color-mix(in oklch, var(--danger) 15%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <Trash2 size={18} style={{ color: 'var(--danger)' }} />
+                </div>
+                <div>
+                  <h2 style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)' }}>Delete Project</h2>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>This action cannot be undone</p>
+                </div>
+              </div>
+              <p style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                Delete <strong style={{ color: 'var(--text-primary)' }}>{confirmDelete.title}</strong>
+                {confirmDelete.storages.length > 0 && <> and <strong style={{ color: 'var(--text-primary)' }}>{confirmDelete.storages.length} dataset{confirmDelete.storages.length !== 1 ? 's' : ''}</strong> attached to it</>}?
+              </p>
+              {confirmDelete.storages.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
+                  {confirmDelete.uniqueStorages.map(s => (
+                    <span key={s.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--danger)', background: 'color-mix(in oklch, var(--danger) 10%, transparent)', border: '1px solid color-mix(in oklch, var(--danger) 25%, transparent)', borderRadius: 4, padding: '2px 7px' }}>
+                      <HardDrive size={9} />{s.derivedBucket}
+                    </span>
+                  ))}
+                </div>
               )}
             </div>
-          ))}
-        </div>
-      )}
-
-      {/* ── Empty State ──────────────────────────────────────── */}
-      {!loading && projects.length === 0 && (
-        <div className="card text-center py-16">
-          <div className="w-16 h-16 rounded-2xl mx-auto mb-4 flex items-center justify-center"
-            style={{background:'var(--primary-dim)'}}>
-            <FolderSync size={28} style={{color:'var(--primary)'}} />
+            <div style={{ display: 'flex', gap: 10, padding: '14px 24px', borderTop: '1px solid var(--border-subtle)' }}>
+              <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setConfirmDelete(null)} disabled={deleting}>Cancel</button>
+              <button
+                className="btn btn-sm"
+                style={{ flex: 1, background: 'var(--danger)', color: '#fff', border: 'none', borderRadius: 8, fontWeight: 600, cursor: deleting ? 'not-allowed' : 'pointer', opacity: deleting ? 0.7 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                onClick={() => handleDelete(confirmDelete)}
+                disabled={deleting}
+              >
+                {deleting ? <><Loader2 size={13} className="animate-spin" />Deleting…</> : <><Trash2 size={13} />Delete</>}
+              </button>
+            </div>
           </div>
-          <h3 className="text-[var(--text-primary)] font-semibold text-lg mb-2">
-            No projects yet
-          </h3>
-          <p className="text-sm text-[var(--text-muted)] mb-6 max-w-sm mx-auto">
-            Create your first project to start managing datasets and syncing data from MinIO
-          </p>
-          <button className="btn btn-primary" onClick={() => setShowCreate(true)}>
-            <Plus size={15} />
-            Create First Project
-          </button>
         </div>
       )}
 
-      {/* ── Create Project Modal ─────────────────────────────── */}
+      {/* Create modal */}
       {showCreate && (
         <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setShowCreate(false) }}>
           <div className="modal">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-5"
-              style={{borderBottom:'1px solid var(--border-subtle)'}}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '20px 24px', borderBottom: '1px solid var(--border-subtle)' }}>
               <div>
-                <h2 className="text-[var(--text-primary)] font-bold text-lg">New Project</h2>
-                <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                  Creates Label Studio project + S3 storage + MinIO bucket
-                </p>
+                <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)' }}>New Project</h2>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>Creates a Label Studio project with S3 storage</p>
               </div>
-              <button className="btn-icon" onClick={() => setShowCreate(false)}>
-                <XCircle size={18} />
-              </button>
+              <button className="btn-icon" onClick={() => setShowCreate(false)}><XCircle size={18} /></button>
             </div>
-
-            {/* Modal Body */}
-            <div className="px-6 py-5 space-y-4">
+            <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div>
                 <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>Project Name</label>
-                <input
-                  type="text"
-                  placeholder="e.g. CXR Chest X-Ray"
-                  value={createForm.name}
-                  onChange={e => setCreateForm(f => ({...f, name: e.target.value}))}
-                  onKeyDown={e => e.key === 'Enter' && !creating && handleCreateProject()}
-                />
+                <input type="text" placeholder="e.g. CXR Chest X-Ray" value={createForm.name}
+                  onChange={e => setCreateForm(f => ({ ...f, name: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && !creating && handleCreate()} />
               </div>
               <div>
-                <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>MinIO Bucket</label>
-                <input
-                  type="text"
-                  placeholder="e.g. medimage-cxr"
-                  value={createForm.bucket}
-                  onChange={e => setCreateForm(f => ({...f, bucket: e.target.value}))}
-                />
+                <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 8 }}>
+                  MinIO Buckets
+                  <span style={{ fontWeight: 400, marginLeft: 6 }}>(select one or more)</span>
+                </label>
+                {bucketsLoading ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 0', color: 'var(--text-muted)', fontSize: 13 }}>
+                    <Loader2 size={13} className="animate-spin" />Loading buckets…
+                  </div>
+                ) : minioBuckets.length === 0 ? (
+                  <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)', fontSize: 13, color: 'var(--text-muted)' }}>
+                    No buckets found. <a href="/storage" style={{ color: 'var(--primary)' }}>Create one on Storage page</a>.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    {minioBuckets.map(b => {
+                      const sel = selectedBuckets.includes(b)
+                      return (
+                        <button
+                          key={b}
+                          type="button"
+                          onClick={() => setSelectedBuckets(prev =>
+                            sel ? prev.filter(x => x !== b) : [...prev, b]
+                          )}
+                          style={{
+                            display: 'inline-flex', alignItems: 'center', gap: 6,
+                            fontSize: 12, fontFamily: 'var(--font-mono)',
+                            padding: '5px 11px', borderRadius: 6, cursor: 'pointer',
+                            border: sel ? '1.5px solid var(--primary)' : '1px solid var(--border-default)',
+                            background: sel ? 'var(--primary-dim)' : 'var(--bg-elevated)',
+                            color: sel ? 'var(--primary-hover)' : 'var(--text-secondary)',
+                            transition: 'all 0.15s',
+                          }}
+                        >
+                          <HardDrive size={11} />{b}
+                          {sel && <CheckCircle2 size={11} style={{ marginLeft: 2 }} />}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+                {/* Inline new bucket creation */}
+                <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    placeholder="new-bucket-name"
+                    value={newBucketInline}
+                    onChange={e => setNewBucketInline(e.target.value.toLowerCase().replace(/[^a-z0-9.-]/g, '-'))}
+                    onKeyDown={async e => {
+                      if (e.key === 'Enter' && newBucketInline.trim() && !creatingBucket) {
+                        e.preventDefault()
+                        await handleInlineCreateBucket()
+                      }
+                    }}
+                    style={{ flex: 1, fontSize: 12, fontFamily: 'var(--font-mono)' }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    disabled={!newBucketInline.trim() || creatingBucket}
+                    onClick={handleInlineCreateBucket}
+                    style={{ flexShrink: 0, whiteSpace: 'nowrap' }}
+                  >
+                    {creatingBucket ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                    New Bucket
+                  </button>
+                </div>
               </div>
               <div>
                 <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>Prefix <span style={{ fontWeight: 400 }}>(optional)</span></label>
-                <input
-                  type="text"
-                  placeholder="e.g. images/"
-                  value={createForm.prefix}
-                  onChange={e => setCreateForm(f => ({...f, prefix: e.target.value}))}
-                />
-              </div>
-
-              {/* Info note */}
-              <div className="flex gap-2.5 p-3 rounded-lg" style={{background:'var(--bg-elevated)',border:'1px solid var(--border-subtle)'}}>
-                <AlertCircle size={14} style={{ color: 'var(--warning)', flexShrink: 0, marginTop: 2 }} />
-                <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
-                  Make sure the MinIO bucket <span className="font-mono text-[var(--text-primary)]">"{createForm.bucket || '...'}"</span> already exists
-                  before creating the project. You can create it via the{' '}
-                  <a href="http://100.68.221.236:9001" target="_blank" rel="noopener noreferrer"
-                    className="text-[var(--primary)] hover:underline">MinIO Console</a>.
-                </p>
+                <input type="text" placeholder="e.g. images/" value={createForm.prefix}
+                  onChange={e => setCreateForm(f => ({ ...f, prefix: e.target.value }))} />
               </div>
             </div>
-
-            {/* Modal Footer */}
-            <div className="flex gap-3 px-6 py-4"
-              style={{borderTop:'1px solid var(--border-subtle)',background:'var(--bg-surface)'}}>
-              <button className="btn btn-secondary flex-1" onClick={() => setShowCreate(false)}>
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary flex-1"
-                onClick={handleCreateProject}
-                disabled={creating || !createForm.name.trim() || !createForm.bucket.trim()}
-              >
-                {creating
-                  ? <><Loader2 size={14} className="animate-spin" /> Creating...</>
-                  : <><Plus size={14} /> Create Project</>
-                }
+            <div style={{ display: 'flex', gap: 10, padding: '14px 24px', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}>
+              <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setShowCreate(false)}>Cancel</button>
+              <button className="btn btn-primary" style={{ flex: 1 }} onClick={handleCreate}
+                disabled={creating || !createForm.name.trim() || selectedBuckets.length === 0}>
+                {creating ? <><Loader2 size={14} className="animate-spin" />Creating…</> : <><Plus size={14} />Create Project</>}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── Toast Container ──────────────────────────────────── */}
+      {/* Toasts */}
       <div className="toast-container">
         {toasts.map(t => (
           <div key={t.id} className={`toast toast-${t.type}`}>
             {t.type === 'success' && <CheckCircle2 size={15} />}
-            {t.type === 'error'   && <XCircle size={15} />}
-            {t.type === 'info'    && <AlertCircle size={15} />}
+            {t.type === 'error'   && <XCircle      size={15} />}
+            {t.type === 'info'    && <AlertCircle  size={15} />}
             {t.msg}
           </div>
         ))}

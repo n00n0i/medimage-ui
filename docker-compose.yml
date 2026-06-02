@@ -9,10 +9,70 @@ services:
       # ถ้า backend run บน host machine ให้ใช้ host.docker.internal
       # ถ้า backend อยู่ใน docker-compose เดียวกัน ให้ใช้ชื่อ service เช่น medimage-api
       - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
+      - LS_USER=${LS_USER:-admin@medimage.local}
+      - LS_PASSWORD=${LS_PASSWORD:-}
     extra_hosts:
       # ให้ container เข้าถึง host machine ผ่าน host.docker.internal
       - "host.docker.internal:host-gateway"
+    depends_on:
+      minio:
+        condition: service_healthy
     restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_PROMETHEUS_AUTH_TYPE=public
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9001:9001"   # MinIO Console (browser-accessible)
+      # port 9000 ไม่ expose ออกไปตรงๆ — ใช้ผ่าน nginx proxy /api/minio แทน
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  label-studio:
+    image: heartexlabs/label-studio:latest
+    ports:
+      - "8085:8080"
+    environment:
+      - LABEL_STUDIO_HOST=http://localhost:8085
+      - LABEL_STUDIO_USERNAME=admin@medimage.local
+      - LABEL_STUDIO_PASSWORD=MedImage2026!
+      - LABEL_STUDIO_USER_TOKEN=medimage-ls-token-2026
+      - LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK=true
+      # Allow LS to show real error messages for internal S3 endpoints (e.g. minio)
+      # minio:9000 has no registered TLD domain (registered_domain="")
+      # Trailing comma adds "" to trusted list so real errors are surfaced
+      - S3_TRUSTED_STORAGE_DOMAINS=amazonaws.com,scw.cloud,yandexcloud.net,digitaloceanspaces.com,
+    volumes:
+      - label-studio-data:/label-studio/data
+    restart: unless-stopped
+
+  # Creates default MinIO buckets on first startup
+  minio-init:
+    image: minio/minio:latest
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/medimage-raw &&
+        mc mb --ignore-existing local/medimage-cxr &&
+        mc mb --ignore-existing local/medimage-mri &&
+        mc mb --ignore-existing local/medimage-ct &&
+        echo 'MinIO buckets ready.'
+      "
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: on-failure
 
   # ── เพิ่ม backend service ตรงนี้เมื่อพร้อม ────────────────────
   # medimage-api:
@@ -20,3 +80,7 @@ services:
   #   ports:
   #     - "8000:8000"
   #   restart: unless-stopped
+
+volumes:
+  minio-data:
+  label-studio-data:
