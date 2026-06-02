@@ -91,30 +91,26 @@ export default function Dashboard() {
       label: 'Total Images',
       value: lsStats.total.toLocaleString(),
       sub: lsStats.total > 0 ? `${Math.round((lsStats.labeled / lsStats.total) * 100)}% labeled` : null,
-      subColor: 'text-green-500',
-      icon: <Database size={18} className="text-indigo-400" />,
-      valueColor: 'text-white',
+      subColor: 'var(--success)',
+      icon: <Database size={15} />,
     },
     {
       label: 'Labeled',
       value: lsStats.labeled.toLocaleString(),
       sub: null,
-      icon: <Activity size={18} className="text-green-400" />,
-      valueColor: 'text-green-400',
+      icon: <Activity size={15} />,
     },
     {
       label: 'Active Jobs',
       value: activeJobs.toString(),
       sub: null,
-      icon: <Brain size={18} className="text-blue-400" />,
-      valueColor: 'text-blue-400',
+      icon: <Brain size={15} />,
     },
     {
       label: 'Completed',
       value: completedJobs.toString(),
       sub: null,
-      icon: <LayoutDashboard size={18} className="text-amber-400" />,
-      valueColor: 'text-amber-400',
+      icon: <LayoutDashboard size={15} />,
     },
   ]
 
@@ -128,21 +124,19 @@ export default function Dashboard() {
 
   return (
     <div className="max-w-6xl mx-auto">
-      <h1 className="text-2xl font-bold text-white mb-6">Dashboard</h1>
+      <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 20 }}>Dashboard</h1>
 
-      {/* Stat Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+      {/* Stat Row */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         {statCards.map((card, i) => (
-          <div key={i} className="card flex flex-col items-center text-center gap-2">
-            <div className="flex items-center justify-center gap-2 mb-1">
+          <div key={i} className="stat-card">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', marginBottom: 6 }}>
               {card.icon}
+              <span className="stat-label">{card.label}</span>
             </div>
-            <div className={`text-3xl font-bold ${card.valueColor}`}>
-              {card.value}
-            </div>
-            <div className="text-xs text-gray-500">{card.label}</div>
+            <div className="stat-value">{card.value}</div>
             {card.sub && (
-              <div className={`text-xs ${card.subColor} mt-0.5`}>
+              <div className="stat-sub" style={{ color: card.subColor }}>
                 {card.sub}
               </div>
             )}
@@ -151,106 +145,98 @@ export default function Dashboard() {
       </div>
 
       {/* Ray Cluster + Storage */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8 items-stretch">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6 items-stretch">
         {/* Ray Cluster Status */}
         <div className="card flex flex-col">
-          <h3 className="font-semibold text-white mb-4">Ray Cluster Status</h3>
+          <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)', marginBottom: 16 }}>Ray Cluster</h3>
           <div className="space-y-4 flex-1">
             <div>
-              <div className="flex items-center justify-between text-sm mb-2">
-                <span className="text-gray-400">GPU Utilization</span>
-                <span className="text-indigo-400 font-medium">{gpuUtilPct}%</span>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 13, marginBottom: 8 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>GPU Utilization</span>
+                <span style={{ color: 'var(--primary-hover)', fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>{gpuUtilPct}%</span>
               </div>
               <div className="progress-bar">
-                <div
-                  className="progress-bar-fill"
-                  style={{ width: `${gpuUtilPct}%`, background: 'linear-gradient(90deg, #6366f1, #34d399)' }}
-                />
+                <div className="progress-bar-fill" style={{ width: `${gpuUtilPct}%` }} />
               </div>
-              <div className="text-xs text-gray-600 mt-1">{cluster?.gpus ?? '?'} / {cluster?.total_gpus ?? '?'} GPUs</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>{cluster?.gpus ?? '?'} / {cluster?.total_gpus ?? '?'} GPUs</div>
             </div>
             <div>
-              <div className="flex items-center justify-between text-sm mb-2">
-                <span className="text-gray-400">Memory Usage</span>
-                <span className="text-indigo-400 font-medium">{memUtilPct}%</span>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 13, marginBottom: 8 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Memory Usage</span>
+                <span style={{ color: 'var(--primary-hover)', fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>{memUtilPct}%</span>
               </div>
               <div className="progress-bar">
-                <div
-                  className="progress-bar-fill"
-                  style={{ width: `${memUtilPct}%` }}
-                />
+                <div className="progress-bar-fill" style={{ width: `${memUtilPct}%` }} />
               </div>
-              <div className="text-xs text-gray-600 mt-1">
-                {cluster ? `${Math.round(cluster.memory_gb)} GB / ${Math.round(cluster.memory_total_gb)} GB` : 'Loading...'}
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+                {cluster ? `${Math.round(cluster.memory_gb)} GB / ${Math.round(cluster.memory_total_gb)} GB` : 'Connecting...'}
               </div>
             </div>
           </div>
-          <div className="mt-4 pt-3 border-t border-gray-800">
-            <div className="flex items-center gap-2 text-xs text-gray-500">
-              <div className={`w-2 h-2 rounded-full ${cluster ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
-              <span>Head: 100.68.53.118 {cluster ? `| ${cluster.total_cpus} CPUs, ${cluster.total_gpus} GPUs` : '| Connecting...'}</span>
+          <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--border-subtle)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)' }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: cluster ? 'var(--success)' : 'var(--danger)', flexShrink: 0 }} />
+              <span style={{ fontFamily: 'var(--font-mono)' }}>100.68.53.118</span>
+              {cluster && <span>{cluster.total_cpus} CPUs · {cluster.total_gpus} GPUs</span>}
             </div>
           </div>
         </div>
 
         {/* Storage */}
         <div className="card flex flex-col">
-          <h3 className="font-semibold text-white mb-4">Storage</h3>
+          <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)', marginBottom: 16 }}>Storage</h3>
           <div className="space-y-4 flex-1">
             <div>
-              <div className="flex items-center justify-between text-sm mb-2">
-                <span className="text-gray-400">MinIO Storage</span>
-                <span className="text-cyan-400 font-medium">
-                  {storageUsedGB.toFixed(1)} GB / {storageTotalGB} GB
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 13, marginBottom: 8 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>MinIO</span>
+                <span style={{ color: 'var(--text-secondary)', fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>
+                  {storageUsedGB.toFixed(1)} / {storageTotalGB} GB
                 </span>
               </div>
               <div className="progress-bar">
-                <div
-                  className="progress-bar-fill"
-                  style={{ width: `${storagePct}%`, background: 'linear-gradient(90deg, #06b6d4, #22d3ee)' }}
-                />
+                <div className="progress-bar-fill" style={{ width: `${storagePct}%` }} />
               </div>
             </div>
             {storage.length > 0 ? (
-              <div className="grid grid-cols-2 gap-2 text-xs">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                 {storage.slice(0, 4).map((b) => (
-                  <div key={b.bucket} className="bg-gray-900 rounded-lg p-2">
-                    <div className="text-gray-500 text-xs mb-1 truncate">{b.bucket}</div>
-                    <div className="text-indigo-400 font-medium">{(b.size_mb / 1024).toFixed(2)} GB</div>
+                  <div key={b.bucket} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid var(--border-subtle)' }}>
+                    <span style={{ fontSize: 13, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '65%' }}>{b.bucket}</span>
+                    <span style={{ fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{(b.size_mb / 1024).toFixed(2)} GB</span>
                   </div>
                 ))}
               </div>
             ) : (
-              <div className="text-xs text-gray-600">No buckets found — create a project first</div>
+              <div style={{ fontSize: 13, color: 'var(--text-muted)', paddingTop: 8 }}>No buckets found — create a project to get started</div>
             )}
           </div>
         </div>
       </div>
 
       {/* Quick Actions */}
-      <div className="card flex flex-col">
-        <h3 className="font-semibold text-white mb-4">Quick Actions</h3>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <a href="/datasets" className="btn btn-secondary flex-col items-center justify-center py-4 gap-1.5">
-            <Database size={18} />
-            <span className="text-xs mt-1">Manage Datasets</span>
+      <div className="card">
+        <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)', marginBottom: 14 }}>Quick Actions</h3>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <a href="/datasets" className="btn btn-secondary">
+            <Database size={15} />
+            Datasets
           </a>
-          <a href="/train" className="btn btn-primary flex-col items-center justify-center py-4 gap-1.5">
-            <Brain size={18} />
-            <span className="text-xs mt-1">New Training</span>
+          <a href="/train" className="btn btn-primary">
+            <Brain size={15} />
+            New Training Job
           </a>
-          <a href="/jobs" className="btn btn-secondary flex-col items-center justify-center py-4 gap-1.5">
-            <Activity size={18} />
-            <span className="text-xs mt-1">View Jobs</span>
+          <a href="/jobs" className="btn btn-secondary">
+            <Activity size={15} />
+            View Jobs
           </a>
           <a
             href="http://100.68.53.118:8265"
             target="_blank"
             rel="noopener noreferrer"
-            className="btn btn-secondary flex-col items-center justify-center py-4 gap-1.5"
+            className="btn btn-secondary"
           >
-            <LayoutDashboard size={18} />
-            <span className="text-xs mt-1">Ray Dashboard</span>
+            <LayoutDashboard size={15} />
+            Ray Dashboard
           </a>
         </div>
       </div>

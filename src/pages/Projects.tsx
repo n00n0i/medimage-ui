@@ -253,12 +253,8 @@ export default function Projects() {
       {/* ── Header ──────────────────────────────────────────── */}
       <div className="flex items-start justify-between mb-8">
         <div>
-          <h1 className="text-2xl font-extrabold text-[var(--text-primary)] tracking-tight">
-            Projects
-          </h1>
-          <p className="text-sm text-[var(--text-muted)] mt-1.5">
-            Manage datasets &amp; sync from MinIO storage
-          </p>
+          <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>Projects</h1>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>Manage datasets and sync from MinIO storage</p>
         </div>
         <div className="flex gap-3">
           <button className="btn btn-secondary btn-sm" onClick={fetchProjects}>
@@ -320,7 +316,7 @@ export default function Projects() {
               <div className="flex items-center justify-between p-5">
                 <div className="flex items-center gap-3 min-w-0">
                   <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
-                    style={{background:'var(--primary-light)'}}>
+                    style={{background:'var(--primary-dim)'}}>
                     <FolderSync size={18} style={{color:'var(--primary)'}} />
                   </div>
                   <div className="min-w-0">
@@ -473,7 +469,7 @@ export default function Projects() {
       {!loading && projects.length === 0 && (
         <div className="card text-center py-16">
           <div className="w-16 h-16 rounded-2xl mx-auto mb-4 flex items-center justify-center"
-            style={{background:'var(--primary-light)'}}>
+            style={{background:'var(--primary-dim)'}}>
             <FolderSync size={28} style={{color:'var(--primary)'}} />
           </div>
           <h3 className="text-[var(--text-primary)] font-semibold text-lg mb-2">
@@ -510,9 +506,7 @@ export default function Projects() {
             {/* Modal Body */}
             <div className="px-6 py-5 space-y-4">
               <div>
-                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)] mb-1.5 block">
-                  Project Name
-                </label>
+                <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>Project Name</label>
                 <input
                   type="text"
                   placeholder="e.g. CXR Chest X-Ray"
@@ -522,9 +516,7 @@ export default function Projects() {
                 />
               </div>
               <div>
-                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)] mb-1.5 block">
-                  MinIO Bucket
-                </label>
+                <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>MinIO Bucket</label>
                 <input
                   type="text"
                   placeholder="e.g. medimage-cxr"
@@ -533,9 +525,7 @@ export default function Projects() {
                 />
               </div>
               <div>
-                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)] mb-1.5 block">
-                  Prefix <span className="font-normal normal-case tracking-normal">(optional)</span>
-                </label>
+                <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>Prefix <span style={{ fontWeight: 400 }}>(optional)</span></label>
                 <input
                   type="text"
                   placeholder="e.g. images/"
@@ -546,7 +536,7 @@ export default function Projects() {
 
               {/* Info note */}
               <div className="flex gap-2.5 p-3 rounded-lg" style={{background:'var(--bg-elevated)',border:'1px solid var(--border-subtle)'}}>
-                <AlertCircle size={14} className="text-[var(--accent)] flex-shrink-0 mt-0.5" />
+                <AlertCircle size={14} style={{ color: 'var(--warning)', flexShrink: 0, marginTop: 2 }} />
                 <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
                   Make sure the MinIO bucket <span className="font-mono text-[var(--text-primary)]">"{createForm.bucket || '...'}"</span> already exists
                   before creating the project. You can create it via the{' '}

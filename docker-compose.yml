@@ -1,0 +1,22 @@
+name: medimage
+
+services:
+  medimage-ui:
+    build: .
+    ports:
+      - "8083:8083"
+    environment:
+      # ถ้า backend run บน host machine ให้ใช้ host.docker.internal
+      # ถ้า backend อยู่ใน docker-compose เดียวกัน ให้ใช้ชื่อ service เช่น medimage-api
+      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
+    extra_hosts:
+      # ให้ container เข้าถึง host machine ผ่าน host.docker.internal
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ── เพิ่ม backend service ตรงนี้เมื่อพร้อม ────────────────────
+  # medimage-api:
+  #   build: ../medimage-api
+  #   ports:
+  #     - "8000:8000"
+  #   restart: unless-stopped

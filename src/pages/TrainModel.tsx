@@ -225,18 +225,21 @@ export default function TrainModel() {
           <div key={i} className="flex items-center gap-2 flex-shrink-0">
             <button
               onClick={() => i < 3 && setStep(i)}
-              className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-all ${
-                i === step
-                  ? 'bg-indigo-600 text-white ring-2 ring-indigo-400 ring-offset-2 ring-offset-gray-950'
-                  : i < step
-                  ? 'bg-indigo-900 text-indigo-300 cursor-pointer hover:bg-indigo-800'
-                  : 'bg-gray-800 text-gray-500'
-              }`}
+              style={{
+                width: 28, height: 28, borderRadius: '50%',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 12, fontWeight: 600,
+                transition: 'all 0.12s ease',
+                cursor: i < step ? 'pointer' : 'default',
+                background: i === step ? 'var(--primary)' : i < step ? 'var(--primary-dim)' : 'var(--bg-elevated)',
+                color: i === step ? '#fff' : i < step ? 'var(--primary-hover)' : 'var(--text-muted)',
+                border: 'none',
+              }}
             >
               {i < step ? '✓' : i + 1}
             </button>
-            <span className={`text-sm whitespace-nowrap ${i === step ? 'text-indigo-400' : 'text-gray-500'}`}>{s}</span>
-            {i < 3 && <ArrowRight size={14} className="text-gray-700 mx-1 flex-shrink-0" />}
+            <span style={{ fontSize: 13, whiteSpace: 'nowrap', color: i === step ? 'var(--text-primary)' : 'var(--text-muted)' }}>{s}</span>
+            {i < 3 && <ArrowRight size={13} style={{ color: 'var(--border-subtle)', margin: '0 4px', flexShrink: 0 }} />}
           </div>
         ))}
       </div>
@@ -244,28 +247,29 @@ export default function TrainModel() {
       {/* ── STEP 0: Training Type ── */}
       {step === 0 && (
         <div>
-          <h2 className="text-xl font-bold text-white mb-1">เลือก Training Type</h2>
-          <p className="text-gray-400 text-sm mb-6">เลือกประเภทงานที่ต้องการ — ระบบจะแนะนำ engine และ model ที่เหมาะสม</p>
+          <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Training Type</h2>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>เลือกประเภทงานที่ต้องการ — ระบบจะแนะนำ engine และ model ที่เหมาะสม</p>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mb-8">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
             {/* Classification */}
             <button
               onClick={() => { set('trainingType', 'classification'); nextStep() }}
-              className={`card text-left hover:border-indigo-500 transition-all group ${config.trainingType === 'classification' ? 'border-indigo-500 bg-indigo-950/30' : ''}`}
+              className="card text-left"
+              style={config.trainingType === 'classification' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
             >
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-10 h-10 rounded-lg bg-indigo-900/50 flex items-center justify-center">
-                  <Brain size={20} className="text-indigo-400" />
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Brain size={18} style={{ color: 'var(--primary-hover)' }} />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Classification</h3>
-                  <p className="text-xs text-gray-500">Image classification</p>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Classification</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Image classification</p>
                 </div>
               </div>
-              <p className="text-xs text-gray-400 leading-relaxed">
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                 แบ่งประเภทภาพ เช่น Normal/Pneumonia/COVID, Fundus disease grading, CT slice triage
               </p>
-              <div className="mt-3 flex items-center gap-1 text-indigo-400 text-xs group-hover:text-indigo-300">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
                 <span>{compatibleOptions.length} models</span>
                 <ChevronDown size={12} />
               </div>
@@ -274,21 +278,22 @@ export default function TrainModel() {
             {/* Object Detection */}
             <button
               onClick={() => { set('trainingType', 'detection'); nextStep() }}
-              className={`card text-left hover:border-indigo-500 transition-all group ${config.trainingType === 'detection' ? 'border-indigo-500 bg-indigo-950/30' : ''}`}
+              className="card text-left"
+              style={config.trainingType === 'detection' ? { borderColor: 'var(--warning)', background: 'var(--warning-dim)' } : {}}
             >
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-10 h-10 rounded-lg bg-amber-900/30 flex items-center justify-center">
-                  <Cpu size={20} className="text-amber-400" />
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--warning-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Cpu size={18} style={{ color: 'var(--warning)' }} />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Object Detection</h3>
-                  <p className="text-xs text-gray-500">Detect & localize</p>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Object Detection</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Detect & localize</p>
                 </div>
               </div>
-              <p className="text-xs text-gray-400 leading-relaxed">
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                 หา bounding box ของ nodule, tumor, lesion บน CXR/CT/Pathology
               </p>
-              <div className="mt-3 flex items-center gap-1 text-amber-400 text-xs group-hover:text-amber-300">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--warning)', fontSize: 12 }}>
                 <span>{compatibleOptions.length} models</span>
                 <ChevronDown size={12} />
               </div>
@@ -297,21 +302,22 @@ export default function TrainModel() {
             {/* Segmentation */}
             <button
               onClick={() => { set('trainingType', 'segmentation'); nextStep() }}
-              className={`card text-left hover:border-indigo-500 transition-all group ${config.trainingType === 'segmentation' ? 'border-indigo-500 bg-indigo-950/30' : ''}`}
+              className="card text-left"
+              style={config.trainingType === 'segmentation' ? { borderColor: 'var(--success)', background: 'var(--success-dim)' } : {}}
             >
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-10 h-10 rounded-lg bg-emerald-900/30 flex items-center justify-center">
-                  <Sparkles size={20} className="text-emerald-400" />
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--success-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Sparkles size={18} style={{ color: 'var(--success)' }} />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Segmentation</h3>
-                  <p className="text-xs text-gray-500">Semantic / Instance</p>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Segmentation</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Semantic / Instance</p>
                 </div>
               </div>
-              <p className="text-xs text-gray-400 leading-relaxed">
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                 แบ่งส่วนเนื้อเยื่อ, ก้อนเนื้อ, อวัยวะ ด้วย pixel-level precision
               </p>
-              <div className="mt-3 flex items-center gap-1 text-emerald-400 text-xs group-hover:text-emerald-300">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--success)', fontSize: 12 }}>
                 <span>{compatibleOptions.length} models</span>
                 <ChevronDown size={12} />
               </div>
@@ -320,21 +326,22 @@ export default function TrainModel() {
             {/* VLM Fine-tune */}
             <button
               onClick={() => { set('trainingType', 'vlm-finetune'); nextStep() }}
-              className={`card text-left hover:border-indigo-500 transition-all group ${config.trainingType === 'vlm-finetune' ? 'border-indigo-500 bg-indigo-950/30' : ''}`}
+              className="card text-left"
+              style={config.trainingType === 'vlm-finetune' ? { borderColor: 'var(--info)', background: 'var(--info-dim)' } : {}}
             >
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-10 h-10 rounded-lg bg-violet-900/30 flex items-center justify-center">
-                  <Sparkles size={20} className="text-violet-400" />
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--info-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Sparkles size={18} style={{ color: 'var(--info)' }} />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">VLM Fine-tune</h3>
-                  <p className="text-xs text-gray-500">Vision-Language Model</p>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>VLM Fine-tune</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Vision-Language Model</p>
                 </div>
               </div>
-              <p className="text-xs text-gray-400 leading-relaxed">
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                 Fine-tune LLaVA, Phi-4-Vision สำหรับ medical report generation, clinical Q&A
               </p>
-              <div className="mt-3 flex items-center gap-1 text-violet-400 text-xs group-hover:text-violet-300">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--info)', fontSize: 12 }}>
                 <span>GPU 16GB+ required</span>
                 <ChevronDown size={12} />
               </div>
@@ -343,21 +350,22 @@ export default function TrainModel() {
             {/* Self-Supervised */}
             <button
               onClick={() => { set('trainingType', 'self-supervised'); nextStep() }}
-              className={`card text-left hover:border-cyan-500 transition-all group ${config.trainingType === 'self-supervised' ? 'border-cyan-500 bg-cyan-950/30' : ''}`}
+              className="card text-left"
+              style={config.trainingType === 'self-supervised' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
             >
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-10 h-10 rounded-lg bg-cyan-900/30 flex items-center justify-center">
-                  <Brain size={20} className="text-cyan-400" />
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Brain size={18} style={{ color: 'var(--primary-hover)' }} />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Self-Supervised</h3>
-                  <p className="text-xs text-gray-500">SSL / Pre-training</p>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Self-Supervised</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>SSL / Pre-training</p>
                 </div>
               </div>
-              <p className="text-xs text-gray-400 leading-relaxed">
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                 Pre-train ด้วย MAE, DINO, SimCLR ก่อน fine-tune — ดีสำหรับ data ใหม่ที่ยังไม่มี label
               </p>
-              <div className="mt-3 flex items-center gap-1 text-cyan-400 text-xs group-hover:text-cyan-300">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
                 <span>{trainingOptions.filter(o => o.compatible).length} models available</span>
                 <ChevronDown size={12} />
               </div>
@@ -366,21 +374,22 @@ export default function TrainModel() {
             {/* Export Edge */}
             <button
               onClick={() => { set('trainingType', 'export-edge'); nextStep() }}
-              className={`card text-left hover:border-indigo-500 transition-all group ${config.trainingType === 'export-edge' ? 'border-indigo-500 bg-indigo-950/30' : ''}`}
+              className="card text-left"
+              style={config.trainingType === 'export-edge' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
             >
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-10 h-10 rounded-lg bg-cyan-900/30 flex items-center justify-center">
-                  <Database size={20} className="text-cyan-400" />
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Database size={18} style={{ color: 'var(--primary-hover)' }} />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Export Edge</h3>
-                  <p className="text-xs text-gray-500">TF-Lite / ONNX / TensorRT</p>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Export Edge</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>TF-Lite / ONNX / TensorRT</p>
                 </div>
               </div>
-              <p className="text-xs text-gray-400 leading-relaxed">
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                 Export trained model ไปเป็น TF-Lite, ONNX, TensorRT สำหรับ deploy บน edge board
               </p>
-              <div className="mt-3 flex items-center gap-1 text-cyan-400 text-xs group-hover:text-cyan-300">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
                 <span>{compatibleOptions.length} formats</span>
                 <ChevronDown size={12} />
               </div>
@@ -392,8 +401,8 @@ export default function TrainModel() {
       {/* ── STEP 1: Data & Target ── */}
       {step === 1 && (
         <div>
-          <h2 className="text-xl font-bold text-white mb-1">Data & Target</h2>
-          <p className="text-gray-400 text-sm mb-6">เลือกประเภทข้อมูลและเป้าหมายการ training</p>
+          <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>Data & Target</h2>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>เลือกประเภทข้อมูลและเป้าหมายการ training</p>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
             {/* Data Type */}
@@ -408,7 +417,7 @@ export default function TrainModel() {
                   <option key={k} value={k}>{v}</option>
                 ))}
               </select>
-              <p className="text-xs text-gray-500 mt-2">
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
                 ประเภทข้อมูลจะช่วยกรอง model ที่เหมาะสมกับ domain
               </p>
             </div>
@@ -425,7 +434,7 @@ export default function TrainModel() {
                 <option value="finetune">Fine-tune (ปรับแต่งจาก pretrained)</option>
                 <option value="export">Export (export model ที่มีอยู่แล้ว)</option>
               </select>
-              <p className="text-xs text-gray-500 mt-2">
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
                 {config.target === 'prelabel' && 'ใช้ AI ช่วย pre-label ก่อน เพื่อลดเวลาการ label ของ expert'}
                 {config.target === 'finetune' && 'Fine-tune จาก pretrained model เช่น ImageNet, MedCLIP'}
                 {config.target === 'export' && 'Export checkpoint ที่มีอยู่ไปเป็น format ที่ต้องการ'}
@@ -458,35 +467,35 @@ export default function TrainModel() {
       {/* ── STEP 2: Model Selection ── */}
       {step === 2 && (
         <div>
-          <h2 className="text-xl font-bold text-white mb-1">เลือก Model</h2>
-          <p className="text-gray-400 text-sm mb-6">
+          <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>
             แนะนำ {config.trainingType} สำหรับ {DATA_TYPE_LABELS[config.dataType]} — เลือก engine ที่เหมาะกับ hardware ของคุณ
           </p>
 
           {/* Compatible */}
           <div className="mb-6">
-            <div className="flex items-center gap-2 mb-3">
-              <div className="w-2 h-2 rounded-full bg-green-500" />
-              <span className="text-sm font-medium text-green-400">Available on your hardware</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)' }} />
+              <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--success)' }}>Available on your hardware</span>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {compatibleOptions.map(opt => (
                 <button
                   key={opt.value}
                   onClick={() => handleModelSelect(opt)}
-                  className="card text-left hover:border-indigo-500 transition-all group"
+                  className="card text-left"
                 >
-                  <div className="flex items-start justify-between mb-2">
-                    <h3 className="font-semibold text-white">{opt.label}</h3>
-                    <span className="badge badge-success text-xs">{opt.hardware}</span>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{opt.label}</h3>
+                    <span className="badge badge-success" style={{ fontSize: 11 }}>{opt.hardware}</span>
                   </div>
-                  <p className="text-xs text-gray-400 mb-2">{opt.description}</p>
-                  <div className="flex items-center gap-2 text-xs text-gray-500">
-                    <span className="font-mono text-indigo-400">{opt.engine}</span>
-                    <span>•</span>
-                    <span className="font-mono text-gray-500">{opt.model}</span>
+                  <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8, lineHeight: 1.5 }}>{opt.description}</p>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                    <span style={{ color: 'var(--primary-hover)' }}>{opt.engine}</span>
+                    <span>·</span>
+                    <span>{opt.model}</span>
                   </div>
-                  <div className="mt-3 text-indigo-400 text-xs group-hover:text-indigo-300 font-medium">
+                  <div style={{ marginTop: 12, fontSize: 12, color: 'var(--primary-hover)', fontWeight: 500 }}>
                     เลือก model นี้ →
                   </div>
                 </button>
@@ -497,22 +506,22 @@ export default function TrainModel() {
           {/* Incompatible (dimmed) */}
           {incompatibleOptions.length > 0 && (
             <div>
-              <div className="flex items-center gap-2 mb-3">
-                <div className="w-2 h-2 rounded-full bg-gray-500" />
-                <span className="text-sm font-medium text-gray-500">Requires more powerful hardware</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--border-subtle)' }} />
+                <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-muted)' }}>Requires more powerful hardware</span>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 opacity-50">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3" style={{ opacity: 0.45 }}>
                 {incompatibleOptions.map(opt => (
                   <div key={opt.value} className="card text-left">
-                    <div className="flex items-start justify-between mb-2">
-                      <h3 className="font-semibold text-gray-400">{opt.label}</h3>
-                      <span className="badge badge-warning text-xs">{opt.hardware}</span>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
+                      <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-muted)' }}>{opt.label}</h3>
+                      <span className="badge badge-warning" style={{ fontSize: 11 }}>{opt.hardware}</span>
                     </div>
-                    <p className="text-xs text-gray-600 mb-2">{opt.description}</p>
-                    <div className="flex items-center gap-2 text-xs text-gray-600">
-                      <span className="font-mono">{opt.engine}</span>
-                      <span>•</span>
-                      <span className="font-mono">{opt.model}</span>
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>{opt.description}</p>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                      <span>{opt.engine}</span>
+                      <span>·</span>
+                      <span>{opt.model}</span>
                     </div>
                   </div>
                 ))}
@@ -529,27 +538,27 @@ export default function TrainModel() {
       {/* ── STEP 3: Config & Launch ── */}
       {step === 3 && (
         <div>
-          <h2 className="text-xl font-bold text-white mb-1">Config & Launch</h2>
-          <p className="text-gray-400 text-sm mb-6">ตั้งค่า hyperparameters แล้ว launch training ไปที่ Ray cluster</p>
+          <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>Config & Launch</h2>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>ตั้งค่า hyperparameters แล้ว launch training ไปที่ Ray cluster</p>
 
           {/* Summary */}
-          <div className="card mb-6 bg-indigo-950/30 border-indigo-800">
+          <div className="card mb-6" style={{ background: 'var(--primary-dim)', borderColor: 'var(--primary-border)' }}>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
-                <div className="text-xs text-gray-500">Training Type</div>
-                <div className="text-sm font-semibold text-indigo-300 capitalize">{config.trainingType}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Training Type</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--primary-hover)', textTransform: 'capitalize' }}>{config.trainingType}</div>
               </div>
               <div>
-                <div className="text-xs text-gray-500">Data Type</div>
-                <div className="text-sm font-semibold text-indigo-300">{DATA_TYPE_LABELS[config.dataType]}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Data Type</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--primary-hover)' }}>{DATA_TYPE_LABELS[config.dataType]}</div>
               </div>
               <div>
-                <div className="text-xs text-gray-500">Model</div>
-                <div className="text-sm font-semibold text-indigo-300 font-mono">{config.model || '-'}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Model</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--primary-hover)', fontFamily: 'var(--font-mono)' }}>{config.model || '-'}</div>
               </div>
               <div>
-                <div className="text-xs text-gray-500">Engine</div>
-                <div className="text-sm font-semibold text-indigo-300 font-mono">{config.engine || '-'}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Engine</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--primary-hover)', fontFamily: 'var(--font-mono)' }}>{config.engine || '-'}</div>
               </div>
             </div>
           </div>
@@ -612,48 +621,50 @@ export default function TrainModel() {
           </div>
 
           {/* Ray Cluster Info */}
-          <div className="card mb-6 bg-gray-900 border-gray-700">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="w-3 h-3 rounded-full bg-green-500 animate-pulse" />
-              <span className="font-semibold text-white">Ray Cluster Ready</span>
+          <div className="card mb-6" style={{ background: 'var(--bg-elevated)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)' }} />
+              <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Ray Cluster Ready</span>
             </div>
-            <div className="grid grid-cols-3 gap-4 text-sm">
+            <div className="grid grid-cols-3 gap-4">
               <div>
-                <div className="text-xs text-gray-500">Head Node</div>
-                <div className="font-mono text-indigo-400">100.68.53.118</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>Head Node</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--primary-hover)' }}>100.68.53.118</div>
               </div>
               <div>
-                <div className="text-xs text-gray-500">Dashboard</div>
-                <a href="http://100.68.53.118:8265" target="_blank" className="font-mono text-indigo-400 hover:underline">:8265</a>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>Dashboard</div>
+                <a href="http://100.68.53.118:8265" target="_blank" rel="noopener noreferrer"
+                  style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--primary-hover)' }}>:8265</a>
               </div>
               <div>
-                <div className="text-xs text-gray-500">MinIO</div>
-                <div className="font-mono text-gray-400">100.68.221.236:9000</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>MinIO</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--text-secondary)' }}>100.68.221.236:9000</div>
               </div>
             </div>
           </div>
 
           {/* Job ID result */}
           {jobId && (
-            <div className="card mb-6 bg-green-950/30 border-green-800">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-3 h-3 rounded-full bg-green-500" />
-                <span className="font-semibold text-green-400">Training Job Launched!</span>
+            <div className="card mb-6" style={{ background: 'var(--success-dim)', borderColor: 'var(--success)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)' }} />
+                <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--success)' }}>Training Job Launched!</span>
               </div>
-              <div className="font-mono text-sm text-green-300 mb-3">{jobId}</div>
-              <div className="flex gap-3">
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--success)', marginBottom: 12 }}>{jobId}</div>
+              <div style={{ display: 'flex', gap: 12 }}>
                 <a
                   href="http://100.68.53.118:8265"
                   target="_blank"
-                  className="btn btn-secondary text-sm"
+                  rel="noopener noreferrer"
+                  className="btn btn-secondary btn-sm"
                 >
-                  → View Ray Dashboard
+                  View Ray Dashboard
                 </a>
                 <button
-                  className="btn btn-secondary text-sm"
+                  className="btn btn-secondary btn-sm"
                   onClick={() => window.location.href = '/jobs'}
                 >
-                  → View Jobs Page
+                  View Jobs
                 </button>
               </div>
             </div>

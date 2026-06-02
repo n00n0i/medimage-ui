@@ -109,8 +109,8 @@ export default function Datasets() {
     <div className="max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-white mb-1">Datasets</h1>
-          <p className="text-sm text-gray-500">จัดการและ sync ข้อมูลจาก MinIO S3 storage</p>
+          <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>Datasets</h1>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>จัดการและ sync ข้อมูลจาก MinIO S3 storage</p>
         </div>
         <button
           className="btn btn-secondary flex items-center gap-2"
@@ -131,30 +131,37 @@ export default function Datasets() {
         {datasets.map((ds) => (
           <div key={ds.id} className="card">
             {/* Header */}
-            <div className="flex items-start justify-between mb-4">
-              <div>
-                <h3 className="font-semibold text-white">{ds.name}</h3>
-                <p className="text-xs text-gray-500 font-mono mt-1 break-all">{ds.source}</p>
+            <div className="flex items-start justify-between mb-3">
+              <div style={{ minWidth: 0, flex: 1, marginRight: 12 }}>
+                <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{ds.name}</h3>
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginTop: 3, wordBreak: 'break-all' }}>{ds.source}</p>
               </div>
               <span className={statusBadge(ds.status)}>{ds.status}</span>
             </div>
 
             {/* Stats row */}
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              <div className="bg-gray-900 rounded-lg p-3 text-center">
-                <div className="text-2xl font-bold text-indigo-400">{ds.images}</div>
-                <div className="text-xs text-gray-500 mt-1">Images</div>
+            <div style={{ display: 'flex', gap: 16, marginBottom: 12, paddingBottom: 12, borderBottom: '1px solid var(--border-subtle)' }}>
+              <div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums' }}>{ds.images}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>Images</div>
               </div>
-              <div className="bg-gray-900 rounded-lg p-3 text-center">
-                <div className="text-2xl font-bold text-green-400">{ds.labeled}</div>
-                <div className="text-xs text-gray-500 mt-1">Labeled</div>
+              <div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--success)', fontVariantNumeric: 'tabular-nums' }}>{ds.labeled}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>Labeled</div>
               </div>
+              {ds.images > 0 && (
+                <div style={{ marginLeft: 'auto' }}>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>
+                    {Math.round((ds.labeled / ds.images) * 100)}%
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>Labeled</div>
+                </div>
+              )}
             </div>
 
             {/* Footer */}
-            <div className="flex items-center justify-between text-xs text-gray-500 mb-4">
-              <span>Last sync: {ds.lastUpdated}</span>
-              <span className="text-green-400">{ds.images > 0 ? `${Math.round((ds.labeled / ds.images) * 100)}% labeled` : '-'}</span>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Last sync: {ds.lastUpdated}</span>
             </div>
 
             <button
@@ -169,11 +176,12 @@ export default function Datasets() {
       </div>
 
       {datasets.length === 0 && (
-        <div className="text-center py-16 text-gray-500">
-          <Database size={48} className="mx-auto mb-4 opacity-50" />
-          <p>ยังไม่มี dataset — ไปที่ Label Studio เพื่อสร้าง S3 storage ก่อน</p>
-          <a href="http://100.68.221.236:8080" target="_blank" className="text-indigo-400 text-sm mt-2 inline-block">
-            → เปิด Label Studio
+        <div style={{ textAlign: 'center', padding: '64px 0', color: 'var(--text-muted)' }}>
+          <Database size={40} style={{ margin: '0 auto 16px', opacity: 0.4 }} />
+          <p style={{ fontSize: 14 }}>ยังไม่มี dataset — ไปที่ Label Studio เพื่อสร้าง S3 storage ก่อน</p>
+          <a href="http://100.68.221.236:8080" target="_blank" rel="noopener noreferrer"
+            style={{ color: 'var(--primary-hover)', fontSize: 13, marginTop: 8, display: 'inline-block' }}>
+            เปิด Label Studio →
           </a>
         </div>
       )}
