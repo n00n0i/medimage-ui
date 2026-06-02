@@ -8,7 +8,7 @@ services:
     environment:
       # ถ้า backend run บน host machine ให้ใช้ host.docker.internal
       # ถ้า backend อยู่ใน docker-compose เดียวกัน ให้ใช้ชื่อ service เช่น medimage-api
-      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
+      - BACKEND_URL=${BACKEND_URL:-http://medimage-api:8000}
       - LS_USER=${LS_USER:-admin@medimage.local}
       - LS_PASSWORD=${LS_PASSWORD:-}
     extra_hosts:
@@ -17,6 +17,8 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+      medimage-api:
+        condition: service_started
     restart: unless-stopped
 
   minio:
@@ -74,13 +76,18 @@ services:
         condition: service_healthy
     restart: on-failure
 
-  # ── เพิ่ม backend service ตรงนี้เมื่อพร้อม ────────────────────
-  # medimage-api:
-  #   build: ../medimage-api
-  #   ports:
-  #     - "8000:8000"
-  #   restart: unless-stopped
+  medimage-api:
+    build: ./backend
+    environment:
+      - LS_API_URL=http://label-studio:8080
+      - LS_TOKEN=medimage-ls-token-2026
+      - MINIO_URL=http://minio:9000
+      - DB_PATH=/data/jobs.db
+    volumes:
+      - api-data:/data
+    restart: unless-stopped
 
 volumes:
   minio-data:
   label-studio-data:
+  api-data:

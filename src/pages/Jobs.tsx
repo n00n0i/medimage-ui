@@ -1,6 +1,6 @@
 
-import { useState, useEffect } from 'react'
-import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 
 interface Job {
   id: string
@@ -45,9 +45,14 @@ export default function Jobs() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<string>('all')
+  const [logJob, setLogJob] = useState<{id: string; name: string} | null>(null)
+  const [logText, setLogText] = useState<string>('')
+  const [logLoading, setLogLoading] = useState(false)
+  const logRef = useRef<HTMLPreElement>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const fetchJobs = async () => {
-    setLoading(true)
+  const fetchJobs = async (quiet = false) => {
+    if (!quiet) setLoading(true)
     setError(null)
     try {
       const res = await fetch('/api/jobs')
@@ -57,8 +62,42 @@ export default function Jobs() {
     } catch (e: any) {
       setError(e.message)
     } finally {
-      setLoading(false)
+      if (!quiet) setLoading(false)
     }
+  }
+
+  // Auto-refresh when any job is running
+  useEffect(() => {
+    fetchJobs()
+    pollRef.current = setInterval(() => {
+      fetchJobs(true)
+    }, 3000)
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [])
+
+  const fetchLog = async (jobId: string) => {
+    setLogLoading(true)
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setLogText(data.log || '(no output yet)')
+      setTimeout(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight) }, 50)
+    } catch (e: any) {
+      setLogText(`Error: ${e.message}`)
+    } finally {
+      setLogLoading(false)
+    }
+  }
+
+  const openLog = (job: Job) => {
+    setLogJob({ id: job.id, name: job.name })
+    fetchLog(job.id)
+  }
+
+  const deleteJob = async (jobId: string) => {
+    await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' })
+    fetchJobs(true)
   }
 
   useEffect(() => { fetchJobs() }, [])
@@ -73,7 +112,7 @@ export default function Jobs() {
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
         <div>
           <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>Training Jobs</h1>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>ติดตามสถานะ training jobs บน Ray cluster</p>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>ติดตามสถานะ training jobs · auto-refresh ทุก 3s</p>
         </div>
         <div className="flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto">
           <div style={{ display: 'flex', gap: 2, background: 'var(--bg-elevated)', borderRadius: 8, padding: 4 }}>
@@ -92,7 +131,7 @@ export default function Jobs() {
               </button>
             ))}
           </div>
-          <button className="btn btn-secondary flex items-center gap-1 whitespace-nowrap" onClick={fetchJobs}>
+          <button className="btn btn-secondary flex items-center gap-1 whitespace-nowrap" onClick={() => fetchJobs()}>
             <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
             Refresh
           </button>
@@ -173,6 +212,9 @@ export default function Jobs() {
 
                 {/* Actions */}
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, paddingTop: 12, borderTop: '1px solid var(--border-subtle)' }}>
+                  <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={() => openLog(job)}>
+                    <Terminal size={13} /> Logs
+                  </button>
                   <a
                     href="http://100.68.53.118:8265"
                     target="_blank"
@@ -181,11 +223,10 @@ export default function Jobs() {
                   >
                     Ray Dashboard
                   </a>
-                  {job.status === 'error' && (
-                    <button className="btn btn-primary btn-sm">Retry</button>
-                  )}
-                  {job.status === 'completed' && (
-                    <button className="btn btn-secondary btn-sm">View Logs</button>
+                  {job.status !== 'running' && (
+                    <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={() => deleteJob(job.id)}>
+                      <Trash2 size={13} /> Delete
+                    </button>
                   )}
                 </div>
               </div>
@@ -204,6 +245,44 @@ export default function Jobs() {
               แสดงทั้งหมด
             </button>
           )}
+        </div>
+      )}
+      {/* Log Modal */}
+      {logJob && (
+        <div className="modal-overlay" onClick={() => setLogJob(null)}>
+          <div className="modal" style={{ maxWidth: 800, width: '95vw' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <div>
+                <h3 style={{ fontWeight: 600, fontSize: 15, color: 'var(--text-primary)' }}>Training Logs</h3>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>{logJob.name}</p>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => fetchLog(logJob.id)}>
+                  {logLoading ? <Loader size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => setLogJob(null)}>✕</button>
+              </div>
+            </div>
+            <pre
+              ref={logRef}
+              style={{
+                background: 'var(--bg-base)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 8,
+                padding: '12px 16px',
+                fontSize: 12,
+                lineHeight: 1.6,
+                color: 'var(--text-secondary)',
+                fontFamily: 'var(--font-mono)',
+                maxHeight: '60vh',
+                overflowY: 'auto',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all',
+              }}
+            >
+              {logLoading && !logText ? 'Loading...' : logText || '(no output yet)'}
+            </pre>
+          </div>
         </div>
       )}
     </div>

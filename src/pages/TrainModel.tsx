@@ -136,10 +136,13 @@ export default function TrainModel() {
   // Fetch projects for dataset dropdown
   const [projects, setProjects] = useState<Array<{id: number; name: string}>>([])
   useEffect(() => {
-    fetch('/api/projects')
+    fetch('/api/ls/projects/?page_size=1000', {
+      headers: { Authorization: 'Token medimage-ls-token-2026' },
+    })
       .then(r => r.json())
       .then(data => {
-        if (Array.isArray(data)) setProjects(data)
+        const list = Array.isArray(data) ? data : (data?.results ?? [])
+        setProjects(list.map((p: { id: number; title: string }) => ({ id: p.id, name: p.title })))
       })
       .catch(() => {})
   }, [])
@@ -193,16 +196,22 @@ export default function TrainModel() {
         }),
       })
 
+      const ct = res.headers.get('content-type') ?? ''
+      if (!ct.includes('application/json')) {
+        showToast(`❌ Training backend ไม่พร้อม (HTTP ${res.status}) — กรุณาตรวจสอบ backend service`, 'error')
+        return
+      }
+
       const data = await res.json()
 
       if (!res.ok) {
-        showToast(`❌ ${data.detail || 'Training failed'}`, 'error')
+        showToast(`❌ ${data.detail || data.error || `HTTP ${res.status}`}`, 'error')
       } else {
         setJobId(data.job_id || data.training_id || `job-${Date.now()}`)
         showToast(`✅ Training started — ${data.message || config.model}`, 'success')
       }
     } catch (err) {
-      showToast(`❌ เชื่อมต่อ backend ล้มเหลว: ${err}`, 'error')
+      showToast(`❌ เชื่อมต่อ training backend ล้มเหลว`, 'error')
     } finally {
       setLaunching(false)
     }
