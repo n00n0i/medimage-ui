@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { useState } from 'react'
 import Dashboard from './pages/Dashboard'
 import TrainModel from './pages/TrainModel'
 import Datasets from './pages/Datasets'
@@ -22,6 +23,8 @@ export default function App() {
 function AppInner() {
   const location = useLocation()
   const isNotebook = location.pathname === '/notebook'
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const sidebarWidth = sidebarCollapsed ? 68 : 240
 
   return (
     <div style={{
@@ -31,15 +34,16 @@ function AppInner() {
       width: '100vw',
       overflow: 'hidden',
     }}>
-      <Sidebar />
+      <Sidebar onCollapsedChange={setSidebarCollapsed} />
       <main style={{
         flex: 1,
-        marginLeft: 240,
+        marginLeft: sidebarWidth,
         padding: isNotebook ? 0 : '32px 40px',
         minHeight: '100vh',
-        width: 'calc(100vw - 240px)',
+        width: `calc(100vw - ${sidebarWidth}px)`,
         overflowX: 'hidden',
         boxSizing: 'border-box',
+        transition: 'margin-left 0.25s cubic-bezier(0.4,0,0.2,1), width 0.25s cubic-bezier(0.4,0,0.2,1)',
       }}>
           <Routes>
             <Route path="/" element={<Navigate to="/projects" replace />} />

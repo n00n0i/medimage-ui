@@ -17,7 +17,11 @@ const navItems = [
   { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  desc: 'Analytics' },
 ]
 
-export default function Sidebar() {
+interface SidebarProps {
+  onCollapsedChange?: (collapsed: boolean) => void
+}
+
+export default function Sidebar({ onCollapsedChange }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false)
 
   return (
@@ -148,7 +152,7 @@ export default function Sidebar() {
 
         {/* Collapse Button */}
         <button
-          onClick={() => setCollapsed(c => !c)}
+          onClick={() => setCollapsed(c => { const next = !c; onCollapsedChange?.(next); return next })}
           style={{
             display: 'flex',
             alignItems: 'center',
