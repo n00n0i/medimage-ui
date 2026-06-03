@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form as FForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -823,7 +823,7 @@ _SEG_LABELS = [
     {"label": "effusion",   "color": "#f59e0b"},
 ]
 
-from fastapi import UploadFile, File, Form as FForm
+# UploadFile, File, FForm already imported above
 from typing import Optional
 
 @app.post("/api/inference")
