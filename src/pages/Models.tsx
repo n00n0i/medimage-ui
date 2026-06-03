@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square } from 'lucide-react'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink } from 'lucide-react'
 
 interface Model {
   id: string
@@ -17,6 +17,39 @@ interface Model {
   dataset: string
   epochs: number
   batch_size: number
+  source?: string
+}
+
+// ─── Pretrained presets ───────────────────────────────────────────────────────
+
+const PRETRAINED: Record<string, Array<{ label: string; arch: string; engine: string; hf?: string }>> = {
+  classification: [
+    { label: 'EfficientNet-B4',  arch: 'efficientnet-b4',  engine: 'PyTorch',     hf: 'google/efficientnet-b4' },
+    { label: 'EfficientNet-B0',  arch: 'efficientnet-b0',  engine: 'PyTorch',     hf: 'google/efficientnet-b0' },
+    { label: 'ResNet-50',        arch: 'resnet50',          engine: 'PyTorch',     hf: 'microsoft/resnet-50' },
+    { label: 'DenseNet-121',     arch: 'densenet121',       engine: 'PyTorch',     hf: 'torchvision/densenet121' },
+    { label: 'ViT-B/16',         arch: 'vit-b-16',          engine: 'PyTorch',     hf: 'google/vit-base-patch16-224' },
+    { label: 'ConvNeXt-Base',    arch: 'convnext-base',     engine: 'PyTorch',     hf: 'facebook/convnext-base-224' },
+    { label: 'Swin-T',           arch: 'swin-tiny-patch4',  engine: 'PyTorch',     hf: 'microsoft/swin-tiny-patch4-window7-224' },
+    { label: 'CheXNet (DenseNet)' ,arch: 'chexnet',         engine: 'PyTorch',     hf: 'kachiwaki/chexnet' },
+  ],
+  detection: [
+    { label: 'YOLOv8n',          arch: 'yolov8n',           engine: 'PyTorch',     hf: 'Ultralytics/assets' },
+    { label: 'YOLOv8s',          arch: 'yolov8s',           engine: 'PyTorch',     hf: 'Ultralytics/assets' },
+    { label: 'YOLOv8m',          arch: 'yolov8m',           engine: 'PyTorch',     hf: 'Ultralytics/assets' },
+    { label: 'YOLOv9c',          arch: 'yolov9c',           engine: 'PyTorch',     hf: 'Ultralytics/assets' },
+    { label: 'RT-DETR-L',        arch: 'rtdetr-l',          engine: 'PyTorch',     hf: 'PekingU/rtdetr_l' },
+    { label: 'DETR ResNet-50',   arch: 'detr-resnet-50',    engine: 'PyTorch',     hf: 'facebook/detr-resnet-50' },
+    { label: 'Grounding DINO',   arch: 'groundingdino-b',   engine: 'PyTorch',     hf: 'IDEA-Research/grounding-dino-base' },
+  ],
+  segmentation: [
+    { label: 'SAM ViT-B',        arch: 'sam-vit-b',         engine: 'PyTorch',     hf: 'facebook/sam-vit-base' },
+    { label: 'SAM ViT-H',        arch: 'sam-vit-h',         engine: 'PyTorch',     hf: 'facebook/sam-vit-huge' },
+    { label: 'U-Net',            arch: 'unet',              engine: 'PyTorch',     hf: 'usefulsensors/unet' },
+    { label: 'SegFormer-B2',     arch: 'segformer-b2',      engine: 'PyTorch',     hf: 'nvidia/segformer-b2-finetuned-ade-512-512' },
+    { label: 'Mask2Former',      arch: 'mask2former',       engine: 'PyTorch',     hf: 'facebook/mask2former-swin-base-coco-panoptic' },
+    { label: 'MedSAM',           arch: 'medsam',            engine: 'PyTorch',     hf: 'wanglab/medsam' },
+  ],
 }
 
 interface ModelDetail extends Model {
@@ -78,6 +111,9 @@ export default function Models() {
   // Delete confirm
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
+
+  // Import modal
+  const [showImport, setShowImport] = useState(false)
 
   // Multi-select
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -208,9 +244,18 @@ export default function Models() {
             จัดการ model ที่ train เสร็จแล้ว &middot; {models.length} model{models.length !== 1 ? 's' : ''}
           </p>
         </div>
-        <button className="btn btn-secondary flex items-center gap-1" onClick={fetchModels}>
-          <RefreshCw size={14} /> Refresh
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-secondary" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={fetchModels}>
+            <RefreshCw size={14} /> Refresh
+          </button>
+          <button
+            className="btn btn-primary"
+            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            onClick={() => setShowImport(true)}
+          >
+            <Download size={14} /> Import Model
+          </button>
+        </div>
       </div>
 
       {/* Bulk action toolbar */}
@@ -339,6 +384,11 @@ export default function Models() {
                     <span className="badge-success" style={{ fontSize: 10, display: 'flex', alignItems: 'center', gap: 4 }}>
                       <CheckCircle2 size={10} /> Completed
                     </span>
+                    {m.source === 'imported' && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 10, background: '#0ea5e920', color: '#0ea5e9', display: 'flex', alignItems: 'center', gap: 3 }}>
+                        <Download size={9} /> Pretrained
+                      </span>
+                    )}
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
                     {m.model} &middot; {m.engine} &middot; {m.dataset} &middot; {m.epochs} epochs
@@ -464,6 +514,11 @@ export default function Models() {
       )}
 
       {/* Delete Confirm Modal */}
+      {/* Import Model Modal */}
+      {showImport && (
+        <ImportModal onClose={() => setShowImport(false)} onImported={() => { setShowImport(false); fetchModels() }} />
+      )}
+
       {deleteId && (
         <div className="modal-overlay" onClick={() => setDeleteId(null)}>
           <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
@@ -557,6 +612,224 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
         <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={onDelete}>
           <Trash2 size={13} /> Delete
         </button>
+      </div>
+    </div>
+  )
+}
+
+// ─── Import Modal ─────────────────────────────────────────────────────────────
+
+function ImportModal({ onClose, onImported }: { onClose: () => void; onImported: () => void }) {
+  const [step, setStep] = useState<'form' | 'importing' | 'done'>('form')
+  const [trainingType, setTrainingType] = useState<'classification' | 'detection' | 'segmentation'>('classification')
+  const [sourceType, setSourceType] = useState<'huggingface' | 'url' | 'builtin'>('huggingface')
+  const [selectedPreset, setSelectedPreset] = useState<string | null>(null)
+  const [name, setName] = useState('')
+  const [arch, setArch] = useState('')
+  const [engine, setEngine] = useState('PyTorch')
+  const [sourceUrl, setSourceUrl] = useState('')
+  const [notes, setNotes] = useState('')
+  const [progress, setProgress] = useState(0)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const presets = PRETRAINED[trainingType] ?? []
+
+  const applyPreset = (preset: typeof presets[0]) => {
+    setSelectedPreset(preset.label)
+    setArch(preset.arch)
+    setEngine(preset.engine)
+    setName(preset.label)
+    if (preset.hf) {
+      setSourceType('huggingface')
+      setSourceUrl(preset.hf)
+    }
+  }
+
+  const handleImport = async () => {
+    if (!name || !arch) return
+    setStep('importing')
+    setProgress(0)
+    try {
+      const res = await fetch('/api/models/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, training_type: trainingType, model_name: arch, engine, source_type: sourceType, source_url: sourceUrl, notes }),
+      })
+      const data = await res.json()
+      const jobId = data.job_id
+
+      pollRef.current = setInterval(async () => {
+        const r = await fetch(`/api/jobs/${jobId}`)
+        const d = await r.json()
+        setProgress(d.progress ?? 0)
+        if (d.status === 'completed' || d.status === 'error') {
+          clearInterval(pollRef.current!)
+          setStep('done')
+        }
+      }, 600)
+    } catch {
+      setStep('form')
+    }
+  }
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
+
+  const TYPE_COLOR: Record<string, string> = { classification: '#6366f1', detection: '#f59e0b', segmentation: '#10b981' }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 620, width: '95vw', padding: 28, maxHeight: '92vh', overflowY: 'auto', overflowX: 'hidden' }} onClick={e => e.stopPropagation()}>
+
+        {/* Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 34, height: 34, borderRadius: 8, background: '#0ea5e920', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Download size={17} color="#0ea5e9" />
+            </div>
+            <div>
+              <h3 style={{ fontWeight: 700, fontSize: 16, color: 'var(--text-primary)', margin: 0 }}>Import Pretrained Model</h3>
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0 }}>Load weights from HuggingFace Hub or a direct URL</p>
+            </div>
+          </div>
+          <button className="btn btn-secondary btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+
+        {step === 'form' && (
+          <>
+            {/* Training type tabs */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: 18 }}>
+              {(['classification', 'detection', 'segmentation'] as const).map(t => (
+                <button key={t} onClick={() => { setTrainingType(t); setSelectedPreset(null) }} style={{
+                  flex: 1, padding: '7px 0', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  border: `1px solid ${trainingType === t ? TYPE_COLOR[t] : 'var(--border-default)'}`,
+                  background: trainingType === t ? TYPE_COLOR[t] + '18' : 'var(--bg-surface)',
+                  color: trainingType === t ? TYPE_COLOR[t] : 'var(--text-muted)',
+                  transition: 'all .15s',
+                }}>
+                  {t.charAt(0).toUpperCase() + t.slice(1)}
+                </button>
+              ))}
+            </div>
+
+            {/* Presets */}
+            <div style={{ marginBottom: 18 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 8 }}>
+                Quick Presets
+              </label>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {presets.map(p => (
+                  <button key={p.label} onClick={() => applyPreset(p)} style={{
+                    padding: '5px 12px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                    border: `1px solid ${selectedPreset === p.label ? TYPE_COLOR[trainingType] : 'var(--border-default)'}`,
+                    background: selectedPreset === p.label ? TYPE_COLOR[trainingType] + '18' : 'var(--bg-surface)',
+                    color: selectedPreset === p.label ? TYPE_COLOR[trainingType] : 'var(--text-secondary)',
+                    fontWeight: selectedPreset === p.label ? 600 : 400,
+                    transition: 'all .1s',
+                  }}>
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Form fields */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 5 }}>Model Name *</label>
+                  <input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. YOLOv8s Medical" style={{ width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)', boxSizing: 'border-box' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 5 }}>Architecture *</label>
+                  <input value={arch} onChange={e => setArch(e.target.value)} placeholder="e.g. yolov8s" style={{ width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)', boxSizing: 'border-box' }} />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 5 }}>Engine</label>
+                  <select value={engine} onChange={e => setEngine(e.target.value)} style={{ width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)' }}>
+                    {['PyTorch', 'ONNX', 'TensorFlow', 'TensorRT', 'Hugging Face'].map(e => <option key={e}>{e}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 5 }}>Source</label>
+                  <select value={sourceType} onChange={e => setSourceType(e.target.value as 'huggingface' | 'url' | 'builtin')} style={{ width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)' }}>
+                    <option value="huggingface">HuggingFace Hub</option>
+                    <option value="url">Direct URL</option>
+                    <option value="builtin">Built-in</option>
+                  </select>
+                </div>
+              </div>
+
+              {sourceType !== 'builtin' && (
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 5 }}>
+                    {sourceType === 'huggingface' ? 'HuggingFace Repo ID' : 'Download URL'}
+                  </label>
+                  <div style={{ position: 'relative' }}>
+                    <input
+                      value={sourceUrl} onChange={e => setSourceUrl(e.target.value)}
+                      placeholder={sourceType === 'huggingface' ? 'e.g. google/vit-base-patch16-224' : 'https://…/model.pt'}
+                      style={{ width: '100%', padding: '8px 36px 8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)', boxSizing: 'border-box' }}
+                    />
+                    {sourceType === 'huggingface' && sourceUrl && (
+                      <a href={`https://huggingface.co/${sourceUrl}`} target="_blank" rel="noopener noreferrer" style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }}>
+                        <ExternalLink size={13} />
+                      </a>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 5 }}>Notes</label>
+                <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} placeholder="Notes about dataset, weights origin, etc." style={{ width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)', resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit' }} />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 22 }}>
+              <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#0ea5e9', borderColor: '#0ea5e9' }}
+                onClick={handleImport}
+                disabled={!name || !arch}
+              >
+                <Download size={14} /> Import Model
+              </button>
+            </div>
+          </>
+        )}
+
+        {step === 'importing' && (
+          <div style={{ padding: '20px 0', textAlign: 'center' }}>
+            <div style={{ width: 56, height: 56, borderRadius: 14, background: '#0ea5e918', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <Download size={26} color="#0ea5e9" />
+            </div>
+            <p style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 6 }}>Importing {name}…</p>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20 }}>
+              {sourceType === 'huggingface' ? `Downloading from HuggingFace: ${sourceUrl}` : sourceUrl || 'Loading built-in weights'}
+            </p>
+            <div style={{ height: 8, borderRadius: 4, background: 'var(--bg-elevated)', overflow: 'hidden', maxWidth: 360, margin: '0 auto' }}>
+              <div style={{ height: '100%', width: `${progress}%`, background: 'linear-gradient(90deg, #0ea5e9, #6366f1)', borderRadius: 4, transition: 'width 0.4s ease' }} />
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8, fontVariantNumeric: 'tabular-nums' }}>{progress}%</p>
+          </div>
+        )}
+
+        {step === 'done' && (
+          <div style={{ padding: '20px 0', textAlign: 'center' }}>
+            <div style={{ width: 56, height: 56, borderRadius: 14, background: '#10b98118', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <CheckCircle2 size={28} color="#10b981" />
+            </div>
+            <p style={{ fontSize: 16, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 6 }}>Import Complete!</p>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 22 }}>{name} is ready. You can now test it in Playground.</p>
+            <button className="btn btn-primary" onClick={onImported} style={{ background: '#10b981', borderColor: '#10b981' }}>
+              Done
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )

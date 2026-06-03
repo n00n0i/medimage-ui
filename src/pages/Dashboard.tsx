@@ -104,7 +104,7 @@ export default function Dashboard() {
         } catch (_) {}
 
         try {
-          const LS_TOKEN = '160d2644f4d45f84cd09f8931d20891e52f5e4cf'
+          const LS_TOKEN = 'medimage-ls-token-2026'
           const taskRes = await fetch('/api/ls/tasks?project=1&page_size=1000', {
             headers: { Authorization: `Token ${LS_TOKEN}` }
           }).catch(() => null)

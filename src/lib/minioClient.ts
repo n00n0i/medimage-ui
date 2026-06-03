@@ -1,7 +1,10 @@
 /**
- * MinIO S3-compatible client using AWS Signature V4 (Web Crypto API).
+ * MinIO S3-compatible client using AWS Signature V4.
+ * Uses @noble/hashes (pure JS) so it works in both secure and non-secure contexts.
  * Signs requests in the browser and routes them through the /api/minio proxy.
  */
+import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js'
+import { hmac as nobleHmac } from '@noble/hashes/hmac.js'
 
 /* ── Config ──────────────────────────────────────────────────── */
 export const MINIO_DEFAULTS = {
@@ -45,27 +48,24 @@ export function saveMinioConfig(cfg: Partial<MinioConfig>): void {
 }
 
 /* ── Crypto helpers ──────────────────────────────────────────── */
-async function sha256(data: ArrayBuffer | string): Promise<ArrayBuffer> {
-  const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data
-  return crypto.subtle.digest('SHA-256', buf)
+function sha256(data: ArrayBuffer | string): ArrayBuffer {
+  const buf = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data)
+  return nobleSha256(buf).buffer as ArrayBuffer
 }
 
 function toHex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
-async function hmac(key: ArrayBuffer | Uint8Array, msg: string): Promise<ArrayBuffer> {
-  const rawKey: ArrayBuffer = key instanceof Uint8Array ? key.buffer as ArrayBuffer : key
-  const k = await crypto.subtle.importKey(
-    'raw', rawKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-  )
-  return crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg))
+function hmac(key: ArrayBuffer | Uint8Array, msg: string): ArrayBuffer {
+  const k = key instanceof Uint8Array ? key : new Uint8Array(key)
+  return nobleHmac(nobleSha256, k, new TextEncoder().encode(msg)).buffer as ArrayBuffer
 }
 
-async function signingKey(secret: string, date: string, region: string): Promise<ArrayBuffer> {
-  let k = await hmac(new TextEncoder().encode('AWS4' + secret), date)
-  k = await hmac(k, region)
-  k = await hmac(k, 's3')
+function signingKey(secret: string, date: string, region: string): ArrayBuffer {
+  let k = hmac(new TextEncoder().encode('AWS4' + secret), date)
+  k = hmac(k, region)
+  k = hmac(k, 's3')
   return hmac(k, 'aws4_request')
 }
 
@@ -92,7 +92,7 @@ export async function s3Fetch(
   const amzDate = now.toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z'
   const dateStamp = amzDate.slice(0, 8)
 
-  const payloadHash = toHex(await sha256(body ?? new ArrayBuffer(0)))
+  const payloadHash = toHex(sha256(body ?? new ArrayBuffer(0)))
 
   // Canonical query string: sorted, URI-encoded
   const qs = Object.entries(query)
@@ -125,10 +125,10 @@ export async function s3Fetch(
     'AWS4-HMAC-SHA256',
     amzDate,
     credentialScope,
-    toHex(await sha256(canonicalRequest)),
+    toHex(sha256(canonicalRequest)),
   ].join('\n')
 
-  const sig = toHex(await hmac(await signingKey(secretKey, dateStamp, region), stringToSign))
+  const sig = toHex(hmac(signingKey(secretKey, dateStamp, region), stringToSign))
   const authHeader = `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeadersList}, Signature=${sig}`
 
   return fetch(`/api/minio${path}${qs ? '?' + qs : ''}`, {

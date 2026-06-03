@@ -158,10 +158,19 @@ export default function Storage() {
 
   // Fetch bucket names used by Label Studio datasets, then auto-create any missing ones in MinIO
   useEffect(() => {
-    fetch('/api/ls/storages/s3?project=1', {
-      headers: { Authorization: 'Token 160d2644f4d45f84cd09f8931d20891e52f5e4cf' },
-    })
-      .then(r => r.ok ? r.json() : [])
+    const LS_HEADERS = { Authorization: 'Token medimage-ls-token-2026' }
+    fetch('/api/ls/projects/?page_size=100', { headers: LS_HEADERS })
+      .then(r => r.ok ? r.json() : { results: [] })
+      .then(({ results: projects }: { results: any[] }) =>
+        Promise.all(
+          (projects || []).map((p: any) =>
+            fetch(`/api/ls/storages/s3?project=${p.id}`, { headers: LS_HEADERS })
+              .then(r => r.ok ? r.json() : [])
+              .catch(() => [] as any[])
+          )
+        )
+      )
+      .then((allStorages: any[][]) => allStorages.flat())
       .then(async (storages: any[]) => {
         // Derive intended bucket from title (e.g. "medimage-cxr-bucket" → "medimage-cxr")
         const deriveBucket = (s: any): string =>
@@ -485,19 +494,9 @@ export default function Storage() {
           <StatCard label="Buckets"      value={buckets.length}            icon={<Layers size={15} />} />
           <StatCard label="Total Objects" value={totalObjects.toLocaleString()} icon={<Database size={15} />} />
           <StatCard
-            label="Storage Used"
-            value={diskInfo ? `${fmtSize(totalSizeBytes)} / ${fmtSize(diskInfo.totalBytes)}` : fmtSize(totalSizeBytes)}
-            sub={diskInfo ? (() => {
-              const pct = Math.min(100, (diskInfo.usedBytes / diskInfo.totalBytes) * 100)
-              return (
-                <div style={{ marginTop: 6 }}>
-                  <div style={{ height: 4, background: 'var(--border-subtle)', borderRadius: 99, overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: `${pct.toFixed(1)}%`, background: pct > 85 ? 'var(--danger)' : pct > 60 ? 'oklch(0.75 0.15 60)' : 'var(--primary)', borderRadius: 99, transition: 'width 0.4s' }} />
-                  </div>
-                  <span style={{ fontSize: 10, marginTop: 3, display: 'block' }}>{pct.toFixed(1)}% used · {fmtSize(diskInfo.freeBytes)} free</span>
-                </div>
-              ) as any
-            })() : undefined}
+            label="Avg Object Size"
+            value={totalObjects > 0 ? fmtSize(totalSizeBytes / totalObjects) : '—'}
+            sub={totalSizeBytes > 0 ? <span style={{ fontSize: 10, marginTop: 3, display: 'block' }}>Total: {fmtSize(totalSizeBytes)}</span> as any : undefined}
             icon={<HardDrive size={15} />}
           />
           {/* MinIO Console status card */}

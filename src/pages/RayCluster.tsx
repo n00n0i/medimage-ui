@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal } from 'lucide-react'
+import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal, Cloud, Eye, EyeOff, ChevronDown, ChevronUp } from 'lucide-react'
 
 const DEFAULT_RAY_URL = 'http://100.68.53.118:8265'
 const STORAGE_KEY     = 'ray_head_url'
@@ -549,6 +549,354 @@ function SettingsModal({
 
 // ──────────────── component ───────────────────────────────────
 
+// ──────────────── Modal.com Cloud Deploy ─────────────────────
+
+const MODAL_GPUS = [
+  { id: 'cpu',      label: 'CPU Only',  vram: null, price: 0.06,  badge: 'Budget',    color: 'var(--text-muted)' },
+  { id: 'T4',       label: 'T4',        vram: 16,   price: 0.59,  badge: 'Entry',     color: 'oklch(65% 0.14 160)' },
+  { id: 'L4',       label: 'L4',        vram: 24,   price: 0.80,  badge: 'Efficient', color: 'oklch(65% 0.14 160)' },
+  { id: 'A10G',     label: 'A10G',      vram: 24,   price: 1.10,  badge: 'Balanced',  color: 'var(--primary)' },
+  { id: 'A100-40GB',label: 'A100 40G',  vram: 40,   price: 3.04,  badge: 'High End',  color: 'var(--accent)' },
+  { id: 'A100-80GB',label: 'A100 80G',  vram: 80,   price: 4.20,  badge: 'High End',  color: 'var(--accent)' },
+  { id: 'H100',     label: 'H100',      vram: 80,   price: 3.95,  badge: 'Top Tier',  color: 'oklch(65% 0.20 30)' },
+] as const
+
+type ModalGpuId = typeof MODAL_GPUS[number]['id']
+type ModalStatus = 'idle' | 'deploying' | 'running' | 'stopping' | 'error'
+
+interface ModalConfig {
+  tokenId: string
+  tokenSecret: string
+  gpuType: ModalGpuId
+  numWorkers: number
+}
+
+const MODAL_KEY = 'modal_deploy_config'
+
+function loadModalConfig(): ModalConfig {
+  try {
+    return { tokenId: '', tokenSecret: '', gpuType: 'T4', numWorkers: 1, ...JSON.parse(localStorage.getItem(MODAL_KEY) ?? '{}') }
+  } catch {
+    return { tokenId: '', tokenSecret: '', gpuType: 'T4', numWorkers: 1 }
+  }
+}
+
+const STATUS_LABEL: Record<ModalStatus, string> = {
+  idle:      'Not deployed',
+  deploying: 'Deploying to Modal…',
+  running:   'Running on Modal',
+  stopping:  'Stopping…',
+  error:     'Deploy failed',
+}
+const STATUS_COLOR: Record<ModalStatus, string> = {
+  idle:      'var(--text-muted)',
+  deploying: 'var(--warning)',
+  running:   'var(--success)',
+  stopping:  'var(--warning)',
+  error:     'var(--danger)',
+}
+
+function ModalDeployPanel() {
+  const [cfg, setCfg] = useState<ModalConfig>(loadModalConfig)
+  const [showSecret, setShowSecret] = useState(false)
+  const [status, setStatus] = useState<ModalStatus>('idle')
+  const [rayUrl, setRayUrl] = useState<string | null>(null)
+  const [logs, setLogs] = useState<string[]>([])
+  const [showLogs, setShowLogs] = useState(false)
+  const [errMsg, setErrMsg] = useState<string | null>(null)
+
+  // Persist config (skip secrets for security — user re-enters on reload)
+  useEffect(() => {
+    localStorage.setItem(MODAL_KEY, JSON.stringify({ ...cfg, tokenSecret: '' }))
+  }, [cfg])
+
+  // Poll status when active
+  useEffect(() => {
+    if (status === 'idle') return
+    const id = setInterval(async () => {
+      try {
+        const r = await fetch('/api/modal/status')
+        if (!r.ok) return
+        const d = await r.json()
+        setStatus(d.status as ModalStatus)
+        if (d.ray_url) setRayUrl(d.ray_url)
+        if (d.logs?.length) setLogs(d.logs)
+      } catch { /* ignore */ }
+    }, 3000)
+    return () => clearInterval(id)
+  }, [status])
+
+  // Sync status on mount
+  useEffect(() => {
+    fetch('/api/modal/status').then(r => r.ok ? r.json() : null).then(d => {
+      if (!d) return
+      setStatus(d.status as ModalStatus)
+      if (d.ray_url) setRayUrl(d.ray_url)
+      if (d.logs?.length) setLogs(d.logs)
+    }).catch(() => {})
+  }, [])
+
+  const handleStart = async () => {
+    setStatus('deploying')
+    setErrMsg(null)
+    setLogs([])
+    setRayUrl(null)
+    try {
+      const r = await fetch('/api/modal/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token_id: cfg.tokenId,
+          token_secret: cfg.tokenSecret,
+          gpu_type: cfg.gpuType,
+          num_workers: cfg.numWorkers,
+        }),
+      })
+      const d = await r.json()
+      if (!r.ok) {
+        setStatus('error')
+        setErrMsg(d.detail ?? 'Deploy failed')
+      }
+    } catch (e) {
+      setStatus('error')
+      setErrMsg((e as Error).message)
+    }
+  }
+
+  const handleStop = async () => {
+    setStatus('stopping')
+    try {
+      await fetch('/api/modal/stop', { method: 'POST' })
+    } catch { /* ignore */ }
+    setStatus('idle')
+    setRayUrl(null)
+  }
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '7px 10px', borderRadius: 7, fontSize: 12,
+    background: 'var(--bg-base)', border: '1px solid var(--border)',
+    color: 'var(--text-primary)', outline: 'none', boxSizing: 'border-box',
+    fontFamily: 'var(--font-mono)',
+  }
+
+  const canStart = cfg.tokenId.trim().length > 0 && cfg.tokenSecret.trim().length > 0
+  const isActive = status === 'running' || status === 'deploying' || status === 'stopping'
+  const selectedGpu = MODAL_GPUS.find(g => g.id === cfg.gpuType)!
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      {/* ── Header ── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+        <Cloud size={14} style={{ color: 'var(--primary)' }} />
+        <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>
+          Modal.com Cloud Deploy
+        </h3>
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>— serverless GPU Ray cluster</span>
+        <a
+          href="https://modal.com/settings"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--primary)', display: 'flex', alignItems: 'center', gap: 4, textDecoration: 'none' }}
+        >
+          Get Token <ExternalLink size={10} />
+        </a>
+      </div>
+
+      {/* ── Credentials ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
+        <div>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Token ID</label>
+          <input
+            style={inputStyle}
+            type="text"
+            value={cfg.tokenId}
+            onChange={e => setCfg(c => ({ ...c, tokenId: e.target.value }))}
+            placeholder="ak-xxxxxxxxxxxxxxxxxxxxxxxx"
+            autoComplete="off"
+          />
+        </div>
+        <div style={{ position: 'relative' }}>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Token Secret</label>
+          <input
+            style={{ ...inputStyle, paddingRight: 32 }}
+            type={showSecret ? 'text' : 'password'}
+            value={cfg.tokenSecret}
+            onChange={e => setCfg(c => ({ ...c, tokenSecret: e.target.value }))}
+            placeholder="as-xxxxxxxxxxxxxxxxxxxxxxxx"
+            autoComplete="new-password"
+          />
+          <button
+            onClick={() => setShowSecret(s => !s)}
+            style={{ position: 'absolute', right: 8, top: 22, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 2 }}
+          >
+            {showSecret ? <EyeOff size={13} /> : <Eye size={13} />}
+          </button>
+        </div>
+      </div>
+
+      {/* ── GPU Card Selector ── */}
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 8 }}>Instance Type</label>
+        <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4 }}>
+          {MODAL_GPUS.map(gpu => {
+            const sel = cfg.gpuType === gpu.id
+            return (
+              <button
+                key={gpu.id}
+                onClick={() => setCfg(c => ({ ...c, gpuType: gpu.id as ModalGpuId }))}
+                disabled={isActive}
+                style={{
+                  flexShrink: 0, padding: '8px 10px', borderRadius: 8, cursor: isActive ? 'default' : 'pointer',
+                  border: `1.5px solid ${sel ? gpu.color : 'var(--border)'}`,
+                  background: sel ? `color-mix(in oklch, ${gpu.color} 10%, var(--bg-elevated))` : 'var(--bg-elevated)',
+                  textAlign: 'center', minWidth: 76,
+                  transition: 'border-color 0.15s, background 0.15s',
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 700, color: sel ? gpu.color : 'var(--text-primary)', marginBottom: 3 }}>
+                  {gpu.label}
+                </div>
+                {gpu.vram ? (
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{gpu.vram} GB VRAM</div>
+                ) : (
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>CPU only</div>
+                )}
+                <div style={{ fontSize: 10, color: gpu.color, fontWeight: 600, marginTop: 2 }}>${gpu.price}/hr</div>
+                <div style={{
+                  fontSize: 9, marginTop: 3, padding: '1px 5px', borderRadius: 3, display: 'inline-block',
+                  background: `color-mix(in oklch, ${gpu.color} 15%, transparent)`,
+                  color: gpu.color, fontWeight: 600,
+                }}>
+                  {gpu.badge}
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* ── Workers + Action Row ── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        {/* Workers counter */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Workers:</span>
+          <button
+            className="btn btn-secondary btn-sm"
+            disabled={isActive}
+            onClick={() => setCfg(c => ({ ...c, numWorkers: Math.max(0, c.numWorkers - 1) }))}
+            style={{ padding: '2px 8px', fontWeight: 700 }}
+          >−</button>
+          <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', minWidth: 22, textAlign: 'center' }}>
+            {cfg.numWorkers}
+          </span>
+          <button
+            className="btn btn-secondary btn-sm"
+            disabled={isActive}
+            onClick={() => setCfg(c => ({ ...c, numWorkers: Math.min(8, c.numWorkers + 1) }))}
+            style={{ padding: '2px 8px', fontWeight: 700 }}
+          >+</button>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            (~${((cfg.numWorkers + 1) * selectedGpu.price).toFixed(2)}/hr total)
+          </span>
+        </div>
+
+        {/* Start / Stop */}
+        {status === 'running' ? (
+          <button
+            className="btn btn-sm"
+            onClick={handleStop}
+            style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            <X size={12} /> Stop Cluster
+          </button>
+        ) : (
+          <button
+            className="btn btn-sm"
+            onClick={handleStart}
+            disabled={!canStart || status === 'deploying' || status === 'stopping'}
+            style={{
+              background: canStart ? 'var(--primary)' : undefined,
+              color: canStart ? '#fff' : undefined,
+              border: 'none', display: 'flex', alignItems: 'center', gap: 6,
+              opacity: (!canStart || isActive) ? 0.55 : 1,
+            }}
+          >
+            {status === 'deploying' ? (
+              <><RefreshCw size={12} className="animate-spin" /> Deploying…</>
+            ) : status === 'stopping' ? (
+              <><RefreshCw size={12} className="animate-spin" /> Stopping…</>
+            ) : (
+              <><Cloud size={12} /> Start Cluster</>
+            )}
+          </button>
+        )}
+
+        {/* Ray Dashboard link when running */}
+        {rayUrl && (
+          <a
+            href={rayUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            <ExternalLink size={12} /> Ray Dashboard
+          </a>
+        )}
+      </div>
+
+      {/* ── Status Bar ── */}
+      {status !== 'idle' && (
+        <div style={{
+          marginTop: 12, display: 'flex', alignItems: 'center', gap: 8,
+          padding: '7px 12px', borderRadius: 7,
+          background: `color-mix(in oklch, ${STATUS_COLOR[status]} 8%, transparent)`,
+          border: `1px solid color-mix(in oklch, ${STATUS_COLOR[status]} 20%, transparent)`,
+        }}>
+          <div style={{
+            width: 7, height: 7, borderRadius: '50%',
+            background: STATUS_COLOR[status],
+            boxShadow: status === 'running' ? `0 0 6px ${STATUS_COLOR[status]}` : undefined,
+            flexShrink: 0,
+            animation: (status === 'deploying' || status === 'stopping') ? 'pulse 1.4s infinite' : undefined,
+          }} />
+          <span style={{ fontSize: 12, color: STATUS_COLOR[status], fontWeight: 500, flex: 1 }}>
+            {errMsg ?? STATUS_LABEL[status]}
+            {rayUrl && status === 'running' && (
+              <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                {rayUrl.replace('https://', '')}
+              </span>
+            )}
+          </span>
+          {logs.length > 0 && (
+            <button
+              onClick={() => setShowLogs(s => !s)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3, fontSize: 11 }}
+            >
+              Logs {showLogs ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ── Deploy Logs ── */}
+      {showLogs && logs.length > 0 && (
+        <pre style={{
+          marginTop: 8, maxHeight: 160, overflowY: 'auto',
+          padding: '8px 10px', borderRadius: 7, fontSize: 10,
+          background: 'var(--bg-base)', border: '1px solid var(--border)',
+          color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+        }}>
+          {logs.join('\n')}
+        </pre>
+      )}
+    </div>
+  )
+}
+
+// ──────────────────────────────────────────────────────────────
+
 export default function RayCluster() {
   // Init synchronously from localStorage cache; async override from backend on mount
   const [rayUrl, setRayUrl] = useState<string>(
@@ -951,9 +1299,14 @@ export default function RayCluster() {
             </div>
             <AddWorkerTab headUrl={rayUrl} />
           </div>
+
+          {/* Modal.com Cloud Deploy */}
+          <ModalDeployPanel />
         </>
       )}
+
+      {/* Modal.com Cloud Deploy — always visible (shown below disconnected state too) */}
+      {!isConnected && <ModalDeployPanel />}
     </div>
   )
 }
-

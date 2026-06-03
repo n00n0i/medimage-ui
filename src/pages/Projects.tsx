@@ -450,6 +450,51 @@ export default function Projects() {
                   </div>
                 )}
 
+                {/* Expanded storage table — above footer */}
+                {isExpanded && (
+                  <div style={{ borderTop: '1px solid var(--border-subtle)', padding: '12px 14px', overflowX: 'auto' }}>
+                    {p.uniqueStorages.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--text-muted)' }}>
+                        <Database size={24} style={{ margin: '0 auto 8px', opacity: 0.25, display: 'block' }} />
+                        <p style={{ fontSize: 12 }}>No storage connected</p>
+                      </div>
+                    ) : (
+                      <table className="data-table" style={{ minWidth: 380 }}>
+                        <thead>
+                          <tr>
+                            <th style={{ whiteSpace: 'nowrap' }}>Bucket</th>
+                            <th style={{ whiteSpace: 'nowrap' }}>Status</th>
+                            <th style={{ whiteSpace: 'nowrap' }}>Synced</th>
+                            <th style={{ whiteSpace: 'nowrap' }}>Last sync</th>
+                            <th></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {p.uniqueStorages.map(s => (
+                            <tr key={s.derivedBucket}>
+                              <td style={{ whiteSpace: 'nowrap' }}>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-primary)' }}>{s.derivedBucket}</span>
+                                {s.prefix && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', marginLeft: 5 }}>/{s.prefix}</span>}
+                              </td>
+                              <td><StatusBadge status={s.status} /></td>
+                              <td style={{ fontSize: 13, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{s.last_sync_count?.toLocaleString() ?? '—'}</td>
+                              <td style={{ fontSize: 12, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{fmt(s.last_sync)}</td>
+                              <td>
+                                <button className="btn btn-secondary btn-sm" onClick={() => syncOne(s)} disabled={s.status === 'started' || syncingId !== null}>
+                                  {s.status === 'started'
+                                    ? <><Loader2 size={11} className="animate-spin" />Syncing</>
+                                    : <><RefreshCw size={11} />Sync</>
+                                  }
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+
                 {/* Footer buttons */}
                 <div style={{ display: 'flex', gap: 8, padding: '12px 16px', marginTop: 'auto', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}>
                   {p.uniqueStorages.length > 0 && (
@@ -472,51 +517,6 @@ export default function Projects() {
                     {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
                   </button>
                 </div>
-
-                {/* Expanded storage table */}
-                {isExpanded && (
-                  <div style={{ borderTop: '1px solid var(--border-subtle)', padding: '14px 16px' }}>
-                    {p.uniqueStorages.length === 0 ? (
-                      <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--text-muted)' }}>
-                        <Database size={24} style={{ margin: '0 auto 8px', opacity: 0.25, display: 'block' }} />
-                        <p style={{ fontSize: 12 }}>No storage connected</p>
-                      </div>
-                    ) : (
-                      <table className="data-table">
-                        <thead>
-                          <tr>
-                            <th>Bucket</th>
-                            <th>Status</th>
-                            <th>Synced</th>
-                            <th>Last sync</th>
-                            <th></th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {p.uniqueStorages.map(s => (
-                            <tr key={s.derivedBucket}>
-                              <td>
-                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-primary)' }}>{s.derivedBucket}</span>
-                                {s.prefix && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', marginLeft: 5 }}>/{s.prefix}</span>}
-                              </td>
-                              <td><StatusBadge status={s.status} /></td>
-                              <td style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{s.last_sync_count?.toLocaleString() ?? '—'}</td>
-                              <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>{fmt(s.last_sync)}</td>
-                              <td>
-                                <button className="btn btn-secondary btn-sm" onClick={() => syncOne(s)} disabled={s.status === 'started' || syncingId !== null}>
-                                  {s.status === 'started'
-                                    ? <><Loader2 size={11} className="animate-spin" />Syncing</>
-                                    : <><RefreshCw size={11} />Sync</>
-                                  }
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                )}
               </div>
             )
           })}
