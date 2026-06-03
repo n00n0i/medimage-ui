@@ -22,33 +22,33 @@ interface Model {
 
 // ─── Pretrained presets ───────────────────────────────────────────────────────
 
-const PRETRAINED: Record<string, Array<{ label: string; arch: string; engine: string; hf?: string }>> = {
+const PRETRAINED: Record<string, Array<{ label: string; arch: string; engine: string; hf?: string; domain?: ModelDomain }>> = {
   classification: [
-    { label: 'EfficientNet-B4',    arch: 'efficientnet-b4',              engine: 'PyTorch',  hf: 'google/efficientnet-b4' },
-    { label: 'EfficientNet-B2',    arch: 'efficientnet-b2',              engine: 'PyTorch',  hf: 'google/efficientnet-b2' },
-    { label: 'ResNet-50',          arch: 'resnet50',                     engine: 'PyTorch',  hf: 'microsoft/resnet-50' },
-    { label: 'ConvNeXt-Tiny',      arch: 'convnext_tiny',                engine: 'PyTorch',  hf: 'facebook/convnext-tiny-224' },
-    { label: 'ViT-Base/16',        arch: 'vit-b-16',                     engine: 'PyTorch',  hf: 'google/vit-base-patch16-224' },
-    { label: 'Swin-Tiny',          arch: 'swin-tiny-patch4',             engine: 'PyTorch',  hf: 'microsoft/swin-tiny-patch4-window7-224' },
-    { label: 'DINOv2-Small',       arch: 'vit_small_patch14_dinov2',     engine: 'TIMM',     hf: 'facebook/dinov2-small' },
-    { label: 'EfficientViT-M5',    arch: 'efficientvit_m5',              engine: 'TIMM',     hf: 'mit-han-lab/efficientvit-m5' },
+    { label: 'EfficientNet-B4',    arch: 'efficientnet-b4',              engine: 'PyTorch',  hf: 'google/efficientnet-b4',                                  domain: 'generic' },
+    { label: 'EfficientNet-B2',    arch: 'efficientnet-b2',              engine: 'PyTorch',  hf: 'google/efficientnet-b2',                                  domain: 'generic' },
+    { label: 'ResNet-50',          arch: 'resnet50',                     engine: 'PyTorch',  hf: 'microsoft/resnet-50',                                     domain: 'generic' },
+    { label: 'ConvNeXt-Tiny',      arch: 'convnext_tiny',                engine: 'PyTorch',  hf: 'facebook/convnext-tiny-224',                              domain: 'generic' },
+    { label: 'ViT-Base/16',        arch: 'vit-b-16',                     engine: 'PyTorch',  hf: 'google/vit-base-patch16-224',                             domain: 'generic' },
+    { label: 'Swin-Tiny',          arch: 'swin-tiny-patch4',             engine: 'PyTorch',  hf: 'microsoft/swin-tiny-patch4-window7-224',                  domain: 'generic' },
+    { label: 'DINOv2-Small',       arch: 'vit_small_patch14_dinov2',     engine: 'TIMM',     hf: 'facebook/dinov2-small',                                   domain: 'industrial' },
+    { label: 'EfficientViT-M5',    arch: 'efficientvit_m5',              engine: 'TIMM',     hf: 'mit-han-lab/efficientvit-m5',                             domain: 'edge' },
   ],
   detection: [
-    { label: 'YOLOv8n',            arch: 'yolov8n',                      engine: 'PyTorch',  hf: 'Ultralytics/assets' },
-    { label: 'YOLOv8s',            arch: 'yolov8s',                      engine: 'PyTorch',  hf: 'Ultralytics/assets' },
-    { label: 'YOLOv8m',            arch: 'yolov8m',                      engine: 'PyTorch',  hf: 'Ultralytics/assets' },
-    { label: 'YOLOv9c',            arch: 'yolov9c',                      engine: 'PyTorch',  hf: 'Ultralytics/assets' },
-    { label: 'RT-DETR-L',          arch: 'rtdetr-l',                     engine: 'PyTorch',  hf: 'PekingU/rtdetr_l' },
-    { label: 'DETR ResNet-50',     arch: 'detr-resnet-50',               engine: 'PyTorch',  hf: 'facebook/detr-resnet-50' },
-    { label: 'Grounding DINO',     arch: 'groundingdino-b',              engine: 'PyTorch',  hf: 'IDEA-Research/grounding-dino-base' },
+    { label: 'YOLOv8n',            arch: 'yolov8n',                      engine: 'PyTorch',  hf: 'Ultralytics/assets',                                      domain: 'edge' },
+    { label: 'YOLOv8s',            arch: 'yolov8s',                      engine: 'PyTorch',  hf: 'Ultralytics/assets',                                      domain: 'generic' },
+    { label: 'YOLOv8m',            arch: 'yolov8m',                      engine: 'PyTorch',  hf: 'Ultralytics/assets',                                      domain: 'generic' },
+    { label: 'YOLOv9c',            arch: 'yolov9c',                      engine: 'PyTorch',  hf: 'Ultralytics/assets',                                      domain: 'industrial' },
+    { label: 'RT-DETR-L',          arch: 'rtdetr-l',                     engine: 'PyTorch',  hf: 'PekingU/rtdetr_l',                                        domain: 'generic' },
+    { label: 'DETR ResNet-50',     arch: 'detr-resnet-50',               engine: 'PyTorch',  hf: 'facebook/detr-resnet-50',                                 domain: 'generic' },
+    { label: 'Grounding DINO',     arch: 'groundingdino-b',              engine: 'PyTorch',  hf: 'IDEA-Research/grounding-dino-base',                       domain: 'industrial' },
   ],
   segmentation: [
-    { label: 'SAM ViT-B',          arch: 'sam-vit-b',                    engine: 'PyTorch',  hf: 'facebook/sam-vit-base' },
-    { label: 'SAM 2 Large',        arch: 'sam2-l',                       engine: 'PyTorch',  hf: 'facebook/sam2-hiera-large' },
-    { label: 'YOLOv8-Seg',         arch: 'yolov8m-seg',                  engine: 'PyTorch',  hf: 'Ultralytics/assets' },
-    { label: 'Mask R-CNN',         arch: 'maskrcnn_resnet50_fpn',        engine: 'PyTorch',  hf: 'torchvision/fasterrcnn_resnet50_fpn' },
-    { label: 'SegFormer-B2',       arch: 'segformer-b2',                 engine: 'PyTorch',  hf: 'nvidia/segformer-b2-finetuned-ade-512-512' },
-    { label: 'Mask2Former',        arch: 'mask2former',                  engine: 'PyTorch',  hf: 'facebook/mask2former-swin-base-coco-panoptic' },
+    { label: 'SAM ViT-B',          arch: 'sam-vit-b',                    engine: 'PyTorch',  hf: 'facebook/sam-vit-base',                                   domain: 'generic' },
+    { label: 'SAM 2 Large',        arch: 'sam2-l',                       engine: 'PyTorch',  hf: 'facebook/sam2-hiera-large',                               domain: 'generic' },
+    { label: 'YOLOv8-Seg',         arch: 'yolov8m-seg',                  engine: 'PyTorch',  hf: 'Ultralytics/assets',                                      domain: 'industrial' },
+    { label: 'Mask R-CNN',         arch: 'maskrcnn_resnet50_fpn',        engine: 'PyTorch',  hf: 'torchvision/fasterrcnn_resnet50_fpn',                     domain: 'generic' },
+    { label: 'SegFormer-B2',       arch: 'segformer-b2',                 engine: 'PyTorch',  hf: 'nvidia/segformer-b2-finetuned-ade-512-512',               domain: 'generic' },
+    { label: 'Mask2Former',        arch: 'mask2former',                  engine: 'PyTorch',  hf: 'facebook/mask2former-swin-base-coco-panoptic',            domain: 'generic' },
   ],
 }
 
@@ -83,9 +83,48 @@ function parseFinalLoss(log: string): string | null {
 }
 
 const TYPE_COLORS: Record<string, string> = {
-  classification: '#6366f1',
-  detection:      '#f59e0b',
-  segmentation:   '#10b981',
+  classification:  '#6366f1',
+  detection:       '#f59e0b',
+  segmentation:    '#10b981',
+  'llm-text':      '#8b5cf6',
+  'vlm-finetune':  '#3b82f6',
+  'self-supervised':'#14b8a6',
+  'export-edge':   '#64748b',
+}
+
+// ─── Domain badges ────────────────────────────────────────────────────────────
+type ModelDomain = 'generic' | 'edge' | 'industrial' | 'medical' | 'reasoning' | 'multilingual'
+
+const DOMAIN_CONFIG: Record<ModelDomain, { label: string; color: string }> = {
+  generic:      { label: 'Generic',      color: '#64748b' },
+  edge:         { label: 'Edge',         color: '#0d9488' },
+  industrial:   { label: 'Industrial',   color: '#f97316' },
+  medical:      { label: 'Medical',      color: '#ec4899' },
+  reasoning:    { label: 'Reasoning',    color: '#6366f1' },
+  multilingual: { label: 'Multilingual', color: '#0ea5e9' },
+}
+
+function inferDomain(model: string): ModelDomain {
+  const m = model.toLowerCase()
+  if (/med|chex|medsam|biomedclip|retinal|fundus|clinical|biopsy/.test(m)) return 'medical'
+  if (/deepseek.*r1|qwen3/.test(m)) return 'reasoning'
+  if (/qwen2[\.\-]5|qwen2-vl|qwen2_vl|internvl/.test(m)) return 'multilingual'
+  if (/nano|mobilenet|efficientvit|smolvlm|smol.vlm|phi.?3[\._\-]5.?mini|paligemma|efficientsam/.test(m)) return 'edge'
+  if (/padim|patchcore|groundingdino|grounding.dino|yolov9/.test(m)) return 'industrial'
+  return 'generic'
+}
+
+function DomainBadge({ model, domain }: { model?: string; domain?: ModelDomain }) {
+  const d: ModelDomain = domain ?? (model ? inferDomain(model) : 'generic')
+  const cfg = DOMAIN_CONFIG[d]
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 10,
+      background: cfg.color + '20', color: cfg.color, letterSpacing: '0.03em',
+    }}>
+      {cfg.label}
+    </span>
+  )
 }
 
 export default function Models() {
@@ -399,6 +438,7 @@ export default function Models() {
                         VLM
                       </span>
                     )}
+                    <DomainBadge model={m.model} />
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
                     {m.model} &middot; {m.engine} &middot; {m.dataset} &middot; {m.epochs} epochs
@@ -729,14 +769,23 @@ function ImportModal({ onClose, onImported }: { onClose: () => void; onImported:
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 {presets.map(p => (
                   <button key={p.label} onClick={() => applyPreset(p)} style={{
-                    padding: '5px 12px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                    padding: '5px 10px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
                     border: `1px solid ${selectedPreset === p.label ? TYPE_COLOR[trainingType] : 'var(--border-default)'}`,
                     background: selectedPreset === p.label ? TYPE_COLOR[trainingType] + '18' : 'var(--bg-surface)',
                     color: selectedPreset === p.label ? TYPE_COLOR[trainingType] : 'var(--text-secondary)',
                     fontWeight: selectedPreset === p.label ? 600 : 400,
                     transition: 'all .1s',
+                    display: 'flex', alignItems: 'center', gap: 6,
                   }}>
                     {p.label}
+                    {p.domain && (() => {
+                      const cfg = DOMAIN_CONFIG[p.domain]
+                      return (
+                        <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 8, background: cfg.color + '22', color: cfg.color }}>
+                          {cfg.label}
+                        </span>
+                      )
+                    })()}
                   </button>
                 ))}
               </div>
