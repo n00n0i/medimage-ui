@@ -96,6 +96,7 @@ services:
     volumes:
       - jupyter-data:/home/jovyan/work
       - ./jupyter_config.py:/home/jovyan/.jupyter/jupyter_server_config.py:ro
+      - ./notebooks:/home/jovyan/work/templates:ro
     user: root
     restart: unless-stopped
 
