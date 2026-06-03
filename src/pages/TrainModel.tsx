@@ -122,6 +122,75 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   ],
 }
 
+// ─── Data-type compatibility per model ───────────────────────────────────────────────
+const _A: DataType[] = ['rgb', 'thermal', 'xray', 'microscopy', 'lidar', 'general'] // all
+const _V: DataType[] = ['rgb', 'thermal', 'xray', 'microscopy', 'general']           // visual (no lidar)
+const _C: DataType[] = ['rgb', 'thermal', 'general']                                 // camera-based
+const _X: DataType[] = ['xray', 'microscopy', 'rgb', 'general']                      // precision detail
+const _I: DataType[] = ['rgb', 'thermal', 'xray', 'general']                         // inspection/anomaly
+
+const MODEL_DATA_TYPES: Record<string, DataType[]> = {
+  // Classification
+  'eff-b2':            _A,
+  'eff-b4':            _V,
+  'mobilenet':         _C,
+  'res50':             _A,
+  'convnext':          ['rgb', 'thermal', 'microscopy', 'general'],
+  'regnet':            ['rgb', 'general'],
+  'swin-t':            ['rgb', 'thermal', 'microscopy', 'general'],
+  'vit-b':             ['rgb', 'general'],
+  'dino-s':            ['rgb', 'thermal', 'microscopy', 'general'],
+  'efficientvit':      ['rgb', 'general'],
+  // Detection
+  'yolov8-s':          _C,
+  'yolov8-m':          _C,
+  'yolov8-l':          _C,
+  'yolonano':          ['rgb', 'general'],
+  'yolov9-c':          _C,
+  'rt-detr':           _C,
+  'detr':              ['rgb', 'general'],
+  'grounding':         ['rgb', 'general'],
+  // Segmentation
+  'sam-b':             _V,
+  'sam-l':             _V,
+  'sam2':              _C,
+  'unet':              _V,
+  'unetpp':            _X,
+  'deeplabv3':         _C,
+  'maskrcnn':          _C,
+  'yoloseg':           _C,
+  'segment-anything2': ['rgb', 'general'],
+  // LLM text (data type irrelevant — text model)
+  'llama31-8b':        _A,
+  'llama32-3b':        _A,
+  'mistral-7b':        _A,
+  'qwen25-7b':         _A,
+  'phi35-mini':        _A,
+  'gemma2-2b':         _A,
+  'deepseek-r1':       _A,
+  'qwen3-14b':         _A,
+  // VLM fine-tune
+  'llava16-7b':        ['rgb', 'xray', 'microscopy', 'general'],
+  'qwen2vl-7b':        _V,
+  'internvl2':         _V,
+  'phi4v':             ['rgb', 'general'],
+  'paligemma':         ['rgb', 'general'],
+  'smolvlm':           ['rgb', 'general'],
+  // Self-supervised / anomaly
+  'mae':               ['rgb', 'general'],
+  'dino':              ['rgb', 'microscopy', 'general'],
+  'simCLR':            _V,
+  'byol':              _V,
+  'padim':             _I,
+  'patchcore':         _I,
+  // Export formats (data-type agnostic)
+  'tflite':            _A,
+  'onnx':              _A,
+  'tensorrt':          _A,
+  'openvino':          _A,
+  'coreml':            _A,
+}
+
 // ─── Image Domain Labels ──────────────────────────────────────────────────────
 const DATA_TYPE_LABELS: Record<DataType, string> = {
   rgb:        'Standard RGB Camera',
@@ -170,6 +239,10 @@ export default function TrainModel() {
   const [toast, setToast] = useState<{msg: string; type: 'success' | 'error'} | null>(null)
   const [launching, setLaunching] = useState(false)
   const [jobId, setJobId] = useState('')
+  const [showAllModels, setShowAllModels] = useState(false)
+
+  // Reset showAllModels when training type changes
+  useEffect(() => { setShowAllModels(false) }, [config.trainingType])
 
   // Re-train: detect ?retrain=<jobId>, fetch job, pre-fill config
   useEffect(() => {
@@ -250,8 +323,14 @@ export default function TrainModel() {
     if (gpuFreeGb !== null) return parseRequiredGb(opt.hardware) <= gpuFreeGb
     return opt.compatible
   }
-  const compatibleOptions   = trainingOptions.filter(o => isCompatible(o))
-  const incompatibleOptions = trainingOptions.filter(o => !isCompatible(o))
+
+  // Data-type filtering
+  const getModelDT   = (opt: TrainOption) => MODEL_DATA_TYPES[opt.value] ?? _A
+  const isDataMatch  = (opt: TrainOption) => getModelDT(opt).includes(config.dataType)
+  const filteredByDomain  = showAllModels ? trainingOptions : trainingOptions.filter(isDataMatch)
+  const hiddenCount       = showAllModels ? 0 : trainingOptions.filter(o => !isDataMatch(o)).length
+  const compatibleOptions   = filteredByDomain.filter(o => isCompatible(o))
+  const incompatibleOptions = filteredByDomain.filter(o => !isCompatible(o))
 
   const set = <K extends keyof TrainingConfig>(key: K, val: TrainingConfig[K]) => {
     setConfig(prev => ({ ...prev, [key]: val }))
@@ -642,9 +721,24 @@ export default function TrainModel() {
       {step === 2 && (
         <div>
           <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>
-            แนะนำ {config.trainingType} สำหรับ {DATA_TYPE_LABELS[config.dataType]}{gpuFreeGb !== null ? ` — GPU ว่างอยู่ ${gpuFreeGb} GB (Ray cluster)` : ''}
-          </p>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 8 }}>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+              {showAllModels
+                ? <span>All models <strong style={{ color: 'var(--text-primary)' }}>({trainingOptions.length})</strong></span>
+                : <span>{filteredByDomain.length} models for <strong style={{ color: 'var(--text-primary)' }}>{DATA_TYPE_LABELS[config.dataType]}</strong></span>
+              }
+              {gpuFreeGb !== null && <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>· GPU ว่าง {gpuFreeGb} GB</span>}
+            </p>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)', userSelect: 'none' as const }}>
+              <input
+                type="checkbox"
+                checked={showAllModels}
+                onChange={e => setShowAllModels(e.target.checked)}
+                style={{ width: 14, height: 14, cursor: 'pointer', accentColor: 'var(--primary)' }}
+              />
+              Show all models ({trainingOptions.length} total)
+            </label>
+          </div>
 
           {/* Compatible */}
           <div className="mb-6">
@@ -671,7 +765,22 @@ export default function TrainModel() {
                     <span>·</span>
                     <span>{opt.model}</span>
                   </div>
-                  <div style={{ marginTop: 12, fontSize: 12, color: 'var(--primary-hover)', fontWeight: 500 }}>
+                  {showAllModels && (
+                    <div style={{ marginTop: 8, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                      {getModelDT(opt).map(dt => (
+                        <span key={dt} style={{
+                          fontSize: 9, padding: '1px 5px', borderRadius: 5, fontWeight: 600,
+                          background: dt === config.dataType ? 'var(--primary)' : 'var(--bg-elevated)',
+                          color: dt === config.dataType ? '#fff' : 'var(--text-muted)',
+                          border: '1px solid',
+                          borderColor: dt === config.dataType ? 'var(--primary)' : 'var(--border-default)',
+                        }}>
+                          {dt}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ marginTop: 8, fontSize: 12, color: 'var(--primary-hover)', fontWeight: 500 }}>
                     เลือก model นี้ →
                   </div>
                 </button>
@@ -679,16 +788,29 @@ export default function TrainModel() {
             </div>
           </div>
 
-          {/* Incompatible (dimmed) */}
+          {/* Hidden models (other data types) */}
+          {hiddenCount > 0 && (
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', borderRadius: 8, background: 'var(--bg-elevated)', marginBottom: 16, cursor: 'pointer', border: '1px dashed var(--border-default)' }}
+              onClick={() => setShowAllModels(true)}
+            >
+              <span style={{ fontSize: 12, color: 'var(--text-muted)', flex: 1 }}>
+                +{hiddenCount} more model{hiddenCount > 1 ? 's' : ''} available for other data types
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--primary)', fontWeight: 600 }}>Show all →</span>
+            </div>
+          )}
+
+          {/* Incompatible (dimmed but clickable) */}
           {incompatibleOptions.length > 0 && (
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
                 <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--border-subtle)' }} />
-                <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-muted)' }}>Requires more powerful hardware</span>
+                <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-muted)' }}>Requires more hardware — click to select anyway</span>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3" style={{ opacity: 0.45 }}>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3" style={{ opacity: 0.5 }}>
                 {incompatibleOptions.map(opt => (
-                  <div key={opt.value} className="card text-left">
+                  <button key={opt.value} className="card text-left" onClick={() => handleModelSelect(opt)} style={{ cursor: 'pointer', width: '100%' }}>
                     <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
                       <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-muted)' }}>{opt.label}</h3>
                       <span className="badge badge-warning" style={{ fontSize: 11 }}>{opt.hardware}</span>
@@ -699,7 +821,22 @@ export default function TrainModel() {
                       <span>·</span>
                       <span>{opt.model}</span>
                     </div>
-                  </div>
+                    {showAllModels && (
+                      <div style={{ marginTop: 8, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        {getModelDT(opt).map(dt => (
+                          <span key={dt} style={{
+                            fontSize: 9, padding: '1px 5px', borderRadius: 5, fontWeight: 600,
+                            background: dt === config.dataType ? 'var(--primary)' : 'var(--bg-elevated)',
+                            color: dt === config.dataType ? '#fff' : 'var(--text-muted)',
+                            border: '1px solid',
+                            borderColor: dt === config.dataType ? 'var(--primary)' : 'var(--border-default)',
+                          }}>
+                            {dt}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </button>
                 ))}
               </div>
             </div>
