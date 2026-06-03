@@ -14,6 +14,7 @@ const navItems = [
   { to: '/models',       label: 'Models',       icon: BrainCircuit,     desc: 'Trained models' },
   { to: '/ray-cluster',  label: 'Ray Cluster',  icon: Server,           desc: 'Cluster & GPUs' },
   { to: '/notebook',     label: 'Notebook',     icon: BookOpen,         desc: 'Jupyter Notebook' },
+  { to: '/status',       label: 'Status',       icon: Activity,         desc: 'System health' },
   { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  desc: 'Analytics' },
 ]
 

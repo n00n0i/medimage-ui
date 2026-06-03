@@ -9,6 +9,7 @@ import Models from './pages/Models'
 import Notebook from './pages/Notebook'
 import RayCluster from './pages/RayCluster'
 import Storage from './pages/Storage'
+import Status from './pages/Status'
 import Sidebar from './components/Sidebar'
 import './index.css'
 
@@ -56,6 +57,7 @@ function AppInner() {
             <Route path="/ray-cluster" element={<RayCluster />} />
             <Route path="/storage" element={<Storage />} />
             <Route path="/notebook" element={<Notebook />} />
+            <Route path="/status" element={<Status />} />
           </Routes>
         </main>
       </div>
