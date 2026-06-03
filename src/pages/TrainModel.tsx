@@ -4,7 +4,7 @@ import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCc
 
 // ─── Training Types ───────────────────────────────────────────────────────────
 type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'export-edge' | 'self-supervised' | 'llm-text'
-type DataType    = 'cxr' | 'fundus' | 'ct' | 'pathology' | 'ultrasound' | 'general'
+type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
 type TargetType  = 'prelabel' | 'finetune' | 'export'
 
 interface TrainOption {
@@ -43,90 +43,93 @@ interface TrainingConfig {
 const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   // ── Classification ──────────────────────────────────────────────────────────
   classification: [
-    { value: 'eff-b2',     label: 'EfficientNet-B2',       engine: 'PyTorch',    model: 'efficientnet-b2',             hardware: 'GPU 8GB+',     description: 'Balanced accuracy & speed สำหรับ CXR, Fundus, CT slices',         compatible: true  },
-    { value: 'eff-b4',     label: 'EfficientNet-B4',       engine: 'PyTorch',    model: 'efficientnet-b4',             hardware: 'GPU 12GB+',    description: 'Higher accuracy สำหรับงานที่ต้องการความละเอียด',         compatible: false },
-    { value: 'mobilenet',  label: 'MobileNetV3-Small',    engine: 'PyTorch+TIMM', model: 'mobilenetv3_small_100',     hardware: 'CPU / Edge',    description: 'Lightweight — รันบน Raspberry Pi, Jetson Nano, Edge GPU',        compatible: true  },
-    { value: 'res50',      label: 'ResNet-50',             engine: 'TorchVision', model: 'resnet50',                   hardware: 'GPU 6GB+',      description: 'Classic baseline — เสถียร, เร็ว, ง่ายต่อ fine-tune',          compatible: true  },
-    { value: 'convnext',   label: 'ConvNeXt-Tiny',        engine: 'PyTorch',    model: 'convnext_tiny',              hardware: 'GPU 8GB+',      description: 'Modern CNN architecture — ดีกว่า ResNet มาก',                  compatible: true  },
-    { value: 'regnet',     label: 'RegNet-Y400M',          engine: 'TorchVision', model: 'regnet_y_400mf',           hardware: 'GPU 6GB+',      description: 'Efficient for large datasets, good for pathology',             compatible: true  },
-    { value: 'swin-t',     label: 'Swin-Tiny',            engine: 'TIMM',       model: 'swin_tiny_patch4_window7_224', hardware: 'GPU 8GB+', description: 'Transformer-based — ดีสำหรับ CT/MRI slice classification',     compatible: true  },
-    { value: 'vit-b',      label: 'ViT-Base (Vision Transformer)', engine: 'TIMM', model: 'vit_base_patch16_224',     hardware: 'GPU 12GB+',    description: 'Pure transformer — ต้อง data เยอะ, ดีสำหรับ CXR ขนาดใหญ่',  compatible: false },
-    { value: 'medclip',    label: 'MedCLIP',              engine: 'HuggingFace', model: 'microsoft/BiomedCLIP',     hardware: 'GPU 10GB+',     description: 'Domain-pretrained CLIP บน biomedical images — zero-shot',         compatible: false },
-    { value: 'chextnet',   label: 'CheXNet (DenseNet-121)', engine: 'PyTorch',   model: 'densenet121',               hardware: 'GPU 8GB+',      description: 'Specialized for chest X-ray pathology classification',         compatible: true  },
+    { value: 'eff-b2',     label: 'EfficientNet-B2',              engine: 'PyTorch',     model: 'efficientnet-b2',               hardware: 'GPU 8GB+',     description: 'Balanced accuracy & speed — defect grading, product quality classification',   compatible: true  },
+    { value: 'eff-b4',     label: 'EfficientNet-B4',              engine: 'PyTorch',     model: 'efficientnet-b4',               hardware: 'GPU 12GB+',    description: 'Higher accuracy — fine-grained surface defect or part classification',        compatible: false },
+    { value: 'mobilenet',  label: 'MobileNetV3-Small',            engine: 'PyTorch+TIMM', model: 'mobilenetv3_small_100',        hardware: 'CPU / Edge',   description: 'Lightweight — deploy บน Raspberry Pi, Jetson Nano, industrial edge device',   compatible: true  },
+    { value: 'res50',      label: 'ResNet-50',                    engine: 'TorchVision', model: 'resnet50',                      hardware: 'GPU 6GB+',     description: 'Classic baseline — เสถียร, ปรับง่าย, รองรับ transfer learning ทุก domain',   compatible: true  },
+    { value: 'convnext',   label: 'ConvNeXt-Tiny',               engine: 'PyTorch',     model: 'convnext_tiny',                 hardware: 'GPU 8GB+',     description: 'Modern CNN — strong baseline สำหรับ visual inspection, PCB, textile',        compatible: true  },
+    { value: 'regnet',     label: 'RegNet-Y400M',                 engine: 'TorchVision', model: 'regnet_y_400mf',                hardware: 'GPU 6GB+',     description: 'Efficient for large-scale classification — automotive parts, warehouse SKU',  compatible: true  },
+    { value: 'swin-t',     label: 'Swin-Tiny',                   engine: 'TIMM',        model: 'swin_tiny_patch4_window7_224',  hardware: 'GPU 8GB+',     description: 'Transformer-based — ดีสำหรับ texture-rich images เช่น fabric, metal surface', compatible: true  },
+    { value: 'vit-b',      label: 'ViT-Base (Vision Transformer)', engine: 'TIMM',      model: 'vit_base_patch16_224',          hardware: 'GPU 12GB+',    description: 'Pure transformer — เหมาะกับ dataset ขนาดใหญ่, multi-class defect',          compatible: false },
+    { value: 'dino-s',     label: 'DINOv2-Small',                engine: 'TIMM',        model: 'vit_small_patch14_dinov2',      hardware: 'GPU 8GB+',     description: 'Self-supervised feature backbone — few-shot classification, anomaly detection', compatible: true },
+    { value: 'efficientvit', label: 'EfficientViT-M5',           engine: 'TIMM',        model: 'efficientvit_m5',               hardware: 'GPU 6GB+',     description: 'Ultra-fast edge transformer — real-time line inspection, <1ms latency',       compatible: true  },
   ],
 
   // ── Object Detection ─────────────────────────────────────────────────────────
   detection: [
-    { value: 'yolov8-s',   label: 'YOLOv8-Small',        engine: 'Ultralytics', model: 'yolov8s.pt',               hardware: 'GPU 6GB+',    description: 'เร็วมาก — real-time inference, รองรับทุก imaging modality',       compatible: true  },
-    { value: 'yolov8-m',   label: 'YOLOv8-Medium',        engine: 'Ultralytics', model: 'yolov8m.pt',               hardware: 'GPU 10GB+',   description: 'Balanced speed/accuracy สำหรับ nodule, fracture detection',    compatible: true  },
-    { value: 'yolov8-l',   label: 'YOLOv8-Large',         engine: 'Ultralytics', model: 'yolov8l.pt',               hardware: 'GPU 16GB+',   description: 'High accuracy — สำหรับงาน detection ที่ต้องการ recall สูง',   compatible: false },
-    { value: 'yolonano',   label: 'YOLOv8-Nano',          engine: 'Ultralytics', model: 'yolov8n.pt',               hardware: 'CPU / Edge',  description: 'Edge-optimized — deploy บน Jetson, Orin, edge devices',        compatible: true  },
-    { value: 'rt-detr',    label: 'RT-DETR-Hybrid',      engine: 'Ultralytics', model: 'yolov8l-rt-detr',          hardware: 'GPU 12GB+',   description: 'Real-time DE-TR, transformer-based detection, ดีสำหรับ CT',   compatible: false },
-    { value: 'detr',       label: 'DETR-ResNet50',        engine: 'HuggingFace', model: 'facebook/detr-resnet50',   hardware: 'GPU 10GB+',   description: 'Transformer-based detection — ดีสำหรับ pathology slides',      compatible: false },
-    { value: 'sam-b',      label: 'SAM-Base (zero-shot detection)', engine: 'Meta SAM', model: 'sam_b.pt',      hardware: 'GPU 12GB+',   description: 'Zero-shot segmentation — ใช้ prompt หา ROI ได้เลย',        compatible: true  },
-    { value: 'nnunet',     label: 'nnU-Net (3D Detection)', engine: 'MONAI',     model: 'nnunet_res3d',            hardware: 'GPU 16GB+',   description: '3D volumes — หา tumor บน CT/MRI แบบ volumetric detection',     compatible: false },
+    { value: 'yolov8-s',   label: 'YOLOv8-Small',               engine: 'Ultralytics', model: 'yolov8s.pt',                    hardware: 'GPU 6GB+',     description: 'Real-time detection — assembly line inspection, package detection',           compatible: true  },
+    { value: 'yolov8-m',   label: 'YOLOv8-Medium',              engine: 'Ultralytics', model: 'yolov8m.pt',                    hardware: 'GPU 10GB+',    description: 'Balanced — surface scratch, weld defect, component presence detection',       compatible: true  },
+    { value: 'yolov8-l',   label: 'YOLOv8-Large',               engine: 'Ultralytics', model: 'yolov8l.pt',                    hardware: 'GPU 16GB+',    description: 'High recall — critical defect detection ที่ต้องการ miss rate ต่ำมาก',       compatible: false },
+    { value: 'yolonano',   label: 'YOLOv8-Nano',                engine: 'Ultralytics', model: 'yolov8n.pt',                    hardware: 'CPU / Edge',   description: 'Edge-optimized — Jetson Orin, Hailo, industrial smart camera',               compatible: true  },
+    { value: 'yolov9-c',   label: 'YOLOv9-C',                   engine: 'Ultralytics', model: 'yolov9c.pt',                    hardware: 'GPU 12GB+',    description: 'Programmable gradient — better small defect detection vs YOLOv8',            compatible: false },
+    { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: false },
+    { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
+    { value: 'grounding',  label: 'Grounding DINO',             engine: 'HuggingFace', model: 'IDEA-Research/grounding-dino-base', hardware: 'GPU 12GB+', description: 'Open-vocabulary detection — detect any object with text prompt',             compatible: false },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
   segmentation: [
-    { value: 'sam-b',      label: 'SAM-Base',            engine: 'Meta SAM',    model: 'sam_b.pt',              hardware: 'GPU 12GB+',   description: 'Zero-shot segmentation — prompt ด้วย box/point',                  compatible: true  },
-    { value: 'sam-l',      label: 'SAM-Large',           engine: 'Meta SAM',    model: 'sam_l.pt',              hardware: 'GPU 20GB+',   description: 'แม่นยำสูงสุด — สำหรับ fine boundary segmentation',             compatible: false },
-    { value: 'unet',       label: 'UNet ResNet34',        engine: 'Segmentation Models PyTorch', model: 'resnet34-unet', hardware: 'GPU 8GB+',   description: 'Classic segmentation — organ, tumor, lesion segmentation',        compatible: true  },
-    { value: 'unetpp',     label: 'UNet++ (ResNet34)',   engine: 'Segmentation Models PyTorch', model: 'resnet34-unetplusplus', hardware: 'GPU 10GB+', description: 'Nested UNet — ดีสำหรับ boundary ที่ซับซ้อน',              compatible: true  },
-    { value: 'deeplabv3',  label: 'DeepLabV3+ (ResNet101)', engine: 'TorchVision', model: 'resnet101-deeplabv3', hardware: 'GPU 10GB+', description: 'Atrous conv — fine boundary บน retinal, pathology',             compatible: true  },
-    { value: 'segany',     label: 'SAM-Med2D (MedSAM)',   engine: 'MedSAM',     model: 'medsam_vit_b',           hardware: 'GPU 16GB+',   description: 'Medical image-specific SAM — zero-shot บน CXR, CT, MRI',         compatible: false },
-    { value: '3d-unet',    label: '3D UNet (ResNet50)',   engine: 'MONAI',      model: 'unet_resnet50_3d',      hardware: 'GPU 16GB+',   description: 'Volumetric segmentation สำหรับ CT/MRI 3D volumes',             compatible: false },
-    { value: 'swin-unet',  label: 'Swin-UNet (TransUNet)', engine: 'MONAI',     model: 'swin_unet',             hardware: 'GPU 12GB+',   description: 'Transformer-based segmentation — ดีสำหรับ histology',           compatible: false },
-    { value: 'nnunet',     label: 'nnU-Net (3D Full)',     engine: 'MONAI',      model: 'nnunet',                hardware: 'GPU 20GB+',   description: 'State-of-the-art 3D medical image segmentation — self-configures', compatible: false },
+    { value: 'sam-b',      label: 'SAM-Base',                   engine: 'Meta SAM',    model: 'sam_b.pt',                      hardware: 'GPU 12GB+',    description: 'Zero-shot segmentation — prompt ด้วย point/box, ไม่ต้อง label mask',        compatible: true  },
+    { value: 'sam-l',      label: 'SAM-Large',                  engine: 'Meta SAM',    model: 'sam_l.pt',                      hardware: 'GPU 20GB+',    description: 'High precision boundary — fine crack, scratch, burr segmentation',           compatible: false },
+    { value: 'sam2',       label: 'SAM 2 (Video)',              engine: 'Meta SAM2',   model: 'sam2_l.pt',                     hardware: 'GPU 16GB+',    description: 'Video segmentation — track defects across frames on conveyor belt',          compatible: false },
+    { value: 'unet',       label: 'UNet ResNet34',              engine: 'Segmentation Models PyTorch', model: 'resnet34-unet', hardware: 'GPU 8GB+', description: 'Classic — surface defect, corrosion, weld bead segmentation',               compatible: true  },
+    { value: 'unetpp',     label: 'UNet++ (ResNet34)',          engine: 'Segmentation Models PyTorch', model: 'resnet34-unetplusplus', hardware: 'GPU 10GB+', description: 'Nested UNet — ดีสำหรับ boundary ซับซ้อน เช่น crack, delamination',      compatible: true  },
+    { value: 'deeplabv3',  label: 'DeepLabV3+ (ResNet101)',     engine: 'TorchVision', model: 'resnet101-deeplabv3',            hardware: 'GPU 10GB+',    description: 'Atrous conv — semantic segmentation บน aerial, industrial floor plan',       compatible: true  },
+    { value: 'maskrcnn',   label: 'Mask R-CNN',                 engine: 'TorchVision', model: 'maskrcnn_resnet50_fpn',          hardware: 'GPU 12GB+',    description: 'Instance segmentation — individual part isolation, robotic grasping',         compatible: false },
+    { value: 'yoloseg',    label: 'YOLOv8-Seg',                engine: 'Ultralytics', model: 'yolov8m-seg.pt',                hardware: 'GPU 10GB+',    description: 'Fast instance seg — real-time defect segmentation on production line',        compatible: true  },
+    { value: 'segment-anything2', label: 'EfficientSAM',       engine: 'TIMM',        model: 'efficientsam_s',                hardware: 'GPU 8GB+',     description: 'Lightweight SAM — edge deployment, real-time segmentation on Jetson',        compatible: false },
   ],
 
   // ── LLM Text Fine-tuning ─────────────────────────────────────────────────────
   'llm-text': [
-    { value: 'llama31-8b',   label: 'LLaMA-3.1-8B',          engine: 'Unsloth', model: 'unsloth/llama-3.1-8b-bnb-4bit',         hardware: 'GPU 16GB+',  description: 'Meta LLaMA 3.1 8B — state-of-the-art open LLM, QLoRA fine-tune สำหรับ medical text', compatible: false },
-    { value: 'llama32-3b',   label: 'LLaMA-3.2-3B-Instruct',  engine: 'Unsloth', model: 'unsloth/Llama-3.2-3B-Instruct-bnb-4bit', hardware: 'GPU 8GB+',   description: 'Compact LLaMA 3.2 3B — เร็ว, ดีสำหรับ domain-specific clinical Q&A',              compatible: true  },
-    { value: 'mistral-7b',   label: 'Mistral-7B-Instruct',    engine: 'Unsloth', model: 'unsloth/mistral-7b-instruct-v0.3-bnb-4bit', hardware: 'GPU 14GB+', description: 'Mistral 7B — strong instruction following, ดีสำหรับ structured medical output',  compatible: false },
-    { value: 'qwen25-7b',    label: 'Qwen2.5-7B-Instruct',   engine: 'Unsloth', model: 'unsloth/Qwen2.5-7B-Instruct-bnb-4bit',  hardware: 'GPU 14GB+',  description: 'Alibaba Qwen2.5 7B — excellent multilingual, ดีสำหรับ Thai medical text',        compatible: false },
-    { value: 'phi35-mini',   label: 'Phi-3.5-Mini-Instruct',  engine: 'Unsloth', model: 'unsloth/Phi-3.5-mini-instruct-bnb-4bit', hardware: 'GPU 6GB+',   description: 'Microsoft Phi-3.5 3.8B — lightweight แต่แรง, เหมาะ edge inference',             compatible: true  },
-    { value: 'gemma2-2b',    label: 'Gemma-2-2B-Instruct',   engine: 'Unsloth', model: 'unsloth/gemma-2-2b-it-bnb-4bit',        hardware: 'GPU 6GB+',   description: 'Google Gemma 2 2B — ขนาดเล็กมาก รันได้บน GPU 6GB, ดีสำหรับ summarization',    compatible: true  },
-    { value: 'deepseek-r1',  label: 'DeepSeek-R1-8B',         engine: 'Unsloth', model: 'unsloth/DeepSeek-R1-0528-Qwen3-8B-bnb-4bit', hardware: 'GPU 20GB+', description: 'DeepSeek R1 reasoning model — ดีสำหรับ clinical reasoning, chain-of-thought',  compatible: false },
-    { value: 'qwen3-14b',    label: 'Qwen3-14B',              engine: 'Unsloth', model: 'unsloth/Qwen3-14B-bnb-4bit',           hardware: 'GPU 24GB+',  description: 'Qwen3 14B — top-tier reasoning, ดีสำหรับ medical report generation',             compatible: false },
+    { value: 'llama31-8b',  label: 'LLaMA-3.1-8B',             engine: 'Unsloth', model: 'unsloth/llama-3.1-8b-bnb-4bit',            hardware: 'GPU 16GB+',  description: 'Meta LLaMA 3.1 8B — strong general LLM, ดีสำหรับ technical doc Q&A, SOP',     compatible: false },
+    { value: 'llama32-3b',  label: 'LLaMA-3.2-3B-Instruct',   engine: 'Unsloth', model: 'unsloth/Llama-3.2-3B-Instruct-bnb-4bit',   hardware: 'GPU 8GB+',   description: 'Compact LLaMA 3.2 — เร็ว, เหมาะกับ domain chatbot, maintenance assistant',     compatible: true  },
+    { value: 'mistral-7b',  label: 'Mistral-7B-Instruct',     engine: 'Unsloth', model: 'unsloth/mistral-7b-instruct-v0.3-bnb-4bit', hardware: 'GPU 14GB+',  description: 'Strong instruction following — structured output, report generation, API agent', compatible: false },
+    { value: 'qwen25-7b',   label: 'Qwen2.5-7B-Instruct',    engine: 'Unsloth', model: 'unsloth/Qwen2.5-7B-Instruct-bnb-4bit',     hardware: 'GPU 14GB+',  description: 'Excellent multilingual (EN/TH/ZH) — ดีสำหรับ Thai industrial documentation',   compatible: false },
+    { value: 'phi35-mini',  label: 'Phi-3.5-Mini-Instruct',   engine: 'Unsloth', model: 'unsloth/Phi-3.5-mini-instruct-bnb-4bit',   hardware: 'GPU 6GB+',   description: 'Microsoft Phi-3.5 3.8B — lightweight แต่แรง, เหมาะ edge inference, IoT gateway', compatible: true  },
+    { value: 'gemma2-2b',   label: 'Gemma-2-2B-Instruct',    engine: 'Unsloth', model: 'unsloth/gemma-2-2b-it-bnb-4bit',           hardware: 'GPU 6GB+',   description: 'Google Gemma 2 2B — ขนาดเล็กมาก, ดีสำหรับ classification text, FAQ bot',       compatible: true  },
+    { value: 'deepseek-r1', label: 'DeepSeek-R1-8B',          engine: 'Unsloth', model: 'unsloth/DeepSeek-R1-0528-Qwen3-8B-bnb-4bit', hardware: 'GPU 20GB+', description: 'Reasoning model — RCA (root cause analysis), troubleshooting chain-of-thought',  compatible: false },
+    { value: 'qwen3-14b',   label: 'Qwen3-14B',               engine: 'Unsloth', model: 'unsloth/Qwen3-14B-bnb-4bit',               hardware: 'GPU 24GB+',  description: 'Top-tier reasoning — complex process optimization, multi-step planning',         compatible: false },
   ],
 
   // ── VLM Fine-tuning ───────────────────────────────────────────────────────────
   'vlm-finetune': [
-    { value: 'llava1.6',   label: 'LLaVA-1.6-7B',         engine: 'LLaVA',      model: 'llava-v1.6-7b',          hardware: 'GPU 16GB+',   description: 'VLM สำหรับ medical report generation, clinical Q&A',           compatible: false },
-    { value: 'phi4v',      label: 'Phi-4-Multimodal',     engine: 'Microsoft',  model: 'phi-4-mini-megvii',       hardware: 'GPU 12GB+',   description: 'Compact VLM — fast inference บน H100, medical vision-language',   compatible: false },
-    { value: 'medvlm',     label: 'MedLVLM (MedLLaVA)',  engine: 'LLaVA',      model: 'medllava_v1.5_7b',       hardware: 'GPU 16GB+',   description: 'Domain-specific VLM fine-tuned บน medical images & reports',    compatible: false },
-    { value: 'biomedclip', label: 'BiomedCLIP',          engine: 'HuggingFace', model: 'BiomedCLIP',             hardware: 'GPU 8GB+',    description: 'Domain-pretrained CLIP — zero-shot classification & retrieval', compatible: false },
-    { value: 'med Flamingo', label: 'MedFlamingo',       engine: 'Flamingo',   model: 'medflamingo_7b',         hardware: 'GPU 20GB+',   description: 'Few-shot VLM สำหรับ medical visual reasoning',               compatible: false },
+    { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'LLaVA',      model: 'llava-v1.6-mistral-7b',          hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: false },
+    { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',   engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit', hardware: 'GPU 16GB+', description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: false },
+    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'HuggingFace', model: 'OpenGVLab/InternVL2-8B',        hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: false },
+    { value: 'phi4v',       label: 'Phi-4-Vision',            engine: 'Microsoft',  model: 'microsoft/Phi-4-multimodal-instruct', hardware: 'GPU 12GB+', description: 'Compact VLM — fast inference, ดีสำหรับ edge visual assistant บน smart camera', compatible: false },
+    { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'HuggingFace', model: 'google/paligemma2-3b-pt-448',   hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: false },
+    { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'HuggingFace', model: 'HuggingFaceTB/SmolVLM-500M-Instruct', hardware: 'GPU 6GB+', description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
   ],
 
   // ── Self-supervised / SSL ────────────────────────────────────────────────────
   'self-supervised': [
-    { value: 'mae',        label: 'MAE (Masked AutoEncoder)', engine: 'PyTorch', model: 'mae_vit_base',         hardware: 'GPU 12GB+',   description: 'Self-supervised pretraining — ดีสำหรับ data ขนาดใหญ่',          compatible: false },
-    { value: 'dino',       label: 'DINOv2 (ViT-B/14)',      engine: 'TIMM',     model: 'vit_base_patch14_dinov2', hardware: 'GPU 10GB+', description: 'Self-distillation — feature extractor สำหรับ downstream tasks',  compatible: false },
-    { value: 'simCLR',     label: 'SimCLR (ResNet50)',     engine: 'PyTorch',   model: 'resnet50-simclr',        hardware: 'GPU 8GB+',    description: 'Contrastive learning — ใช้ pretrain ก่อน fine-tune',             compatible: true  },
-    { value: 'byol',       label: 'BYOL (ResNet50)',       engine: 'PyTorch',   model: 'resnet50-byol',          hardware: 'GPU 8GB+',    description: 'Bootstrap your own latent — no negative samples needed',            compatible: true  },
-    { value: 'medcone',    label: 'MedCoNe (Contrastive SSL)', engine: 'PyTorch', model: 'medcone_resnet50',    hardware: 'GPU 8GB+',    description: 'Medical-specific contrastive — pretrained บน CXR, CT, MRI',        compatible: false },
+    { value: 'mae',        label: 'MAE (Masked AutoEncoder)',   engine: 'PyTorch', model: 'mae_vit_base',                   hardware: 'GPU 12GB+',   description: 'Self-supervised pretraining — ดีเมื่อ label น้อย แต่ unlabeled data เยอะ', compatible: false },
+    { value: 'dino',       label: 'DINOv2 (ViT-B/14)',         engine: 'TIMM',    model: 'vit_base_patch14_dinov2',        hardware: 'GPU 10GB+',   description: 'Self-distillation — universal feature extractor สำหรับ downstream tasks',   compatible: false },
+    { value: 'simCLR',     label: 'SimCLR (ResNet50)',         engine: 'PyTorch', model: 'resnet50-simclr',                hardware: 'GPU 8GB+',    description: 'Contrastive learning — pretrain ก่อน fine-tune เมื่อ label data ขาดแคลน',  compatible: true  },
+    { value: 'byol',       label: 'BYOL (ResNet50)',           engine: 'PyTorch', model: 'resnet50-byol',                  hardware: 'GPU 8GB+',    description: 'Bootstrap your own latent — no negative samples, stable training',           compatible: true  },
+    { value: 'padim',      label: 'PaDiM (Anomaly Detection)', engine: 'Anomalib', model: 'padim_resnet18',               hardware: 'GPU 6GB+',    description: 'Unsupervised anomaly detection — zero defect sample needed for training',    compatible: true  },
+    { value: 'patchcore',  label: 'PatchCore',                engine: 'Anomalib', model: 'patchcore_wide_resnet50',       hardware: 'GPU 8GB+',    description: 'Memory bank anomaly detection — MVTec-style industrial inspection',          compatible: true  },
   ],
 
   // ── Export ────────────────────────────────────────────────────────────────────
   'export-edge': [
-    { value: 'tflite',     label: 'TensorFlow Lite',     engine: 'TF-Lite',    model: 'model.tflite',         hardware: 'CPU / Mobile', description: 'iOS, Android, Edge TPU, Raspberry Pi — int8 quantization',        compatible: true  },
-    { value: 'onnx',       label: 'ONNX Runtime',        engine: 'ONNX',       model: 'model.onnx',            hardware: 'CPU / GPU',    description: 'Universal format — รันได้ทุก platform, GPU acceleration',     compatible: true  },
-    { value: 'tensorrt',   label: 'TensorRT',            engine: 'NVIDIA',     model: 'model.plan',            hardware: 'NVIDIA GPU',  description: 'Optimized for NVIDIA edge — Jetson, Orin, T4, A100',            compatible: true  },
-    { value: 'coreml',     label: 'CoreML',              engine: 'Apple',      model: 'model.mlmodel',         hardware: 'Apple Neural', description: 'iOS/iPad native — รันบน Neural Engine, ANE acceleration',      compatible: true  },
+    { value: 'tflite',     label: 'TensorFlow Lite',           engine: 'TF-Lite',  model: 'model.tflite',                  hardware: 'CPU / Mobile', description: 'Raspberry Pi, Android, Edge TPU — int8 quantization',                     compatible: true  },
+    { value: 'onnx',       label: 'ONNX Runtime',              engine: 'ONNX',     model: 'model.onnx',                    hardware: 'CPU / GPU',    description: 'Universal — รันได้ทุก platform, GPU acceleration via OrtValue',           compatible: true  },
+    { value: 'tensorrt',   label: 'TensorRT',                  engine: 'NVIDIA',   model: 'model.plan',                    hardware: 'NVIDIA GPU',   description: 'Optimized for NVIDIA — Jetson Orin, AGX, T4, A100, <1ms latency',        compatible: true  },
+    { value: 'openvino',   label: 'OpenVINO',                  engine: 'Intel',    model: 'model.xml',                     hardware: 'Intel CPU/iGPU', description: 'Intel optimized — Core, Xeon, Myriad X, industrial IPC deployment',     compatible: true  },
+    { value: 'coreml',     label: 'CoreML',                    engine: 'Apple',    model: 'model.mlmodel',                 hardware: 'Apple Neural', description: 'iOS/iPadOS — ANE acceleration, AR industrial inspection app',             compatible: true  },
   ],
 }
 
-// ─── Medical Modality Labels ──────────────────────────────────────────────────
+// ─── Image Domain Labels ──────────────────────────────────────────────────────
 const DATA_TYPE_LABELS: Record<DataType, string> = {
-  cxr:       'Chest X-Ray (CXR)',
-  fundus:    'Retinal Fundus',
-  ct:        'CT Scan / MRI (3D Volumes)',
-  pathology: 'Pathology (H&E Stained)',
-  ultrasound:'Ultrasound (US)',
-  general:   'General Images',
+  rgb:        'Standard RGB Camera',
+  thermal:    'Thermal / IR Camera',
+  xray:       'X-Ray / CT Scan',
+  microscopy: 'Microscopy / Macro',
+  lidar:      'LiDAR / Depth / Point Cloud',
+  general:    'General Images',
 }
 
 // ─── Step Wizard ─────────────────────────────────────────────────────────────
@@ -146,7 +149,7 @@ export default function TrainModel() {
   const [step, setStep] = useState(0)
   const [config, setConfig] = useState<TrainingConfig>({
     trainingType: 'classification',
-    dataType: 'cxr',
+    dataType: 'rgb',
     target: 'finetune',
     datasetId: null,
     epochs: 30,
@@ -413,7 +416,7 @@ export default function TrainModel() {
                 </div>
               </div>
               <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                หา bounding box ของ nodule, tumor, lesion บน CXR/CT/Pathology
+                หา bounding box ของ defect, component, object บน production line / aerial / industrial camera
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--warning)', fontSize: 12 }}>
                 <span>{compatibleOptions.length} models</span>
@@ -437,7 +440,7 @@ export default function TrainModel() {
                 </div>
               </div>
               <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                แบ่งส่วนเนื้อเยื่อ, ก้อนเนื้อ, อวัยวะ ด้วย pixel-level precision
+                แบ่งส่วน defect area, surface crack, part boundary ด้วย pixel-level precision
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--success)', fontSize: 12 }}>
                 <span>{compatibleOptions.length} models</span>
@@ -461,7 +464,7 @@ export default function TrainModel() {
                 </div>
               </div>
               <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                Fine-tune LLaVA, Phi-4-Vision สำหรับ medical report generation, clinical Q&A
+                Fine-tune LLaVA, Qwen2-VL, InternVL2 สำหรับ visual inspection report, defect Q&A, part recognition
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--info)', fontSize: 12 }}>
                 <span>GPU 16GB+ required</span>
@@ -533,7 +536,7 @@ export default function TrainModel() {
                 </div>
               </div>
               <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                Fine-tune LLaMA-3.1, Mistral, Qwen2.5, Phi-3.5 สำหรับ clinical NLP, Thai medical chatbot, report generation
+                Fine-tune LLaMA-3.1, Mistral, Qwen2.5, Phi-3.5 สำหรับ industrial Q&A, SOP bot, Thai/EN assistant
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
                 <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>QLoRA 4-bit</span>

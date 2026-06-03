@@ -603,7 +603,7 @@ export default function Projects() {
             <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div>
                 <label style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>Project Name</label>
-                <input type="text" placeholder="e.g. CXR Chest X-Ray" value={createForm.name}
+                <input type="text" placeholder="e.g. PCB Surface Defect" value={createForm.name}
                   onChange={e => setCreateForm(f => ({ ...f, name: e.target.value }))}
                   onKeyDown={e => e.key === 'Enter' && !creating && handleCreate()} />
               </div>

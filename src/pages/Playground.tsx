@@ -190,7 +190,7 @@ export default function Playground() {
   const [error, setError] = useState<string | null>(null)
 
   // Text / VL inference state
-  const [systemPrompt, setSystemPrompt] = useState('You are a helpful medical AI assistant.')
+  const [systemPrompt, setSystemPrompt] = useState('You are a helpful industrial AI assistant.')
   const [userPrompt, setUserPrompt] = useState('')
   const [textResult, setTextResult] = useState<TextResult | null>(null)
   const [textError, setTextError] = useState<string | null>(null)
@@ -561,7 +561,7 @@ export default function Playground() {
                 onChange={e => setUserPrompt(e.target.value)}
                 rows={5}
                 style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px', borderRadius: 8, border: '1px solid var(--border-default)', background: 'var(--bg-elevated)', color: 'var(--text-primary)', fontSize: 13, resize: 'vertical', fontFamily: 'inherit' }}
-                placeholder={playMode === 'vl' ? 'Describe what you see in this image…' : 'Ask a medical question…'}
+                placeholder={playMode === 'vl' ? 'Describe what you see in this image…' : 'Ask a question about this product or process…'}
               />
             </div>
           </div>

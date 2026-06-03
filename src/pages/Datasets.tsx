@@ -324,7 +324,7 @@ export default function Datasets() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
                 <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>Alpaca format</p>
-                <pre style={{ fontSize: 11, background: 'var(--bg-surface)', borderRadius: 6, padding: '8px', color: 'var(--text-secondary)', overflow: 'auto' }}>{`{"instruction": "วินิจฉัยภาพนี้",\n "input": "",\n "output": "Normal CXR"}`}</pre>
+                    <pre style={{ fontSize: 11, background: 'var(--bg-surface)', borderRadius: 6, padding: '8px', color: 'var(--text-secondary)', overflow: 'auto' }}>{`{"instruction": "Describe the defect",\n "input": "",\n "output": "Surface scratch on panel A"}`}</pre>
               </div>
               <div>
                 <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>ShareGPT / ChatML format</p>
