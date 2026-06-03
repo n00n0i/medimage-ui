@@ -113,10 +113,17 @@ const DATA_TYPE_LABELS: Record<DataType, string> = {
 // ─── Step Wizard ─────────────────────────────────────────────────────────────
 const STEPS = ['Training Type', 'Data & Target', 'Model', 'Config & Launch']
 
+// Parse hardware string like "GPU 16GB+" → minimum GB, or 0 for CPU/Edge
+function parseRequiredGb(hardware: string): number {
+  const m = hardware.match(/(\d+)\s*GB/i)
+  return m ? parseInt(m[1]) : 0
+}
+
 export default function TrainModel() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const [retrainSource, setRetrainSource] = useState<{ id: string; name: string } | null>(null)
+  const [gpuFreeGb, setGpuFreeGb] = useState<number | null>(null)  // max free GPU memory on Ray
   const [step, setStep] = useState(0)
   const [config, setConfig] = useState<TrainingConfig>({
     trainingType: 'classification',
@@ -164,6 +171,25 @@ export default function TrainModel() {
 
   // Fetch projects for dataset dropdown
   const [projects, setProjects] = useState<Array<{id: number; name: string}>>([])
+
+  // Query Ray cluster for actual GPU memory
+  useEffect(() => {
+    fetch('/api/ray/nodes?view=summary')
+      .then(r => r.json())
+      .then(data => {
+        const nodes: any[] = data?.data?.summary ?? []
+        let maxFreeGb = 0
+        for (const node of nodes) {
+          for (const gpu of (node.gpus ?? [])) {
+            const freeGb = (gpu.memoryTotal - gpu.memoryUsed) / 1024
+            if (freeGb > maxFreeGb) maxFreeGb = freeGb
+          }
+        }
+        if (maxFreeGb > 0) setGpuFreeGb(Math.floor(maxFreeGb))
+      })
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     fetch('/api/ls/projects/?page_size=1000', {
       headers: { Authorization: 'Token medimage-ls-token-2026' },
@@ -177,8 +203,14 @@ export default function TrainModel() {
   }, [])
 
   const trainingOptions = TRAINING_MATRIX[config.trainingType] || []
-  const compatibleOptions = trainingOptions.filter(o => o.compatible)
-  const incompatibleOptions = trainingOptions.filter(o => !o.compatible)
+
+  // Dynamic compatibility: if we know real GPU memory, use it; else fall back to hardcoded
+  const isCompatible = (opt: TrainOption) => {
+    if (gpuFreeGb !== null) return parseRequiredGb(opt.hardware) <= gpuFreeGb
+    return opt.compatible
+  }
+  const compatibleOptions   = trainingOptions.filter(o => isCompatible(o))
+  const incompatibleOptions = trainingOptions.filter(o => !isCompatible(o))
 
   const set = <K extends keyof TrainingConfig>(key: K, val: TrainingConfig[K]) => {
     setConfig(prev => ({ ...prev, [key]: val }))
@@ -507,14 +539,16 @@ export default function TrainModel() {
         <div>
           <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>
-            แนะนำ {config.trainingType} สำหรับ {DATA_TYPE_LABELS[config.dataType]} — เลือก engine ที่เหมาะกับ hardware ของคุณ
+            แนะนำ {config.trainingType} สำหรับ {DATA_TYPE_LABELS[config.dataType]}{gpuFreeGb !== null ? ` — GPU ว่างอยู่ ${gpuFreeGb} GB (Ray cluster)` : ''}
           </p>
 
           {/* Compatible */}
           <div className="mb-6">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
               <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)' }} />
-              <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--success)' }}>Available on your hardware</span>
+              <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--success)' }}>
+                Available on your hardware{gpuFreeGb !== null ? ` (${gpuFreeGb} GB GPU free)` : ''}
+              </span>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {compatibleOptions.map(opt => (
