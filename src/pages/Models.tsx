@@ -1,6 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink } from 'lucide-react'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search } from 'lucide-react'
+
+interface HFModel {
+  id: string
+  author?: string
+  pipeline_tag?: string
+  downloads?: number
+  likes?: number
+  tags?: string[]
+}
 
 interface Model {
   id: string
@@ -682,6 +691,43 @@ function ImportModal({ onClose, onImported }: { onClose: () => void; onImported:
   const [progress, setProgress] = useState(0)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // HuggingFace search
+  const [hfQuery, setHfQuery] = useState('')
+  const [hfResults, setHfResults] = useState<HFModel[]>([])
+  const [hfSearching, setHfSearching] = useState(false)
+  const [hfSearched, setHfSearched] = useState(false)
+
+  const searchHF = async () => {
+    if (!hfQuery.trim()) return
+    setHfSearching(true)
+    setHfResults([])
+    try {
+      const res = await fetch(
+        `https://huggingface.co/api/models?search=${encodeURIComponent(hfQuery.trim())}&limit=10&sort=downloads&direction=-1`,
+        { signal: AbortSignal.timeout(8000) }
+      )
+      const data: HFModel[] = await res.json()
+      setHfResults(data)
+    } catch {
+      setHfResults([])
+    } finally {
+      setHfSearching(false)
+      setHfSearched(true)
+    }
+  }
+
+  const applyHFResult = (r: HFModel) => {
+    const archGuess = r.id.split('/').pop() ?? r.id
+    setSourceType('huggingface')
+    setSourceUrl(r.id)
+    if (!name) setName(archGuess)
+    setArch(archGuess)
+    setSelectedPreset(null)
+    setHfResults([])
+    setHfQuery('')
+    setHfSearched(false)
+  }
+
   const presets = PRETRAINED[trainingType] ?? []
 
   const applyPreset = (preset: typeof presets[0]) => {
@@ -759,6 +805,71 @@ function ImportModal({ onClose, onImported }: { onClose: () => void; onImported:
                   {t.charAt(0).toUpperCase() + t.slice(1)}
                 </button>
               ))}
+            </div>
+
+            {/* HuggingFace Search */}
+            <div style={{ marginBottom: 18 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 8 }}>
+                Search HuggingFace Hub
+              </label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  value={hfQuery}
+                  onChange={e => setHfQuery(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && searchHF()}
+                  placeholder="e.g. yolov8, bert-base, whisper-small..."
+                  style={{ flex: 1, padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)' }}
+                />
+                <button
+                  onClick={searchHF}
+                  disabled={hfSearching || !hfQuery.trim()}
+                  style={{ padding: '8px 14px', borderRadius: 7, fontSize: 12, fontWeight: 600, cursor: 'pointer', border: '1px solid var(--border-default)', background: 'var(--bg-elevated)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap', opacity: hfSearching || !hfQuery.trim() ? 0.5 : 1 }}
+                >
+                  {hfSearching ? <Loader size={13} className="animate-spin" /> : <Search size={13} />}
+                  Search
+                </button>
+              </div>
+
+              {/* Results */}
+              {hfResults.length > 0 && (
+                <div style={{ marginTop: 8, border: '1px solid var(--border-default)', borderRadius: 8, overflow: 'hidden', maxHeight: 220, overflowY: 'auto' }}>
+                  {hfResults.map((r, i) => (
+                    <button
+                      key={r.id}
+                      onClick={() => applyHFResult(r)}
+                      style={{
+                        width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', cursor: 'pointer',
+                        background: i % 2 === 0 ? 'var(--bg-surface)' : 'var(--bg-base)',
+                        border: 'none', borderBottom: i < hfResults.length - 1 ? '1px solid var(--border-subtle)' : 'none',
+                        textAlign: 'left',
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {r.id}
+                        </div>
+                        {r.pipeline_tag && (
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 1 }}>{r.pipeline_tag}</div>
+                        )}
+                      </div>
+                      <div style={{ flexShrink: 0, textAlign: 'right' }}>
+                        {r.downloads !== undefined && (
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                            ↓ {r.downloads >= 1000 ? (r.downloads / 1000).toFixed(0) + 'k' : r.downloads}
+                          </div>
+                        )}
+                        {r.likes !== undefined && (
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>♥ {r.likes}</div>
+                        )}
+                      </div>
+                      <span style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 600, flexShrink: 0 }}>Select →</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {hfSearched && hfResults.length === 0 && !hfSearching && (
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8, textAlign: 'center' }}>ไม่พบผลลัพธ์ ลองใช้คำค้นอื่น</p>
+              )}
             </div>
 
             {/* Presets */}
