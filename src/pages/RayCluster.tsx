@@ -306,11 +306,16 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
 
   const [cpus, setCpus]       = useState('8')
   const [gpus, setGpus]       = useState('0')
+  const [gpuUtil, setGpuUtil] = useState('100')   // % advertised GPU utilisation cap
   const [block, setBlock]     = useState(true)
   const [copied, setCopied]   = useState(false)
 
   const cpuFlag  = cpus.trim()  ? ` --num-cpus=${cpus.trim()}`  : ''
-  const gpuFlag  = gpus.trim() !== '0' && gpus.trim() ? ` --num-gpus=${gpus.trim()}` : ''
+  // num-gpus accepts decimals: 0.5 = 50% of 1 GPU, 1 = full GPU
+  const gpuNum   = parseFloat(gpus) || 0
+  const utilPct  = Math.min(100, Math.max(1, parseInt(gpuUtil) || 100))
+  const gpuEffective = gpuNum > 0 ? (gpuNum * utilPct / 100).toFixed(2).replace(/\.?0+$/, '') : '0'
+  const gpuFlag  = gpuNum > 0 ? ` --num-gpus=${gpuEffective}` : ''
   const blockFlag = block ? ' --block' : ''
   const cmd = `ray start --address=${headHost}:6379${cpuFlag}${gpuFlag}${blockFlag}`
 
@@ -334,7 +339,7 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
       </div>
 
       {/* Resource inputs */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 14 }}>
         <div>
           <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 5 }}>CPUs</label>
           <input
@@ -351,7 +356,31 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
             style={inputStyle}
           />
         </div>
+        <div>
+          <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 5 }}>
+            GPU Utilization %
+            <span style={{ marginLeft: 4, color: 'var(--text-muted)', fontWeight: 400 }}>(1–100)</span>
+          </label>
+          <input
+            type="number" min={1} max={100} value={gpuUtil}
+            onChange={e => setGpuUtil(e.target.value)}
+            disabled={parseFloat(gpus) === 0}
+            style={{ ...inputStyle, opacity: parseFloat(gpus) === 0 ? 0.4 : 1 }}
+          />
+        </div>
       </div>
+      {parseFloat(gpus) > 0 && parseInt(gpuUtil) < 100 && (
+        <div style={{
+          fontSize: 11, color: 'var(--text-muted)', marginBottom: 12,
+          padding: '6px 10px', borderRadius: 6,
+          background: 'color-mix(in oklch, var(--accent) 8%, transparent)',
+          border: '1px solid color-mix(in oklch, var(--accent) 20%, transparent)',
+        }}>
+          <span style={{ color: 'var(--accent)', fontWeight: 500 }}>--num-gpus={gpuEffective}</span>
+          {' '}→ Ray จะโฆษณา {gpuEffective} GPU ต่อ node
+          {' '}&nbsp;·&nbsp; task ที่ใช้ <code style={{ fontFamily: 'var(--font-mono)' }}>num_gpus=0.5</code> รันพร้อมกันได้ {Math.floor(parseFloat(gpuEffective) / 0.5)} task
+        </div>
+      )}
 
       {/* --block toggle */}
       <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
@@ -892,6 +921,15 @@ export default function RayCluster() {
                               fontFamily: 'var(--font-mono)',
                             }}>
                               {gpu.name} · {gpu.memoryUsed ?? 0}/{gpu.memoryTotal ?? 0} MB
+                              {gpu.utilizationGpu != null && (
+                                <span style={{
+                                  marginLeft: 6,
+                                  color: gpu.utilizationGpu > 80 ? 'var(--danger)' : gpu.utilizationGpu > 40 ? 'var(--warning)' : 'var(--success)',
+                                  fontWeight: 600,
+                                }}>
+                                  {gpu.utilizationGpu}%
+                                </span>
+                              )}
                               {gpu.temperatureC != null && ` · ${gpu.temperatureC}°C`}
                             </span>
                           ))}
