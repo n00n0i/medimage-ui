@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square } from 'lucide-react'
 
 interface Model {
   id: string
@@ -78,6 +78,10 @@ export default function Models() {
   // Delete confirm
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
+
+  // Multi-select
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deletingBulk, setDeletingBulk] = useState(false)
 
   const fetchModels = async () => {
     setLoading(true)
@@ -159,10 +163,34 @@ export default function Models() {
     try {
       await fetch(`/api/jobs/${deleteId}`, { method: 'DELETE' })
       setDeleteId(null)
+      setSelected(prev => { const s = new Set(prev); s.delete(deleteId); return s })
       fetchModels()
     } finally {
       setDeleting(false)
     }
+  }
+
+  const toggleSelect = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    setSelected(prev => {
+      const s = new Set(prev)
+      s.has(id) ? s.delete(id) : s.add(id)
+      return s
+    })
+  }
+
+  const toggleSelectAll = () => {
+    const ids = filtered.map(m => m.id)
+    const allSelected = ids.every(id => selected.has(id))
+    setSelected(allSelected ? new Set() : new Set(ids))
+  }
+
+  const deleteSelected = async () => {
+    setDeletingBulk(true)
+    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}`, { method: 'DELETE' })))
+    setSelected(new Set())
+    setDeletingBulk(false)
+    fetchModels()
   }
 
   const filtered = filter === 'all' ? models : models.filter(m => m.training_type === filter)
@@ -184,6 +212,30 @@ export default function Models() {
           <RefreshCw size={14} /> Refresh
         </button>
       </div>
+
+      {/* Bulk action toolbar */}
+      {selected.size > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px',
+          background: 'var(--bg-elevated)', borderRadius: 10, marginBottom: 16,
+          border: '1px solid var(--primary)', boxShadow: '0 0 0 3px var(--primary-dim, #6366f120)',
+        }}>
+          <CheckSquare size={16} color="var(--primary)" />
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', flex: 1 }}>
+            เลือกไว้ {selected.size} model
+          </span>
+          <button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())}>ยกเลิก</button>
+          <button
+            className="btn btn-sm"
+            style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
+            onClick={deleteSelected}
+            disabled={deletingBulk}
+          >
+            {deletingBulk ? <Loader size={13} className="animate-spin" /> : <Trash2 size={13} />}
+            Delete {selected.size}
+          </button>
+        </div>
+      )}
 
       {/* Filter tabs */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 24 }}>
@@ -230,16 +282,40 @@ export default function Models() {
 
       {/* Model cards */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {/* Select-all row */}
+        {filtered.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 4 }}>
+            <button
+              onClick={toggleSelectAll}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 12 }}
+            >
+              {filtered.every(m => selected.has(m.id))
+                ? <CheckSquare size={15} color="var(--primary)" />
+                : <Square size={15} />}
+              เลือกทั้งหมด ({filtered.length})
+            </button>
+          </div>
+        )}
+
         {filtered.map(m => {
           const typeColor = TYPE_COLORS[m.training_type] || '#6366f1'
           const expanded = expandedId === m.id
+          const isSelected = selected.has(m.id)
           return (
-            <div key={m.id} className="card" style={{ padding: 0, overflow: 'hidden' }}>
+            <div key={m.id} className="card" style={{ padding: 0, overflow: 'hidden', outline: isSelected ? '2px solid var(--primary)' : 'none', outlineOffset: -2 }}>
               {/* Main row */}
               <div
-                style={{ padding: '16px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 16 }}
+                style={{ padding: '16px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12 }}
                 onClick={() => setExpandedId(expanded ? null : m.id)}
               >
+                {/* Checkbox */}
+                <button
+                  onClick={e => toggleSelect(m.id, e)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', flexShrink: 0, padding: 0, color: isSelected ? 'var(--primary)' : 'var(--text-muted)' }}
+                >
+                  {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                </button>
+
                 {/* Icon */}
                 <div style={{
                   width: 44, height: 44, borderRadius: 10, flexShrink: 0,

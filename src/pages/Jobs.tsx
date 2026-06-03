@@ -1,6 +1,6 @@
 
 import { useState, useEffect, useRef } from 'react'
-import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2 } from 'lucide-react'
+import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square } from 'lucide-react'
 import GpuMonitor from '../components/GpuMonitor'
 
 interface Job {
@@ -46,6 +46,8 @@ export default function Jobs() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<string>('all')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deletingBulk, setDeletingBulk] = useState(false)
   const [logJob, setLogJob] = useState<{id: string; name: string} | null>(null)
   const [logText, setLogText] = useState<string>('')
   const [logLoading, setLogLoading] = useState(false)
@@ -98,6 +100,29 @@ export default function Jobs() {
 
   const deleteJob = async (jobId: string) => {
     await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' })
+    setSelected(prev => { const s = new Set(prev); s.delete(jobId); return s })
+    fetchJobs(true)
+  }
+
+  const toggleSelect = (id: string) => {
+    setSelected(prev => {
+      const s = new Set(prev)
+      s.has(id) ? s.delete(id) : s.add(id)
+      return s
+    })
+  }
+
+  const toggleSelectAll = () => {
+    const ids = filtered.map(j => j.id)
+    const allSelected = ids.every(id => selected.has(id))
+    setSelected(allSelected ? new Set() : new Set(ids))
+  }
+
+  const deleteSelected = async () => {
+    setDeletingBulk(true)
+    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}`, { method: 'DELETE' })))
+    setSelected(new Set())
+    setDeletingBulk(false)
     fetchJobs(true)
   }
 
@@ -139,6 +164,30 @@ export default function Jobs() {
         </div>
       </div>
 
+      {/* Bulk action toolbar */}
+      {selected.size > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px',
+          background: 'var(--bg-elevated)', borderRadius: 10, marginBottom: 16,
+          border: '1px solid var(--primary)', boxShadow: '0 0 0 3px var(--primary-dim, #6366f120)',
+        }}>
+          <CheckSquare size={16} color="var(--primary)" />
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', flex: 1 }}>
+            เลือกไว้ {selected.size} job
+          </span>
+          <button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())}>ยกเลิก</button>
+          <button
+            className="btn btn-sm"
+            style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
+            onClick={deleteSelected}
+            disabled={deletingBulk}
+          >
+            {deletingBulk ? <Loader size={13} className="animate-spin" /> : <Trash2 size={13} />}
+            Delete {selected.size}
+          </button>
+        </div>
+      )}
+
       {/* Live GPU Monitor — show when a job is running */}
       {jobs.some(j => j.status === 'running' || j.status === 'queued') && (
         <div className="card mb-6" style={{ padding: '16px 20px' }}>
@@ -163,14 +212,36 @@ export default function Jobs() {
       {/* Jobs list */}
       {!loading && (
         <div className="space-y-3">
+          {/* Select-all row */}
+          {filtered.length > 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 8 }}>
+              <button
+                onClick={toggleSelectAll}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 12 }}
+              >
+                {filtered.every(j => selected.has(j.id))
+                  ? <CheckSquare size={15} color="var(--primary)" />
+                  : <Square size={15} />}
+                เลือกทั้งหมด ({filtered.length})
+              </button>
+            </div>
+          )}
+
           {filtered.map((job: Job) => {
             const cfg = STATUS_CONFIG[job.status as keyof typeof STATUS_CONFIG] ?? STATUS_CONFIG.queued
             const Icon = cfg.icon
+            const isSelected = selected.has(job.id)
             return (
-              <div key={job.id} className="card">
+              <div key={job.id} className="card" style={{ outline: isSelected ? '2px solid var(--primary)' : 'none', outlineOffset: -2 }}>
                 {/* Header */}
                 <div className="flex flex-col sm:flex-row items-start sm:items-start justify-between gap-3 mb-3">
                   <div className="flex items-start gap-3">
+                    <button
+                      onClick={() => toggleSelect(job.id)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', flexShrink: 0, marginTop: 1, padding: 0, color: isSelected ? 'var(--primary)' : 'var(--text-muted)' }}
+                    >
+                      {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                    </button>
                     <Icon size={16} style={{ color: 'var(--text-muted)', flexShrink: 0, marginTop: 2 }} className={job.status === 'running' ? 'animate-spin' : ''} />
                     <div>
                       <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{job.name}</h3>
