@@ -332,6 +332,13 @@ export default function TrainModel() {
   const compatibleOptions   = filteredByDomain.filter(o => isCompatible(o))
   const incompatibleOptions = filteredByDomain.filter(o => !isCompatible(o))
 
+  // Per-card counts for step 0 — each training type card shows ITS OWN count
+  const countForType = (tt: TrainingType) => {
+    const opts = TRAINING_MATRIX[tt] || []
+    const dataFiltered = opts.filter(o => (MODEL_DATA_TYPES[o.value] ?? _A).includes(config.dataType))
+    return dataFiltered.filter(o => isCompatible(o)).length
+  }
+
   const set = <K extends keyof TrainingConfig>(key: K, val: TrainingConfig[K]) => {
     setConfig(prev => ({ ...prev, [key]: val }))
   }
@@ -474,7 +481,7 @@ export default function TrainModel() {
                 แบ่งประเภทภาพ เช่น Normal/Pneumonia/COVID, Fundus disease grading, CT slice triage
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
-                <span>{compatibleOptions.length} models</span>
+                <span>{countForType('classification')} models</span>
                 <ChevronDown size={12} />
               </div>
             </button>
@@ -498,7 +505,7 @@ export default function TrainModel() {
                 หา bounding box ของ defect, component, object บน production line / aerial / industrial camera
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--warning)', fontSize: 12 }}>
-                <span>{compatibleOptions.length} models</span>
+                <span>{countForType('detection')} models</span>
                 <ChevronDown size={12} />
               </div>
             </button>
@@ -522,7 +529,7 @@ export default function TrainModel() {
                 แบ่งส่วน defect area, surface crack, part boundary ด้วย pixel-level precision
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--success)', fontSize: 12 }}>
-                <span>{compatibleOptions.length} models</span>
+                <span>{countForType('segmentation')} models</span>
                 <ChevronDown size={12} />
               </div>
             </button>
@@ -570,7 +577,7 @@ export default function TrainModel() {
                 Pre-train ด้วย MAE, DINO, SimCLR ก่อน fine-tune — ดีสำหรับ data ใหม่ที่ยังไม่มี label
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
-                <span>{trainingOptions.filter(o => o.compatible).length} models available</span>
+                <span>{countForType('self-supervised')} models</span>
                 <ChevronDown size={12} />
               </div>
             </button>
@@ -594,7 +601,7 @@ export default function TrainModel() {
                 Export trained model ไปเป็น TF-Lite, ONNX, TensorRT สำหรับ deploy บน edge board
               </p>
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
-                <span>{compatibleOptions.length} formats</span>
+                <span>{countForType('export-edge')} formats</span>
                 <ChevronDown size={12} />
               </div>
             </button>
