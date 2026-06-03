@@ -1,6 +1,7 @@
 
 import { useState, useEffect, useRef } from 'react'
 import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2 } from 'lucide-react'
+import GpuMonitor from '../components/GpuMonitor'
 
 interface Job {
   id: string
@@ -137,6 +138,13 @@ export default function Jobs() {
           </button>
         </div>
       </div>
+
+      {/* Live GPU Monitor — show when a job is running */}
+      {jobs.some(j => j.status === 'running' || j.status === 'queued') && (
+        <div className="card mb-6" style={{ padding: '16px 20px' }}>
+          <GpuMonitor active={jobs.some(j => j.status === 'running')} />
+        </div>
+      )}
 
       {/* Error */}
       {error && (
