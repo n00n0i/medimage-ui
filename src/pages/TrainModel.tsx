@@ -199,6 +199,7 @@ export default function TrainModel() {
   const [textDatasets, setTextDatasets] = useState<Array<{id: string; name: string; format: string; row_count: number; size_bytes: number}>>([])
 
   const isLlmType = (t: TrainingType) => t === 'llm-text' || t === 'vlm-finetune'
+  const needsTextDataset = (t: TrainingType) => t === 'llm-text'
 
   // Fetch text datasets when in LLM/VLM mode
   useEffect(() => {
@@ -586,8 +587,8 @@ export default function TrainModel() {
               </p>
             </div>
 
-            {/* Dataset — image types use LS projects; LLM/VLM use text datasets */}
-            {isLlmType(config.trainingType) ? (
+            {/* Dataset — only pure LLM uses text datasets; VLM uses LS image projects */}
+            {needsTextDataset(config.trainingType) ? (
               <div className="card md:col-span-2">
                 <label>Text Dataset (.jsonl)</label>
                 {textDatasets.length === 0 ? (
