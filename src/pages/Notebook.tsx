@@ -4,7 +4,6 @@ import { BookOpen, ExternalLink, Loader, AlertCircle, RefreshCw } from 'lucide-r
 export default function Notebook() {
   const [status, setStatus] = useState<'checking' | 'ready' | 'unavailable'>('checking')
   const JUPYTER_TOKEN = 'medimage2026'
-  const JUPYTER_URL = '/jupyter/'
   const JUPYTER_LAB_URL = `/jupyter/lab?token=${JUPYTER_TOKEN}`
 
   useEffect(() => {
@@ -14,21 +13,22 @@ export default function Notebook() {
   const checkJupyter = async () => {
     setStatus('checking')
     try {
-      const res = await fetch(JUPYTER_URL, { method: 'GET', redirect: 'follow' })
-      // Jupyter may 302-redirect to /jupyter/lab — 2xx or 3xx both mean it's up
-      setStatus(res.ok || res.status === 302 || res.type === 'opaqueredirect' ? 'ready' : 'unavailable')
+      // Fetch with token URL — this sets the Jupyter session cookie for localhost:8083
+      // so the iframe can load /jupyter/lab without needing the token in URL again
+      const res = await fetch(JUPYTER_LAB_URL, { redirect: 'follow', credentials: 'include' })
+      setStatus(res.ok ? 'ready' : 'unavailable')
     } catch {
       setStatus('unavailable')
     }
   }
 
   return (
-    <div style={{ height: 'calc(100vh - 48px)', display: 'flex', flexDirection: 'column', margin: '-24px' }}>
+    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
       {/* Top bar */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 10, padding: '10px 20px',
         background: 'var(--bg-surface)', borderBottom: '1px solid var(--border-default)',
-        flexShrink: 0,
+        flexShrink: 0, height: 44,
       }}>
         <BookOpen size={16} color="var(--primary)" />
         <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Jupyter Notebook</span>
