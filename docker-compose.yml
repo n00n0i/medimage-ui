@@ -87,7 +87,20 @@ services:
       - api-data:/data
     restart: unless-stopped
 
+  jupyter:
+    image: quay.io/jupyter/scipy-notebook:latest
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - GRANT_SUDO=yes
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-medimage2026}
+    volumes:
+      - jupyter-data:/home/jovyan/work
+      - ./jupyter_config.py:/home/jovyan/.jupyter/jupyter_server_config.py:ro
+    user: root
+    restart: unless-stopped
+
 volumes:
   minio-data:
   label-studio-data:
   api-data:
+  jupyter-data:

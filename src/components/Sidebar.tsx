@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import {
   FolderSync, Database, Brain, ListChecks, LayoutDashboard,
-  ChevronLeft, ChevronRight, Activity, Server, HardDrive, BrainCircuit
+  ChevronLeft, ChevronRight, Activity, Server, HardDrive, BrainCircuit, BookOpen
 } from 'lucide-react'
 import { useState } from 'react'
 
@@ -13,6 +13,7 @@ const navItems = [
   { to: '/jobs',         label: 'Jobs',         icon: ListChecks,       desc: 'Running jobs' },
   { to: '/models',       label: 'Models',       icon: BrainCircuit,     desc: 'Trained models' },
   { to: '/ray-cluster',  label: 'Ray Cluster',  icon: Server,           desc: 'Cluster & GPUs' },
+  { to: '/notebook',     label: 'Notebook',     icon: BookOpen,         desc: 'Jupyter Notebook' },
   { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  desc: 'Analytics' },
 ]
 
