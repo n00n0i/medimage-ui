@@ -3,7 +3,16 @@ import axios from 'axios'
 import {
   Database, RefreshCw, ExternalLink, CheckCircle2, XCircle,
   AlertCircle, Loader2, HardDrive, FolderSync, Upload, FileText, Trash2,
+  Search, Package,
 } from 'lucide-react'
+
+interface HFDataset {
+  id: string
+  author?: string
+  downloads?: number
+  tags?: string[]
+  gated?: boolean | string
+}
 
 const LS_API   = '/api/ls'
 const LS_TOKEN = 'medimage-ls-token-2026'
@@ -74,6 +83,7 @@ export default function Datasets() {
   const [uploading, setUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [showHFImport, setShowHFImport] = useState(false)
 
   const showToast = (msg: string, type = 'success') => {
     setToast({ msg, type })
@@ -242,6 +252,13 @@ export default function Datasets() {
         </div>
         <button className="btn btn-secondary btn-sm" onClick={tab === 'image' ? fetchDatasets : fetchTextDatasets}>
           <RefreshCw size={14} />Refresh
+        </button>
+        <button
+          className="btn btn-primary btn-sm"
+          style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#f97316', borderColor: '#f97316' }}
+          onClick={() => setShowHFImport(true)}
+        >
+          <Package size={14} /> Import from HuggingFace
         </button>
       </div>
 
@@ -489,6 +506,307 @@ export default function Datasets() {
       )}
       </>
       )}
+
+      {showHFImport && (
+        <HFDatasetImportModal
+          onClose={() => setShowHFImport(false)}
+          onDone={() => { setShowHFImport(false); fetchDatasets() }}
+        />
+      )}
+    </div>
+  )
+}
+
+// ─── HuggingFace Dataset Import Modal ────────────────────────────────────────
+
+function HFDatasetImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const [hfQuery, setHfQuery] = useState('')
+  const [hfResults, setHfResults] = useState<HFDataset[]>([])
+  const [hfSearching, setHfSearching] = useState(false)
+  const [hfSearched, setHfSearched] = useState(false)
+  const [selected, setSelected] = useState<HFDataset | null>(null)
+  const [bucketName, setBucketName] = useState('')
+  const [bucketError, setBucketError] = useState('')
+  const [maxFiles, setMaxFiles] = useState(20)
+  const [jobId, setJobId] = useState<string | null>(null)
+  const [job, setJob] = useState<any>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const logRef = useRef<HTMLPreElement>(null)
+
+  const suggestBucket = (id: string) => {
+    const base = id.split('/').pop() ?? id
+    return 'hf-' + base.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 27)
+  }
+
+  const validateBucket = (name: string): string => {
+    if (!name) return 'Required'
+    if (!/^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$/.test(name))
+      return '3–63 chars, lowercase letters/numbers/hyphens only, no leading/trailing hyphens'
+    return ''
+  }
+
+  const searchHF = async () => {
+    if (!hfQuery.trim()) return
+    setHfSearching(true)
+    setHfResults([])
+    try {
+      const res = await fetch(
+        `https://huggingface.co/api/datasets?search=${encodeURIComponent(hfQuery.trim())}&limit=8&sort=downloads&direction=-1`,
+        { signal: AbortSignal.timeout(8000) }
+      )
+      const data = await res.json()
+      setHfResults(Array.isArray(data) ? data : [])
+    } catch { setHfResults([]) }
+    setHfSearching(false)
+    setHfSearched(true)
+  }
+
+  const selectDataset = (ds: HFDataset) => {
+    setSelected(ds)
+    setHfResults([])
+    setHfSearched(false)
+    setHfQuery('')
+    const suggested = suggestBucket(ds.id)
+    setBucketName(suggested)
+    setBucketError('')
+  }
+
+  const startImport = async () => {
+    const err = validateBucket(bucketName)
+    if (err) { setBucketError(err); return }
+    if (!selected) return
+    try {
+      const res = await fetch('/api/datasets/import-hf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hf_dataset_id: selected.id, bucket_name: bucketName, max_files: maxFiles }),
+      })
+      const data = await res.json()
+      if (!res.ok) { setBucketError(data.detail ?? 'Import failed'); return }
+      setJobId(data.job_id)
+      pollRef.current = setInterval(async () => {
+        const r = await fetch(`/api/datasets/import-hf/${data.job_id}`)
+        const d = await r.json()
+        setJob(d)
+        setTimeout(() => logRef.current?.scrollTo(0, logRef.current.scrollHeight), 30)
+        if (d.status === 'completed' || d.status === 'error') {
+          clearInterval(pollRef.current!)
+        }
+      }, 800)
+    } catch (e: any) {
+      setBucketError(e.message)
+    }
+  }
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
+
+  const isRunning = job && (job.status === 'queued' || job.status === 'running')
+  const isDone    = job?.status === 'completed'
+  const isError   = job?.status === 'error'
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div
+        className="modal"
+        style={{ maxWidth: 600, width: '95vw', padding: 28, maxHeight: '92vh', overflowY: 'auto' }}
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 22 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 36, height: 36, borderRadius: 9, background: '#f9731620', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Package size={18} color="#f97316" />
+            </div>
+            <div>
+              <h3 style={{ fontWeight: 700, fontSize: 16, color: 'var(--text-primary)', margin: 0 }}>Import from HuggingFace</h3>
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0 }}>Download dataset files → create MinIO bucket</p>
+            </div>
+          </div>
+          <button className="btn btn-secondary btn-sm" onClick={onClose} disabled={isRunning}>✕</button>
+        </div>
+
+        {/* ── Pre-import form ── */}
+        {!jobId && (
+          <>
+            {/* Search */}
+            <div style={{ marginBottom: 18 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 8 }}>
+                Search HuggingFace Datasets
+              </label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  value={hfQuery}
+                  onChange={e => setHfQuery(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && searchHF()}
+                  placeholder="e.g. imagenet, coco, squad, mnist..."
+                  style={{ flex: 1, padding: '8px 10px', borderRadius: 7, fontSize: 13, border: '1px solid var(--border-default)', background: 'var(--bg-surface)', color: 'var(--text-primary)' }}
+                />
+                <button
+                  onClick={searchHF}
+                  disabled={hfSearching || !hfQuery.trim()}
+                  style={{ padding: '8px 14px', borderRadius: 7, fontSize: 12, fontWeight: 600, cursor: 'pointer', border: '1px solid var(--border-default)', background: 'var(--bg-elevated)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 6, opacity: hfSearching || !hfQuery.trim() ? 0.5 : 1 }}
+                >
+                  {hfSearching ? <Loader2 size={13} className="animate-spin" /> : <Search size={13} />}
+                  Search
+                </button>
+              </div>
+
+              {/* Results */}
+              {hfResults.length > 0 && (
+                <div style={{ marginTop: 8, border: '1px solid var(--border-default)', borderRadius: 8, overflow: 'hidden', maxHeight: 240, overflowY: 'auto' }}>
+                  {hfResults.map((ds, i) => (
+                    <button
+                      key={ds.id}
+                      onClick={() => selectDataset(ds)}
+                      style={{
+                        width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px',
+                        border: 'none', borderBottom: i < hfResults.length - 1 ? '1px solid var(--border-subtle)' : 'none',
+                        background: i % 2 === 0 ? 'var(--bg-surface)' : 'var(--bg-base)',
+                        cursor: 'pointer', textAlign: 'left',
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ds.id}</div>
+                        <div style={{ display: 'flex', gap: 6, marginTop: 3, flexWrap: 'wrap' }}>
+                          {ds.gated && <span style={{ fontSize: 10, background: '#f9731620', color: '#f97316', borderRadius: 4, padding: '1px 5px', fontWeight: 600 }}>Gated</span>}
+                          {(ds.tags ?? []).slice(0, 3).map(t => (
+                            <span key={t} style={{ fontSize: 10, background: 'var(--bg-elevated)', color: 'var(--text-muted)', borderRadius: 4, padding: '1px 5px' }}>{t}</span>
+                          ))}
+                        </div>
+                      </div>
+                      {ds.downloads !== undefined && (
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', flexShrink: 0, textAlign: 'right' }}>
+                          ↓ {ds.downloads >= 1000 ? (ds.downloads / 1000).toFixed(0) + 'k' : ds.downloads}
+                        </div>
+                      )}
+                      <span style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 600, flexShrink: 0 }}>Select →</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {hfSearched && hfResults.length === 0 && !hfSearching && (
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>ไม่พบผลลัพธ์ ลองคำค้นอื่น</p>
+              )}
+            </div>
+
+            {/* Selected dataset chip */}
+            {selected && (
+              <div style={{ marginBottom: 18, display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderRadius: 8, background: '#f9731614', border: '1px solid #f9731640' }}>
+                <Package size={14} color="#f97316" style={{ flexShrink: 0 }} />
+                <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', flex: 1 }}>{selected.id}</span>
+                {selected.gated && <span style={{ fontSize: 10, background: '#f9731620', color: '#f97316', borderRadius: 4, padding: '2px 6px', fontWeight: 700 }}>Gated ⚠</span>}
+                <button onClick={() => setSelected(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 16, lineHeight: 1 }}>×</button>
+              </div>
+            )}
+
+            {/* Bucket name */}
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>
+                MinIO Bucket Name <span style={{ color: 'var(--danger)' }}>*</span>
+              </label>
+              <input
+                value={bucketName}
+                onChange={e => { setBucketName(e.target.value); setBucketError(validateBucket(e.target.value)) }}
+                placeholder="e.g. hf-squad"
+                style={{ width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, border: `1px solid ${bucketError ? 'var(--danger)' : 'var(--border-default)'}`, background: 'var(--bg-surface)', color: 'var(--text-primary)', boxSizing: 'border-box' }}
+              />
+              {bucketError
+                ? <p style={{ fontSize: 11, color: 'var(--danger)', marginTop: 4 }}>{bucketError}</p>
+                : <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>lowercase letters, numbers, hyphens · 3–63 chars</p>
+              }
+            </div>
+
+            {/* Max files */}
+            <div style={{ marginBottom: 22 }}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>
+                Max files to download
+                <span style={{ marginLeft: 8, fontWeight: 400, color: 'var(--text-muted)' }}>(ใช้ขีดจำกัดเพื่อป้องกัน dataset ขนาดใหญ่)</span>
+              </label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <input
+                  type="range" min={1} max={100} value={maxFiles}
+                  onChange={e => setMaxFiles(Number(e.target.value))}
+                  style={{ flex: 1, accentColor: '#f97316' }}
+                />
+                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', minWidth: 30, textAlign: 'right' }}>{maxFiles}</span>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                style={{ background: '#f97316', borderColor: '#f97316', display: 'flex', alignItems: 'center', gap: 7, opacity: !selected || !bucketName ? 0.6 : 1 }}
+                onClick={startImport}
+                disabled={!selected || !bucketName}
+              >
+                <Package size={14} /> Import Dataset
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* ── Progress ── */}
+        {jobId && job && (
+          <div>
+            {/* Status row */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+              <div style={{ width: 40, height: 40, borderRadius: 10, background: isDone ? '#10b98120' : isError ? '#ef444420' : '#f9731620', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                {isRunning ? <Loader2 size={20} color="#f97316" className="animate-spin" /> :
+                 isDone    ? <CheckCircle2 size={20} color="#10b981" /> :
+                             <XCircle size={20} color="#ef4444" />}
+              </div>
+              <div style={{ flex: 1 }}>
+                <p style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
+                  {isRunning ? `Importing ${job.hf_id}…` : isDone ? 'Import complete!' : 'Import failed'}
+                </p>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0, marginTop: 2 }}>
+                  Bucket: <code style={{ fontFamily: 'var(--font-mono)' }}>{job.bucket}</code>
+                  {job.total_files > 0 && ` · ${job.done_files}/${job.total_files} files`}
+                </p>
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>{job.progress}%</span>
+            </div>
+
+            {/* Progress bar */}
+            <div style={{ height: 6, borderRadius: 3, background: 'var(--bg-elevated)', marginBottom: 16, overflow: 'hidden' }}>
+              <div style={{ height: '100%', borderRadius: 3, transition: 'width 0.4s ease', width: `${job.progress}%`, background: isDone ? '#10b981' : isError ? '#ef4444' : '#f97316' }} />
+            </div>
+
+            {/* Log */}
+            <pre ref={logRef} style={{
+              background: 'var(--bg-base)', border: '1px solid var(--border-subtle)', borderRadius: 8,
+              padding: '10px 14px', fontSize: 11, lineHeight: 1.6, color: 'var(--text-secondary)',
+              fontFamily: 'var(--font-mono)', maxHeight: '30vh', overflowY: 'auto',
+              whiteSpace: 'pre-wrap', wordBreak: 'break-all', marginBottom: 20,
+            }}>
+              {job.log || 'Starting…'}
+            </pre>
+
+            {isError && (
+              <div style={{ padding: '10px 14px', borderRadius: 8, background: '#ef444418', border: '1px solid #ef444440', marginBottom: 16, fontSize: 12, color: '#ef4444' }}>
+                {job.error}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              {isDone && (
+                <a href="http://localhost:9001" target="_blank" rel="noopener noreferrer" className="btn btn-secondary" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                  <ExternalLink size={12} /> MinIO Console
+                </a>
+              )}
+              <button
+                className="btn btn-primary"
+                style={{ background: isDone ? '#10b981' : '#ef4444', borderColor: isDone ? '#10b981' : '#ef4444' }}
+                onClick={isDone ? onDone : onClose}
+                disabled={isRunning}
+              >
+                {isDone ? '✓ Done' : isRunning ? 'Importing…' : 'Close'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

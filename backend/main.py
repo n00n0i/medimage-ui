@@ -141,6 +141,8 @@ class TrainRequest(BaseModel):
 LS_API_URL = os.getenv("LS_API_URL", "http://label-studio:8080")
 LS_TOKEN   = os.getenv("LS_TOKEN", "medimage-ls-token-2026")
 MINIO_URL  = os.getenv("MINIO_URL", "http://minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 
 
 def _append_log(job_id: str, line: str):
@@ -797,6 +799,188 @@ def delete_text_dataset(ds_id: str):
         conn.execute("DELETE FROM text_datasets WHERE id = ?", (ds_id,))
         conn.commit()
     return {"ok": True}
+
+
+# ─── HuggingFace Dataset Import ──────────────────────────────────────────────
+
+_hf_import_jobs: dict = {}  # job_id → {status, progress, log, bucket, error, done_files, total_files}
+
+
+class HFImportRequest(BaseModel):
+    hf_dataset_id: str
+    bucket_name: str
+    max_files: int = 20
+
+
+def _log_hf(job_id: str, line: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    _hf_import_jobs[job_id]["log"] += f"[{ts}] {line}\n"
+
+
+def _run_hf_import(job_id: str, req: HFImportRequest):
+    import requests as _req
+    import boto3 as _boto3
+    from botocore.exceptions import ClientError as _CE
+
+    job = _hf_import_jobs[job_id]
+    job["status"] = "running"
+    try:
+        # 1. Create MinIO bucket
+        _log_hf(job_id, f"Connecting to MinIO ({MINIO_URL})...")
+        s3 = _boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name="us-east-1",
+        )
+        try:
+            s3.create_bucket(Bucket=req.bucket_name)
+            _log_hf(job_id, f"✓ Bucket '{req.bucket_name}' created")
+        except _CE as e:
+            code = e.response["Error"]["Code"]
+            if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                _log_hf(job_id, f"ℹ Bucket '{req.bucket_name}' already exists — reusing")
+            else:
+                raise Exception(f"MinIO error: {e.response['Error']['Message']}")
+
+        job["progress"] = 10
+
+        # 2. List files from HF dataset repo
+        _log_hf(job_id, f"Fetching file tree: huggingface.co/datasets/{req.hf_dataset_id}...")
+        tree_url = f"https://huggingface.co/api/datasets/{req.hf_dataset_id}/tree/main"
+        r = _req.get(tree_url, timeout=30)
+        if not r.ok:
+            raise Exception(f"HuggingFace API returned HTTP {r.status_code} — dataset not found or is private")
+
+        entries = r.json()
+        blobs = [e for e in entries if e.get("type") == "blob"]
+
+        # If no blobs at root, try data/ subdirectory
+        if not blobs:
+            r2 = _req.get(f"{tree_url}/data", timeout=30)
+            if r2.ok:
+                blobs += [e for e in r2.json() if e.get("type") == "blob"]
+
+        # Remove gitattributes
+        blobs = [b for b in blobs if not b["path"].lower().endswith(".gitattributes")]
+
+        if not blobs:
+            raise Exception("No downloadable files found in this dataset repo")
+
+        # Sort: parquet → jsonl/json/csv → images → other
+        def _prio(e: dict) -> int:
+            p = e["path"].lower()
+            if p.endswith(".parquet"): return 0
+            if p.endswith((".jsonl", ".json", ".csv")): return 1
+            if p.endswith((".jpg", ".jpeg", ".png", ".webp")): return 2
+            if p.endswith(".txt"): return 3
+            return 9
+
+        blobs.sort(key=_prio)
+        blobs = blobs[:req.max_files]
+        _log_hf(job_id, f"Found {len(blobs)} file(s) to download")
+        job["progress"] = 15
+        job["total_files"] = len(blobs)
+        job["done_files"] = 0
+
+        # 3. Download each file and upload to MinIO
+        done = 0
+        for i, blob in enumerate(blobs):
+            path = blob["path"]
+            size_bytes = blob.get("size", 0)
+
+            # Skip files > 200 MB
+            if size_bytes > 200 * 1024 * 1024:
+                _log_hf(job_id, f"  ⚠ Skip {path} — too large ({size_bytes // 1024 // 1024} MB)")
+                continue
+
+            sz_str = (
+                f"{size_bytes / 1024 / 1024:.1f} MB" if size_bytes > 1024 * 1024
+                else f"{size_bytes // 1024} KB"
+            )
+            _log_hf(job_id, f"↓ [{i+1}/{len(blobs)}] {path}  ({sz_str})")
+
+            hf_url = f"https://huggingface.co/datasets/{req.hf_dataset_id}/resolve/main/{path}"
+            dl = _req.get(hf_url, timeout=120)
+            if not dl.ok:
+                _log_hf(job_id, f"  ⚠ HTTP {dl.status_code} — skipping")
+                continue
+
+            s3_key = path.lstrip("/")
+            s3.put_object(Bucket=req.bucket_name, Key=s3_key, Body=dl.content)
+            _log_hf(job_id, f"  ✓ s3://{req.bucket_name}/{s3_key}")
+            done += 1
+            job["done_files"] = done
+            job["progress"] = 15 + int((i + 1) / len(blobs) * 80)
+
+        job["progress"] = 100
+        job["status"] = "completed"
+        _log_hf(job_id, "")
+        _log_hf(job_id, "=== Import complete ===")
+        _log_hf(job_id, f"Bucket : {req.bucket_name}")
+        _log_hf(job_id, f"Files  : {done}/{len(blobs)} uploaded")
+        _log_hf(job_id, "MinIO console → http://localhost:9001")
+
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        _log_hf(job_id, f"ERROR: {e}")
+
+
+@app.post("/api/datasets/import-hf")
+def import_hf_dataset(req: HFImportRequest):
+    import re as _re
+    if not _re.match(r"^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$", req.bucket_name):
+        raise HTTPException(
+            status_code=400,
+            detail="Bucket name: 3–63 lowercase letters/numbers/hyphens, no leading/trailing hyphens",
+        )
+    if not req.hf_dataset_id.strip():
+        raise HTTPException(status_code=400, detail="HuggingFace dataset ID is required")
+
+    job_id = str(uuid.uuid4())[:8]
+    _hf_import_jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "log": "",
+        "bucket": req.bucket_name,
+        "hf_id": req.hf_dataset_id,
+        "error": None,
+        "done_files": 0,
+        "total_files": 0,
+    }
+    threading.Thread(target=_run_hf_import, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/datasets/import-hf/{job_id}")
+def get_hf_import_status(job_id: str):
+    job = _hf_import_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.get("/api/datasets/buckets")
+def list_minio_buckets():
+    try:
+        import boto3 as _boto3
+        s3 = _boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name="us-east-1",
+        )
+        resp = s3.list_buckets()
+        buckets = [
+            {"name": b["Name"], "created": b["CreationDate"].isoformat()}
+            for b in resp.get("Buckets", [])
+        ]
+        return {"buckets": buckets}
+    except Exception as e:
+        return {"buckets": [], "error": str(e)}
 
 
 @app.get("/healthz")
