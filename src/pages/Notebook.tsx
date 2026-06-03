@@ -3,7 +3,9 @@ import { BookOpen, ExternalLink, Loader, AlertCircle, RefreshCw } from 'lucide-r
 
 export default function Notebook() {
   const [status, setStatus] = useState<'checking' | 'ready' | 'unavailable'>('checking')
+  const JUPYTER_TOKEN = 'medimage2026'
   const JUPYTER_URL = '/jupyter/'
+  const JUPYTER_LAB_URL = `/jupyter/lab?token=${JUPYTER_TOKEN}`
 
   useEffect(() => {
     checkJupyter()
@@ -12,8 +14,9 @@ export default function Notebook() {
   const checkJupyter = async () => {
     setStatus('checking')
     try {
-      const res = await fetch(JUPYTER_URL, { method: 'HEAD' })
-      setStatus(res.ok ? 'ready' : 'unavailable')
+      const res = await fetch(JUPYTER_URL, { method: 'GET', redirect: 'follow' })
+      // Jupyter may 302-redirect to /jupyter/lab — 2xx or 3xx both mean it's up
+      setStatus(res.ok || res.status === 302 || res.type === 'opaqueredirect' ? 'ready' : 'unavailable')
     } catch {
       setStatus('unavailable')
     }
@@ -52,7 +55,7 @@ export default function Notebook() {
           </button>
         )}
         <a
-          href={JUPYTER_URL}
+          href={JUPYTER_LAB_URL}
           target="_blank"
           rel="noopener noreferrer"
           className="btn btn-secondary btn-sm"
@@ -82,7 +85,7 @@ export default function Notebook() {
         </div>
       ) : (
         <iframe
-          src={JUPYTER_URL}
+          src={JUPYTER_LAB_URL}
           style={{ flex: 1, border: 'none', width: '100%' }}
           allow="clipboard-read; clipboard-write"
           title="Jupyter Notebook"
