@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import {
   Database, RefreshCw, ExternalLink, CheckCircle2, XCircle,
-  AlertCircle, Loader2, HardDrive, FolderSync,
+  AlertCircle, Loader2, HardDrive, FolderSync, Upload, FileText, Trash2,
 } from 'lucide-react'
 
 const LS_API   = '/api/ls'
@@ -35,6 +35,16 @@ interface Dataset {
   syncStatus: string
 }
 
+interface TextDataset {
+  id: string
+  name: string
+  format: string
+  row_count: number
+  size_bytes: number
+  created_at: number
+  preview?: any[]
+}
+
 async function fetchLSCreds(): Promise<{ email: string; password: string } | null> {
   try {
     const r = await fetch('/api/ls-config')
@@ -58,6 +68,12 @@ export default function Datasets() {
   const [datasets, setDatasets] = useState<Dataset[]>([])
   const [syncing,  setSyncing]  = useState<Set<number>>(new Set())
   const [toast,    setToast]    = useState<{ msg: string; type: string } | null>(null)
+  const [tab, setTab] = useState<'image' | 'text'>('image')
+  const [textDatasets, setTextDatasets] = useState<TextDataset[]>([])
+  const [textLoading, setTextLoading] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [dragOver, setDragOver] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const showToast = (msg: string, type = 'success') => {
     setToast({ msg, type })
@@ -113,6 +129,54 @@ export default function Datasets() {
 
   useEffect(() => { fetchDatasets() }, [fetchDatasets])
 
+  const fetchTextDatasets = useCallback(async () => {
+    setTextLoading(true)
+    try {
+      const res = await fetch('/api/text-datasets')
+      const data = await res.json()
+      setTextDatasets(data.datasets ?? [])
+    } catch { /* ignore */ }
+    setTextLoading(false)
+  }, [])
+
+  useEffect(() => {
+    if (tab === 'text') fetchTextDatasets()
+  }, [tab, fetchTextDatasets])
+
+  const handleFileUpload = async (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase()
+    if (!['jsonl', 'json', 'txt', 'csv'].includes(ext ?? '')) {
+      showToast('รองรับเฉพาะ .jsonl, .json, .txt, .csv', 'error')
+      return
+    }
+    setUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await fetch('/api/text-datasets/upload', { method: 'POST', body: fd })
+      if (!res.ok) throw new Error(await res.text())
+      showToast(`✅ อัปโหลด "${file.name}" สำเร็จ`)
+      fetchTextDatasets()
+    } catch (e: any) {
+      showToast(`❌ อัปโหลดล้มเหลว: ${e.message}`, 'error')
+    }
+    setUploading(false)
+  }
+
+  const deleteTextDataset = async (id: string, name: string) => {
+    if (!confirm(`ลบ dataset "${name}"?`)) return
+    try {
+      await fetch(`/api/text-datasets/${id}`, { method: 'DELETE' })
+      showToast(`ลบ "${name}" แล้ว`)
+      fetchTextDatasets()
+    } catch {
+      showToast('ลบไม่สำเร็จ', 'error')
+    }
+  }
+
+  const fmtBytes = (b: number) =>
+    b < 1024 ? `${b} B` : b < 1024 * 1024 ? `${(b/1024).toFixed(1)} KB` : `${(b/1024/1024).toFixed(1)} MB`
+
   const openInLS = useCallback(async (projectId: number) => {
     // Use unique name to avoid cross-origin reuse of a previous ls-N popup.
     const win = window.open('about:blank', `ls-${projectId}-${Date.now()}`)
@@ -167,25 +231,45 @@ export default function Datasets() {
       day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
     }) : '—'
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="loading-spinner" />
-      </div>
-    )
-  }
-
   return (
     <div className="max-w-5xl mx-auto">
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24 }}>
         <div>
           <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>Datasets</h1>
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-            Label Studio annotation projects — datasets backed by MinIO S3
+            {tab === 'image' ? 'Label Studio annotation projects — datasets backed by MinIO S3' : 'Text & Instruction datasets for LLM/VLM fine-tuning'}
           </p>
         </div>
-        <button className="btn btn-secondary btn-sm" onClick={fetchDatasets}>
+        <button className="btn btn-secondary btn-sm" onClick={tab === 'image' ? fetchDatasets : fetchTextDatasets}>
           <RefreshCw size={14} />Refresh
+        </button>
+      </div>
+
+      {/* Tab switcher */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 24, padding: '4px', background: 'var(--bg-elevated)', borderRadius: 10, width: 'fit-content' }}>
+        <button
+          onClick={() => setTab('image')}
+          style={{
+            padding: '6px 16px', borderRadius: 8, fontSize: 13, fontWeight: 500, border: 'none', cursor: 'pointer',
+            background: tab === 'image' ? 'var(--bg-surface)' : 'transparent',
+            color: tab === 'image' ? 'var(--text-primary)' : 'var(--text-muted)',
+            boxShadow: tab === 'image' ? '0 1px 3px rgba(0,0,0,0.15)' : 'none',
+          }}
+        >
+          <Database size={13} style={{ display: 'inline', marginRight: 6 }} />
+          Image Datasets
+        </button>
+        <button
+          onClick={() => setTab('text')}
+          style={{
+            padding: '6px 16px', borderRadius: 8, fontSize: 13, fontWeight: 500, border: 'none', cursor: 'pointer',
+            background: tab === 'text' ? 'var(--bg-surface)' : 'transparent',
+            color: tab === 'text' ? 'var(--text-primary)' : 'var(--text-muted)',
+            boxShadow: tab === 'text' ? '0 1px 3px rgba(0,0,0,0.15)' : 'none',
+          }}
+        >
+          <FileText size={13} style={{ display: 'inline', marginRight: 6 }} />
+          Text Datasets
         </button>
       </div>
 
@@ -195,7 +279,132 @@ export default function Datasets() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+      {/* ── Text Datasets Tab ── */}
+      {tab === 'text' && (
+        <div>
+          {/* Upload zone */}
+          <div
+            className="card mb-6"
+            style={{
+              borderStyle: 'dashed', borderWidth: 2, cursor: 'pointer',
+              borderColor: dragOver ? '#8b5cf6' : 'var(--border)',
+              background: dragOver ? 'rgba(139,92,246,0.06)' : 'var(--bg-surface)',
+              textAlign: 'center', padding: '32px 16px', transition: 'all 0.15s',
+            }}
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={e => {
+              e.preventDefault()
+              setDragOver(false)
+              const file = e.dataTransfer.files[0]
+              if (file) handleFileUpload(file)
+            }}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".jsonl,.json,.txt,.csv"
+              style={{ display: 'none' }}
+              onChange={e => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
+            />
+            {uploading ? (
+              <><Loader2 size={28} className="animate-spin" style={{ color: '#8b5cf6', margin: '0 auto 8px' }} />
+              <p style={{ fontSize: 14, color: 'var(--text-muted)' }}>กำลังอัปโหลด...</p></>
+            ) : (
+              <><Upload size={28} style={{ color: '#8b5cf6', margin: '0 auto 8px' }} />
+              <p style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 4 }}>คลิกหรือลาก .jsonl file มาวางที่นี่</p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>รองรับ .jsonl (Alpaca / ShareGPT), .json, .txt, .csv</p></>
+            )}
+          </div>
+
+          {/* Format hints */}
+          <div className="card mb-6" style={{ background: 'var(--bg-elevated)' }}>
+            <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>รูปแบบ .jsonl ที่รองรับ</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>Alpaca format</p>
+                <pre style={{ fontSize: 11, background: 'var(--bg-surface)', borderRadius: 6, padding: '8px', color: 'var(--text-secondary)', overflow: 'auto' }}>{`{"instruction": "วินิจฉัยภาพนี้",\n "input": "",\n "output": "Normal CXR"}`}</pre>
+              </div>
+              <div>
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>ShareGPT / ChatML format</p>
+                <pre style={{ fontSize: 11, background: 'var(--bg-surface)', borderRadius: 6, padding: '8px', color: 'var(--text-secondary)', overflow: 'auto' }}>{`{"conversations": [\n  {"role": "user", "content": "..."},\n  {"role": "assistant", "content": "..."}\n]}`}</pre>
+              </div>
+            </div>
+          </div>
+
+          {/* Dataset list */}
+          {textLoading ? (
+            <div className="flex items-center justify-center h-32"><div className="loading-spinner" /></div>
+          ) : textDatasets.length === 0 ? (
+            <div className="card" style={{ textAlign: 'center', padding: '40px 16px' }}>
+              <FileText size={36} style={{ color: 'var(--text-muted)', margin: '0 auto 12px' }} />
+              <p style={{ fontSize: 14, color: 'var(--text-muted)' }}>ยังไม่มี text dataset</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {textDatasets.map(ds => (
+                <div key={ds.id} className="card">
+                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ width: 32, height: 32, borderRadius: 8, background: 'rgba(139,92,246,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <FileText size={15} style={{ color: '#8b5cf6' }} />
+                      </div>
+                      <div>
+                        <h3 style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)', margin: 0 }}>{ds.name}</h3>
+                        <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                          <span style={{ fontSize: 11, background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '1px 6px', fontWeight: 600 }}>{ds.format}</span>
+                          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{ds.row_count.toLocaleString()} rows</span>
+                          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>·</span>
+                          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{fmtBytes(ds.size_bytes)}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => deleteTextDataset(ds.id, ds.name)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 4 }}
+                      title="ลบ dataset นี้"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                  {/* Preview rows */}
+                  {ds.preview && ds.preview.length > 0 && (
+                    <div style={{ marginTop: 8, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
+                      <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>Preview (3 rows)</p>
+                      {ds.preview.slice(0, 3).map((row, i) => (
+                        <pre key={i} style={{ fontSize: 10, background: 'var(--bg-elevated)', borderRadius: 4, padding: '4px 6px', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%', marginBottom: 2 }}>
+                          {JSON.stringify(row).slice(0, 100)}{JSON.stringify(row).length > 100 ? '...' : ''}
+                        </pre>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+                    <a href="/train" className="btn btn-primary btn-sm" style={{ fontSize: 11 }}>Use in Training →</a>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)', alignSelf: 'center' }}>{fmt(new Date(ds.created_at * 1000).toISOString())}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Image Datasets Tab ── */}
+      {tab === 'image' && (
+        <>
+        {loading ? (
+          <div className="flex items-center justify-center h-64"><div className="loading-spinner" /></div>
+        ) : datasets.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '64px 0', color: 'var(--text-muted)' }}>
+            <Database size={40} style={{ margin: '0 auto 16px', opacity: 0.4, display: 'block' }} />
+            <p style={{ fontSize: 14 }}>No datasets yet — create a project to get started</p>
+            <a href="/projects" style={{ color: 'var(--primary-hover)', fontSize: 13, marginTop: 8, display: 'inline-block' }}>
+              Go to Projects →
+            </a>
+          </div>
+        ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
         {datasets.map((ds) => {
           const isSyncing = syncing.has(ds.projectId)
           return (
@@ -277,15 +486,8 @@ export default function Datasets() {
           )
         })}
       </div>
-
-      {datasets.length === 0 && (
-        <div style={{ textAlign: 'center', padding: '64px 0', color: 'var(--text-muted)' }}>
-          <Database size={40} style={{ margin: '0 auto 16px', opacity: 0.4, display: 'block' }} />
-          <p style={{ fontSize: 14 }}>No datasets yet — create a project to get started</p>
-          <a href="/projects" style={{ color: 'var(--primary-hover)', fontSize: 13, marginTop: 8, display: 'inline-block' }}>
-            Go to Projects →
-          </a>
-        </div>
+      )}
+      </>
       )}
     </div>
   )

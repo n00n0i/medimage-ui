@@ -389,6 +389,16 @@ export default function Models() {
                         <Download size={9} /> Pretrained
                       </span>
                     )}
+                    {m.training_type === 'llm-text' && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#8b5cf620', color: '#8b5cf6' }}>
+                        LLM
+                      </span>
+                    )}
+                    {m.training_type === 'vlm-finetune' && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#3b82f620', color: '#3b82f6' }}>
+                        VLM
+                      </span>
+                    )}
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
                     {m.model} &middot; {m.engine} &middot; {m.dataset} &middot; {m.epochs} epochs

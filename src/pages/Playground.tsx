@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   FlaskConical, Upload, Play, X, Loader2, ImageIcon,
-  Zap, CheckCircle2, AlertCircle, ChevronDown,
+  Zap, CheckCircle2, AlertCircle, ChevronDown, MessageSquare, Eye,
+  Send,
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -9,9 +10,18 @@ import {
 interface Model {
   id: string
   name: string
-  training_type: 'classification' | 'detection' | 'segmentation'
+  training_type: string
   model: string
   engine: string
+}
+
+interface TextResult {
+  type: 'text'
+  response: string
+  tokens_generated: number
+  tokens_per_second: number
+  inference_time_ms: number
+  model_name: string
 }
 
 interface ClsResult {
@@ -61,12 +71,16 @@ const TYPE_COLOR: Record<string, string> = {
   classification: '#6366f1',
   detection:      '#f59e0b',
   segmentation:   '#10b981',
+  'llm-text':     '#8b5cf6',
+  'vlm-finetune': '#3b82f6',
 }
 
 const TYPE_LABEL: Record<string, string> = {
   classification: 'Classification',
   detection:      'Detection',
   segmentation:   'Segmentation',
+  'llm-text':     'LLM',
+  'vlm-finetune': 'VLM',
 }
 
 // ─── Confidence bar colours ───────────────────────────────────────────────────
@@ -158,6 +172,8 @@ function drawSegmentation(canvas: HTMLCanvasElement, img: HTMLImageElement, mask
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Playground() {
+  const [playMode, setPlayMode] = useState<'image' | 'text' | 'vl'>('image')
+
   const [models, setModels] = useState<Model[]>([])
   const [modelsLoading, setModelsLoading] = useState(true)
   const [selectedModel, setSelectedModel] = useState<Model | null>(null)
@@ -172,6 +188,16 @@ export default function Playground() {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<InferenceResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  // Text / VL inference state
+  const [systemPrompt, setSystemPrompt] = useState('You are a helpful medical AI assistant.')
+  const [userPrompt, setUserPrompt] = useState('')
+  const [textResult, setTextResult] = useState<TextResult | null>(null)
+  const [textError, setTextError] = useState<string | null>(null)
+  const [vlImageFile, setVlImageFile] = useState<File | null>(null)
+  const [vlImageUrl, setVlImageUrl] = useState<string | null>(null)
+  const [vlIsDragging, setVlIsDragging] = useState(false)
+  const vlFileInputRef = useRef<HTMLInputElement>(null)
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const imgRef    = useRef<HTMLImageElement>(null)
@@ -196,6 +222,47 @@ export default function Playground() {
       .catch(() => {})
       .finally(() => setModelsLoading(false))
   }, [])
+
+  const isLlmModel = (m: Model) => m.training_type === 'llm-text'
+  const isVlmModel = (m: Model) => m.training_type === 'vlm-finetune'
+  const isImageModel = (m: Model) => !isLlmModel(m) && !isVlmModel(m)
+
+  const visibleModels = playMode === 'text'
+    ? models.filter(isLlmModel)
+    : playMode === 'vl'
+    ? models.filter(isVlmModel)
+    : models.filter(isImageModel)
+
+  const runTextInference = async () => {
+    if (!selectedModel || !userPrompt.trim()) return
+    setRunning(true)
+    setTextResult(null)
+    setTextError(null)
+    try {
+      const form = new FormData()
+      form.append('model_id', selectedModel.id)
+      form.append('prompt', userPrompt)
+      form.append('system_prompt', systemPrompt)
+      if (playMode === 'vl' && vlImageFile) form.append('image', vlImageFile)
+      const res = await fetch('/api/inference', { method: 'POST', body: form })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        throw new Error(err.detail ?? res.statusText)
+      }
+      const data = await res.json()
+      setTextResult({ ...data, type: 'text' })
+    } catch (e: any) {
+      setTextError(e.message ?? 'Inference failed')
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const handleVlFile = (file: File) => {
+    if (!file.type.startsWith('image/')) return
+    setVlImageFile(file)
+    setVlImageUrl(URL.createObjectURL(file))
+  }
 
   // Redraw canvas when result or threshold changes
   useEffect(() => {
@@ -260,7 +327,7 @@ export default function Playground() {
   return (
     <div style={{ maxWidth: 1200, margin: '0 auto' }}>
       {/* Header */}
-      <div style={{ marginBottom: 28 }}>
+      <div style={{ marginBottom: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
           <div style={{
             width: 40, height: 40, borderRadius: 10,
@@ -274,8 +341,24 @@ export default function Playground() {
           </h1>
         </div>
         <p style={{ color: 'var(--text-muted)', fontSize: 14, margin: 0 }}>
-          Test inference on your trained models · upload an image and run predictions
+          Test inference on your trained models
         </p>
+      </div>
+
+      {/* Mode tabs */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20, background: 'var(--bg-surface)', borderRadius: 10, padding: 4, border: '1px solid var(--border-default)', width: 'fit-content' }}>
+        {([['image','Image','#6366f1'] , ['text','Text (LLM)','#8b5cf6'], ['vl','Vision-Language','#3b82f6']] as const).map(([mode, label, color]) => (
+          <button key={mode} onClick={() => { setPlayMode(mode); setSelectedModel(null); setResult(null); setTextResult(null) }}
+            style={{
+              padding: '7px 18px', borderRadius: 7, border: 'none', cursor: 'pointer',
+              fontSize: 13, fontWeight: 600, transition: 'all 0.15s',
+              background: playMode === mode ? color : 'transparent',
+              color: playMode === mode ? '#fff' : 'var(--text-muted)',
+            }}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {/* Config bar */}
@@ -290,7 +373,7 @@ export default function Playground() {
         alignItems: 'center',
         flexWrap: 'wrap',
       }}>
-        {/* Model selector */}
+        {/* Model selector (filtered by mode) */}
         <div style={{ flex: '1 1 300px', minWidth: 220 }}>
           <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 6 }}>
             Model
@@ -333,7 +416,7 @@ export default function Playground() {
               <ChevronDown size={14} style={{ color: 'var(--text-muted)', flexShrink: 0, marginLeft: 'auto' }} />
             </button>
 
-            {modelOpen && models.length > 0 && (
+            {modelOpen && visibleModels.length > 0 && (
               <div style={{
                 position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0,
                 background: 'var(--bg-elevated)',
@@ -342,7 +425,7 @@ export default function Playground() {
                 boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                 maxHeight: 260, overflowY: 'auto',
               }}>
-                {models.map(m => (
+                {visibleModels.map(m => (
                   <button
                     key={m.id}
                     onClick={() => { setSelectedModel(m); setModelOpen(false); setResult(null) }}
@@ -374,8 +457,8 @@ export default function Playground() {
           </div>
         </div>
 
-        {/* Confidence threshold */}
-        <div style={{ flex: '0 1 260px' }}>
+        {/* Confidence threshold — image only */}
+        {playMode === 'image' && <div style={{ flex: '0 1 260px' }}>
           <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
             <span>Confidence Threshold</span>
             <span style={{ color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums' }}>{(threshold * 100).toFixed(0)}%</span>
@@ -385,42 +468,150 @@ export default function Playground() {
             onChange={e => setThreshold(parseFloat(e.target.value))}
             style={{ width: '100%', accentColor: '#6366f1' }}
           />
-        </div>
+        </div>}
 
         {/* Run button */}
         <div style={{ marginLeft: 'auto', flexShrink: 0 }}>
           <button
             className="btn"
-            onClick={runInference}
-            disabled={!canRun}
+            onClick={playMode === 'image' ? runInference : runTextInference}
+            disabled={playMode === 'image' ? !canRun : (!selectedModel || !userPrompt.trim() || running)}
             style={{
-              background: canRun
+              background: (playMode === 'image' ? canRun : (!selectedModel || !userPrompt.trim() || running) === false)
                 ? 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)'
                 : 'var(--bg-elevated)',
-              color: canRun ? '#fff' : 'var(--text-muted)',
+              color: (playMode === 'image' ? canRun : (!selectedModel || !userPrompt.trim() || running) === false) ? '#fff' : 'var(--text-muted)',
               border: 'none',
               padding: '10px 22px',
               borderRadius: 8,
               fontWeight: 700,
               fontSize: 14,
-              cursor: canRun ? 'pointer' : 'not-allowed',
+              cursor: (playMode === 'image' ? canRun : (!selectedModel || !userPrompt.trim() || running) === false) ? 'pointer' : 'not-allowed',
               display: 'flex',
               alignItems: 'center',
               gap: 8,
               transition: 'opacity 0.15s',
-              opacity: canRun ? 1 : 0.55,
+              opacity: (playMode === 'image' ? canRun : (!selectedModel || !userPrompt.trim() || running) === false) ? 1 : 0.55,
             }}
           >
             {running
               ? <><Loader2 size={16} className="animate-spin" />Running…</>
-              : <><Play size={15} fill="currentColor" />Run Inference</>
+              : playMode === 'image'
+              ? <><Play size={15} fill="currentColor" />Run Inference</>
+              : <><Send size={15} />Generate</>
             }
           </button>
         </div>
       </div>
 
-      {/* Main 2-col */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'start' }}>
+      {/* ── Text (LLM) mode ── */}
+      {(playMode === 'text' || playMode === 'vl') && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+          {/* Left: Inputs */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {/* VL image upload */}
+            {playMode === 'vl' && (
+              <div>
+                <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 6 }}>Image</label>
+                <div
+                  onDragOver={e => { e.preventDefault(); setVlIsDragging(true) }}
+                  onDragLeave={() => setVlIsDragging(false)}
+                  onDrop={e => { e.preventDefault(); setVlIsDragging(false); const f = e.dataTransfer.files[0]; if (f) handleVlFile(f) }}
+                  onClick={() => vlFileInputRef.current?.click()}
+                  style={{
+                    border: `2px dashed ${vlIsDragging ? '#3b82f6' : vlImageFile ? 'var(--border-default)' : 'var(--border-subtle)'}`,
+                    borderRadius: 10, background: vlIsDragging ? 'rgba(59,130,246,0.06)' : 'var(--bg-surface)',
+                    padding: vlImageFile ? 0 : '24px 0', textAlign: 'center', cursor: 'pointer', overflow: 'hidden',
+                  }}
+                >
+                  <input ref={vlFileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={e => { if (e.target.files?.[0]) handleVlFile(e.target.files[0]) }} />
+                  {vlImageFile ? (
+                    <div style={{ position: 'relative' }}>
+                      <img src={vlImageUrl!} alt="vl" style={{ width: '100%', maxHeight: 200, objectFit: 'contain', display: 'block', background: '#000' }} />
+                      <button onClick={e => { e.stopPropagation(); setVlImageFile(null); setVlImageUrl(null) }}
+                        style={{ position: 'absolute', top: 6, right: 6, background: 'rgba(0,0,0,0.6)', border: 'none', color: '#fff', borderRadius: 6, cursor: 'pointer', padding: '2px 6px' }}>
+                        <X size={12} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>
+                      <Eye size={22} style={{ margin: '0 auto 6px', display: 'block', opacity: 0.4 }} />
+                      Drop image or click to upload
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            {/* System prompt */}
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 6 }}>System Prompt</label>
+              <textarea
+                value={systemPrompt}
+                onChange={e => setSystemPrompt(e.target.value)}
+                rows={3}
+                style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px', borderRadius: 8, border: '1px solid var(--border-default)', background: 'var(--bg-elevated)', color: 'var(--text-primary)', fontSize: 13, resize: 'vertical', fontFamily: 'inherit' }}
+                placeholder="System instructions…"
+              />
+            </div>
+            {/* User prompt */}
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 6 }}>User Prompt</label>
+              <textarea
+                value={userPrompt}
+                onChange={e => setUserPrompt(e.target.value)}
+                rows={5}
+                style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px', borderRadius: 8, border: '1px solid var(--border-default)', background: 'var(--bg-elevated)', color: 'var(--text-primary)', fontSize: 13, resize: 'vertical', fontFamily: 'inherit' }}
+                placeholder={playMode === 'vl' ? 'Describe what you see in this image…' : 'Ask a medical question…'}
+              />
+            </div>
+          </div>
+
+          {/* Right: Response */}
+          <div>
+            {!textResult && !textError && (
+              <div style={{ border: '1px solid var(--border-subtle)', borderRadius: 12, background: 'var(--bg-surface)', minHeight: 280, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 40, color: 'var(--text-muted)', textAlign: 'center' }}>
+                <MessageSquare size={36} style={{ opacity: 0.2, marginBottom: 14 }} />
+                <p style={{ fontSize: 14, fontWeight: 600, margin: '0 0 6px', color: 'var(--text-secondary)' }}>No response yet</p>
+                <p style={{ fontSize: 12, margin: 0 }}>Enter a prompt and click Generate</p>
+              </div>
+            )}
+            {textError && (
+              <div style={{ border: '1px solid #ef444440', borderRadius: 12, background: '#ef444408', padding: 24, display: 'flex', gap: 12 }}>
+                <AlertCircle size={18} color="#ef4444" style={{ flexShrink: 0 }} />
+                <div>
+                  <p style={{ margin: '0 0 4px', fontWeight: 600, fontSize: 14, color: '#ef4444' }}>Generation failed</p>
+                  <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)' }}>{textError}</p>
+                </div>
+              </div>
+            )}
+            {textResult && (
+              <div style={{ border: '1px solid var(--border-default)', borderRadius: 12, background: 'var(--bg-surface)', overflow: 'hidden' }}>
+                <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-elevated)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <CheckCircle2 size={16} color="#10b981" />
+                    <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--text-primary)' }}>Response</span>
+                  </div>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{textResult.tokens_generated} tokens · {textResult.tokens_per_second.toFixed(0)} tok/s · {textResult.inference_time_ms} ms</span>
+                </div>
+                <div style={{ padding: '16px 18px', fontSize: 14, color: 'var(--text-primary)', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
+                  {textResult.response}
+                </div>
+                <div style={{ padding: '10px 18px', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-elevated)', display: 'flex', gap: 20 }}>
+                  {[['Model', textResult.model_name], ['Tokens', String(textResult.tokens_generated)], ['Speed', `${textResult.tokens_per_second.toFixed(0)} tok/s`], ['Latency', `${textResult.inference_time_ms} ms`]].map(([k, v]) => (
+                    <div key={k}>
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>{k}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 500 }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Image mode ── */}
+      {playMode === 'image' && <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'start' }}>
 
         {/* Left: Upload */}
         <div>
@@ -815,7 +1006,7 @@ export default function Playground() {
             </div>
           )}
         </div>
-      </div>
+      </div>}
     </div>
   )
 }

@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCcw } from 'lucide-react'
+import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
-type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'export-edge' | 'self-supervised'
+type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'export-edge' | 'self-supervised' | 'llm-text'
 type DataType    = 'cxr' | 'fundus' | 'ct' | 'pathology' | 'ultrasound' | 'general'
 type TargetType  = 'prelabel' | 'finetune' | 'export'
 
@@ -30,6 +30,13 @@ interface TrainingConfig {
   engine: string
   model: string
   notes: string
+  // LLM/VLM-specific
+  loraRank: number
+  quantization: string
+  maxSeqLen: number
+  chatTemplate: string
+  gradAccum: number
+  textDatasetId: string
 }
 
 // ─── Training Matrix ───────────────────────────────────────────────────────────
@@ -71,6 +78,18 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: '3d-unet',    label: '3D UNet (ResNet50)',   engine: 'MONAI',      model: 'unet_resnet50_3d',      hardware: 'GPU 16GB+',   description: 'Volumetric segmentation สำหรับ CT/MRI 3D volumes',             compatible: false },
     { value: 'swin-unet',  label: 'Swin-UNet (TransUNet)', engine: 'MONAI',     model: 'swin_unet',             hardware: 'GPU 12GB+',   description: 'Transformer-based segmentation — ดีสำหรับ histology',           compatible: false },
     { value: 'nnunet',     label: 'nnU-Net (3D Full)',     engine: 'MONAI',      model: 'nnunet',                hardware: 'GPU 20GB+',   description: 'State-of-the-art 3D medical image segmentation — self-configures', compatible: false },
+  ],
+
+  // ── LLM Text Fine-tuning ─────────────────────────────────────────────────────
+  'llm-text': [
+    { value: 'llama31-8b',   label: 'LLaMA-3.1-8B',          engine: 'Unsloth', model: 'unsloth/llama-3.1-8b-bnb-4bit',         hardware: 'GPU 16GB+',  description: 'Meta LLaMA 3.1 8B — state-of-the-art open LLM, QLoRA fine-tune สำหรับ medical text', compatible: false },
+    { value: 'llama32-3b',   label: 'LLaMA-3.2-3B-Instruct',  engine: 'Unsloth', model: 'unsloth/Llama-3.2-3B-Instruct-bnb-4bit', hardware: 'GPU 8GB+',   description: 'Compact LLaMA 3.2 3B — เร็ว, ดีสำหรับ domain-specific clinical Q&A',              compatible: true  },
+    { value: 'mistral-7b',   label: 'Mistral-7B-Instruct',    engine: 'Unsloth', model: 'unsloth/mistral-7b-instruct-v0.3-bnb-4bit', hardware: 'GPU 14GB+', description: 'Mistral 7B — strong instruction following, ดีสำหรับ structured medical output',  compatible: false },
+    { value: 'qwen25-7b',    label: 'Qwen2.5-7B-Instruct',   engine: 'Unsloth', model: 'unsloth/Qwen2.5-7B-Instruct-bnb-4bit',  hardware: 'GPU 14GB+',  description: 'Alibaba Qwen2.5 7B — excellent multilingual, ดีสำหรับ Thai medical text',        compatible: false },
+    { value: 'phi35-mini',   label: 'Phi-3.5-Mini-Instruct',  engine: 'Unsloth', model: 'unsloth/Phi-3.5-mini-instruct-bnb-4bit', hardware: 'GPU 6GB+',   description: 'Microsoft Phi-3.5 3.8B — lightweight แต่แรง, เหมาะ edge inference',             compatible: true  },
+    { value: 'gemma2-2b',    label: 'Gemma-2-2B-Instruct',   engine: 'Unsloth', model: 'unsloth/gemma-2-2b-it-bnb-4bit',        hardware: 'GPU 6GB+',   description: 'Google Gemma 2 2B — ขนาดเล็กมาก รันได้บน GPU 6GB, ดีสำหรับ summarization',    compatible: true  },
+    { value: 'deepseek-r1',  label: 'DeepSeek-R1-8B',         engine: 'Unsloth', model: 'unsloth/DeepSeek-R1-0528-Qwen3-8B-bnb-4bit', hardware: 'GPU 20GB+', description: 'DeepSeek R1 reasoning model — ดีสำหรับ clinical reasoning, chain-of-thought',  compatible: false },
+    { value: 'qwen3-14b',    label: 'Qwen3-14B',              engine: 'Unsloth', model: 'unsloth/Qwen3-14B-bnb-4bit',           hardware: 'GPU 24GB+',  description: 'Qwen3 14B — top-tier reasoning, ดีสำหรับ medical report generation',             compatible: false },
   ],
 
   // ── VLM Fine-tuning ───────────────────────────────────────────────────────────
@@ -138,6 +157,12 @@ export default function TrainModel() {
     engine: '',
     model: '',
     notes: '',
+    loraRank: 16,
+    quantization: '4bit',
+    maxSeqLen: 2048,
+    chatTemplate: 'alpaca',
+    gradAccum: 4,
+    textDatasetId: '',
   })
   const [toast, setToast] = useState<{msg: string; type: 'success' | 'error'} | null>(null)
   const [launching, setLaunching] = useState(false)
@@ -171,6 +196,18 @@ export default function TrainModel() {
 
   // Fetch projects for dataset dropdown
   const [projects, setProjects] = useState<Array<{id: number; name: string}>>([])
+  const [textDatasets, setTextDatasets] = useState<Array<{id: string; name: string; format: string; row_count: number; size_bytes: number}>>([])
+
+  const isLlmType = (t: TrainingType) => t === 'llm-text' || t === 'vlm-finetune'
+
+  // Fetch text datasets when in LLM/VLM mode
+  useEffect(() => {
+    if (!isLlmType(config.trainingType)) return
+    fetch('/api/text-datasets')
+      .then(r => r.json())
+      .then(d => setTextDatasets(d.datasets ?? []))
+      .catch(() => {})
+  }, [config.trainingType])
 
   // Query Ray cluster for actual GPU memory
   useEffect(() => {
@@ -232,15 +269,22 @@ export default function TrainModel() {
       showToast('กรุณาเลือก model ก่อน', 'error')
       return
     }
-    if (!config.datasetId) {
+    const llm = isLlmType(config.trainingType)
+    if (!llm && !config.datasetId) {
       showToast('กรุณาเลือก dataset', 'error')
+      return
+    }
+    if (llm && !config.textDatasetId) {
+      showToast('กรุณาเลือก text dataset', 'error')
       return
     }
     setLaunching(true)
     showToast('🚀 Launching training job...', 'success')
 
+    const projectId = llm ? 0 : config.datasetId
+
     try {
-      const res = await fetch(`/api/train/${config.datasetId}`, {
+      const res = await fetch(`/api/train/${projectId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -254,6 +298,13 @@ export default function TrainModel() {
           learning_rate: config.learningRate,
           optimizer:     config.optimizer,
           notes:         config.notes,
+          // LLM fields
+          lora_rank:     config.loraRank,
+          quantization:  config.quantization,
+          max_seq_len:   config.maxSeqLen,
+          chat_template: config.chatTemplate,
+          grad_accum:    config.gradAccum,
+          text_dataset:  config.textDatasetId,
         }),
       })
 
@@ -464,6 +515,30 @@ export default function TrainModel() {
                 <ChevronDown size={12} />
               </div>
             </button>
+
+            {/* LLM Text Fine-tuning */}
+            <button
+              onClick={() => { set('trainingType', 'llm-text'); nextStep() }}
+              className="card text-left"
+              style={config.trainingType === 'llm-text' ? { borderColor: '#8b5cf6', background: 'rgba(139,92,246,0.08)' } : {}}
+            >
+              <div className="flex items-center gap-3 mb-3">
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(139,92,246,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <MessageSquare size={18} style={{ color: '#8b5cf6' }} />
+                </div>
+                <div>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>LLM Fine-tune</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Text · Unsloth + QLoRA</p>
+                </div>
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                Fine-tune LLaMA-3.1, Mistral, Qwen2.5, Phi-3.5 สำหรับ clinical NLP, Thai medical chatbot, report generation
+              </p>
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>QLoRA 4-bit</span>
+                <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>Unsloth 2x faster</span>
+              </div>
+            </button>
           </div>
         </div>
       )}
@@ -511,20 +586,45 @@ export default function TrainModel() {
               </p>
             </div>
 
-            {/* Dataset */}
-            <div className="card md:col-span-2">
-              <label>Dataset (เลือก project ที่จะใช้ train)</label>
-              <select
-                value={config.datasetId ?? ''}
-                onChange={e => set('datasetId', e.target.value ? Number(e.target.value) : null)}
-                className="mt-1"
-              >
-                <option value="">-- เลือก project --</option>
-                {projects.map(p => (
-                  <option key={p.id} value={p.id}>{p.name} (id={p.id})</option>
-                ))}
-              </select>
-            </div>
+            {/* Dataset — image types use LS projects; LLM/VLM use text datasets */}
+            {isLlmType(config.trainingType) ? (
+              <div className="card md:col-span-2">
+                <label>Text Dataset (.jsonl)</label>
+                {textDatasets.length === 0 ? (
+                  <div style={{ marginTop: 8, padding: '16px', borderRadius: 8, background: 'var(--bg-elevated)', textAlign: 'center' }}>
+                    <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 8 }}>ยังไม่มี text dataset — ไปที่ Datasets เพื่ออัปโหลด .jsonl</p>
+                    <a href="/datasets" className="btn btn-secondary btn-sm">ไปที่ Datasets →</a>
+                  </div>
+                ) : (
+                  <select
+                    value={config.textDatasetId}
+                    onChange={e => set('textDatasetId', e.target.value)}
+                    className="mt-1"
+                  >
+                    <option value="">-- เลือก text dataset --</option>
+                    {textDatasets.map(d => (
+                      <option key={d.id} value={d.id}>
+                        {d.name} ({d.row_count.toLocaleString()} rows · {d.format})
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            ) : (
+              <div className="card md:col-span-2">
+                <label>Dataset (เลือก project ที่จะใช้ train)</label>
+                <select
+                  value={config.datasetId ?? ''}
+                  onChange={e => set('datasetId', e.target.value ? Number(e.target.value) : null)}
+                  className="mt-1"
+                >
+                  <option value="">-- เลือก project --</option>
+                  {projects.map(p => (
+                    <option key={p.id} value={p.id}>{p.name} (id={p.id})</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="flex justify-between mt-6">
@@ -661,49 +761,128 @@ export default function TrainModel() {
           </div>
 
           {/* Hyperparameters */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-            <div className="card">
-              <label>Epochs</label>
-              <input
-                type="number"
-                min="1"
-                max="500"
-                value={config.epochs}
-                onChange={e => set('epochs', Number(e.target.value))}
-              />
+          {isLlmType(config.trainingType) ? (
+            /* ── LLM / VLM Config ── */
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+              {/* VRAM estimate */}
+              <div className="card md:col-span-2" style={{ background: 'rgba(139,92,246,0.06)', borderColor: 'rgba(139,92,246,0.3)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: '#8b5cf6' }}>Estimated VRAM</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--text-primary)' }}>
+                    {config.quantization === '4bit' ? '≈ 4–10 GB' : config.quantization === '8bit' ? '≈ 8–16 GB' : '≈ 14–32 GB'}
+                  </span>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    ({config.quantization === '4bit' ? 'QLoRA 4-bit' : config.quantization === '8bit' ? 'QLoRA 8-bit' : 'Full fine-tune'})
+                  </span>
+                  <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-muted)' }}>
+                    Unsloth 2× faster training + gradient checkpointing
+                  </span>
+                </div>
+              </div>
+
+              <div className="card">
+                <label>LoRA Rank (r)</label>
+                <select value={config.loraRank} onChange={e => set('loraRank', Number(e.target.value))}>
+                  <option value={8}>8 — ประหยัด VRAM สุด</option>
+                  <option value={16}>16 — แนะนำ (balance)</option>
+                  <option value={32}>32 — คุณภาพสูงขึ้น</option>
+                  <option value={64}>64 — เกือบเทียบเท่า full fine-tune</option>
+                </select>
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>alpha = {config.loraRank * 2} (2×rank)</p>
+              </div>
+              <div className="card">
+                <label>Quantization</label>
+                <select value={config.quantization} onChange={e => set('quantization', e.target.value)}>
+                  <option value="4bit">4-bit QLoRA (แนะนำ — ประหยัด VRAM สุด)</option>
+                  <option value="8bit">8-bit QLoRA (คุณภาพดีกว่า 4-bit)</option>
+                  <option value="full">Full Precision (ต้องการ VRAM มาก)</option>
+                </select>
+              </div>
+              <div className="card">
+                <label>Max Sequence Length</label>
+                <select value={config.maxSeqLen} onChange={e => set('maxSeqLen', Number(e.target.value))}>
+                  <option value={512}>512 tokens (เร็ว, ประหยัด)</option>
+                  <option value={1024}>1,024 tokens</option>
+                  <option value={2048}>2,048 tokens (แนะนำ)</option>
+                  <option value={4096}>4,096 tokens (ต้องการ VRAM เพิ่ม)</option>
+                </select>
+              </div>
+              <div className="card">
+                <label>Chat Template</label>
+                <select value={config.chatTemplate} onChange={e => set('chatTemplate', e.target.value)}>
+                  <option value="alpaca">Alpaca (instruction/response)</option>
+                  <option value="chatml">ChatML (system/user/assistant)</option>
+                  <option value="llama3">LLaMA-3 (เหมาะกับ LLaMA-3.x)</option>
+                  <option value="gemma">Gemma (เหมาะกับ Gemma-2)</option>
+                </select>
+              </div>
+              <div className="card">
+                <label>Epochs</label>
+                <input type="number" min="1" max="10" value={config.epochs} onChange={e => set('epochs', Number(e.target.value))} />
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>LLM: 1–3 epochs มักเพียงพอ</p>
+              </div>
+              <div className="card">
+                <label>Gradient Accumulation Steps</label>
+                <select value={config.gradAccum} onChange={e => set('gradAccum', Number(e.target.value))}>
+                  <option value={2}>2 steps</option>
+                  <option value={4}>4 steps (แนะนำ)</option>
+                  <option value={8}>8 steps (effective batch ใหญ่ขึ้น)</option>
+                  <option value={16}>16 steps</option>
+                </select>
+              </div>
+              <div className="card">
+                <label>Learning Rate</label>
+                <input type="text" placeholder="e.g. 2e-4" value={config.learningRate}
+                  onChange={e => set('learningRate', Number(e.target.value))} />
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>LLM: 2e-4 ถึง 5e-5 แนะนำ</p>
+              </div>
             </div>
-            <div className="card">
-              <label>Batch Size</label>
-              <input
-                type="number"
-                min="1"
-                max="256"
-                value={config.batchSize}
-                onChange={e => set('batchSize', Number(e.target.value))}
-              />
+          ) : (
+            /* ── Image / Vision Config ── */
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+              <div className="card">
+                <label>Epochs</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="500"
+                  value={config.epochs}
+                  onChange={e => set('epochs', Number(e.target.value))}
+                />
+              </div>
+              <div className="card">
+                <label>Batch Size</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="256"
+                  value={config.batchSize}
+                  onChange={e => set('batchSize', Number(e.target.value))}
+                />
+              </div>
+              <div className="card">
+                <label>Learning Rate</label>
+                <input
+                  type="text"
+                  placeholder="e.g. 0.001"
+                  value={config.learningRate}
+                  onChange={e => set('learningRate', Number(e.target.value))}
+                />
+              </div>
+              <div className="card">
+                <label>Optimizer</label>
+                <select
+                  value={config.optimizer}
+                  onChange={e => set('optimizer', e.target.value)}
+                >
+                  <option value="adamw">AdamW (แนะนำ)</option>
+                  <option value="adam">Adam</option>
+                  <option value="sgd">SGD with momentum</option>
+                  <option value="lion">Lion (modern, lightweight)</option>
+                </select>
+              </div>
             </div>
-            <div className="card">
-              <label>Learning Rate</label>
-              <input
-                type="text"
-                placeholder="e.g. 0.001"
-                value={config.learningRate}
-                onChange={e => set('learningRate', Number(e.target.value))}
-              />
-            </div>
-            <div className="card">
-              <label>Optimizer</label>
-              <select
-                value={config.optimizer}
-                onChange={e => set('optimizer', e.target.value)}
-              >
-                <option value="adamw">AdamW (แนะนำ)</option>
-                <option value="adam">Adam</option>
-                <option value="sgd">SGD with momentum</option>
-                <option value="lion">Lion (modern, lightweight)</option>
-              </select>
-            </div>
-          </div>
+          )}
 
           {/* Notes */}
           <div className="card mb-6">

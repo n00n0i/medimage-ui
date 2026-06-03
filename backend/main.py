@@ -70,6 +70,12 @@ def init_db():
             ("hidden_in_models", "INTEGER DEFAULT 0"),
             ("source",           "TEXT DEFAULT 'trained'"),
             ("source_url",       "TEXT DEFAULT ''"),
+            ("lora_rank",        "INTEGER DEFAULT 16"),
+            ("quantization",     "TEXT DEFAULT '4bit'"),
+            ("max_seq_len",      "INTEGER DEFAULT 2048"),
+            ("chat_template",    "TEXT DEFAULT 'alpaca'"),
+            ("grad_accum",       "INTEGER DEFAULT 4"),
+            ("text_dataset",     "TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {defval}")
@@ -79,6 +85,17 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS text_datasets (
+                id         TEXT PRIMARY KEY,
+                name       TEXT,
+                format     TEXT DEFAULT 'alpaca',
+                path       TEXT,
+                row_count  INTEGER DEFAULT 0,
+                size_bytes INTEGER DEFAULT 0,
+                created_at REAL
             )
         """)
         conn.commit()
@@ -110,6 +127,13 @@ class TrainRequest(BaseModel):
     optimizer: str = "adamw"
     imgsz: int = 640
     notes: str = ""
+    # LLM-specific fields
+    lora_rank: int = 16
+    quantization: str = "4bit"      # 4bit | 8bit | full
+    max_seq_len: int = 2048
+    chat_template: str = "alpaca"   # alpaca | chatml | llama3 | gemma
+    grad_accum: int = 4
+    text_dataset: str = ""          # text_dataset id or name
 
 
 # ─── Training runner ─────────────────────────────────────────────────────────
@@ -231,38 +255,171 @@ def run_training(job: dict):
         _set_status(job_id, "error", str(exc))
 
 
+def run_llm_training(job: dict):
+    """Simulate Unsloth/TRL LLM or VLM fine-tuning."""
+    job_id     = job["id"]
+    epochs     = max(1, job["epochs"])
+    model      = job["model_name"]
+    engine     = job["engine"]
+    lora_rank  = job.get("lora_rank", 16)
+    quant      = job.get("quantization", "4bit")
+    max_seq    = job.get("max_seq_len", 2048)
+    tmpl       = job.get("chat_template", "alpaca")
+    grad_accum = job.get("grad_accum", 4)
+    t_type     = job.get("training_type", "llm-text")
+    text_ds    = job.get("text_dataset", "custom dataset")
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='running', started_at=? WHERE id=?",
+                (time.time(), job_id),
+            )
+            conn.commit()
+
+        is_vlm = (t_type == "vlm-finetune")
+        _append_log(job_id, f"=== MedImage {'VLM' if is_vlm else 'LLM'} Fine-tuning ===")
+        _append_log(job_id, f"Model      : {model}")
+        _append_log(job_id, f"Engine     : {engine}")
+        _append_log(job_id, f"Quantize   : {quant} {'(QLoRA)' if quant != 'full' else '(full fine-tune)'}")
+        _append_log(job_id, f"LoRA rank  : r={lora_rank}  alpha={lora_rank*2}")
+        _append_log(job_id, f"Max seq len: {max_seq}")
+        _append_log(job_id, f"Chat tmpl  : {tmpl}")
+        _append_log(job_id, f"Grad accum : {grad_accum}")
+        _append_log(job_id, f"Epochs     : {epochs}")
+        _append_log(job_id, f"Dataset    : {text_ds}")
+        _append_log(job_id, "")
+
+        # Phase 1: Load model + tokenizer
+        _set_progress(job_id, 5)
+        _append_log(job_id, f"[1/6] Loading {model} with Unsloth FastLanguageModel ...")
+        time.sleep(random.uniform(2.0, 4.0))
+        if is_vlm:
+            _append_log(job_id, f"  ✓ Vision encoder loaded (patch_size=14, num_patches=729)")
+        _append_log(job_id, f"  ✓ Base model loaded in {quant} mode ({random.randint(3, 8)} GB VRAM)")
+        _append_log(job_id, f"  ✓ Tokenizer loaded (vocab_size={random.randint(32000, 128000)})")
+        _append_log(job_id, "")
+
+        # Phase 2: Apply LoRA
+        _set_progress(job_id, 12)
+        _append_log(job_id, f"[2/6] Applying LoRA adapters (PEFT) ...")
+        time.sleep(random.uniform(0.5, 1.5))
+        trainable = round(random.uniform(0.8, 2.5), 2)
+        total = round(random.uniform(7.0, 14.0), 1)
+        _append_log(job_id, f"  trainable params: {trainable}M / {total}B ({trainable/total*100:.2f}%) -- LoRA r={lora_rank}")
+        _append_log(job_id, f"  target modules  : q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj")
+        _append_log(job_id, "")
+
+        # Phase 3: Prepare dataset
+        _set_progress(job_id, 20)
+        _append_log(job_id, f"[3/6] Preparing dataset ({tmpl} format) ...")
+        time.sleep(random.uniform(1.0, 2.5))
+        n_train = random.randint(800, 5000)
+        n_val   = int(n_train * 0.1)
+        _append_log(job_id, f"  ✓ Loaded {n_train + n_val} samples from {text_ds}")
+        _append_log(job_id, f"  ✓ Train: {n_train}  |  Val: {n_val}")
+        _append_log(job_id, f"  ✓ Avg token length: {random.randint(128, 512)} tokens")
+        _append_log(job_id, f"  ✓ Tokenized & packed to max_seq_len={max_seq}")
+        _append_log(job_id, "")
+
+        # Phase 4: Training steps
+        _set_progress(job_id, 25)
+        _append_log(job_id, f"[4/6] Training (SFTTrainer with DeepSpeed Zero-2 offload) ...")
+        _append_log(job_id, "")
+
+        steps_per_epoch = max(10, n_train // (job.get("batch_size", 2) * grad_accum))
+        total_steps = steps_per_epoch * epochs
+        loss = 2.4 + random.uniform(-0.2, 0.2)
+        lr   = job.get("learning_rate", 2e-4)
+        step_delay = max(0.3, min(2.0, 60.0 / total_steps))
+
+        for step in range(1, total_steps + 1):
+            time.sleep(step_delay)
+            loss  = loss  * random.uniform(0.96, 0.999) + random.uniform(-0.01, 0.01)
+            loss  = max(0.05, loss)
+            pct   = int(25 + (step / total_steps) * 65)
+            _set_progress(job_id, pct)
+
+            if step == 1 or step % max(1, total_steps // 20) == 0 or step == total_steps:
+                cur_epoch = int((step - 1) / steps_per_epoch) + 1
+                tps       = random.randint(180, 420)
+                perp      = round(math.exp(loss), 3)
+                _append_log(
+                    job_id,
+                    f"Step [{step:>4}/{total_steps}] epoch={cur_epoch}/{epochs}  "
+                    f"loss={loss:.4f}  perplexity={perp:.3f}  "
+                    f"lr={lr:.2e}  tokens/s={tps}"
+                )
+
+        _append_log(job_id, "")
+
+        # Phase 5: Eval
+        _set_progress(job_id, 92)
+        _append_log(job_id, f"[5/6] Running evaluation on validation set ...")
+        time.sleep(random.uniform(1.0, 2.0))
+        eval_loss = loss * random.uniform(1.02, 1.08)
+        _append_log(job_id, f"  eval_loss={eval_loss:.4f}  eval_perplexity={math.exp(eval_loss):.3f}")
+        _append_log(job_id, "")
+
+        # Phase 6: Save adapter
+        _set_progress(job_id, 97)
+        _append_log(job_id, f"[6/6] Saving LoRA adapter ...")
+        time.sleep(random.uniform(0.5, 1.5))
+        _append_log(job_id, f"  ✓ Adapter saved to /data/models/{job_id}/lora_adapter/")
+        _append_log(job_id, f"  ✓ Tokenizer saved")
+        _append_log(job_id, "")
+        _append_log(job_id, "Fine-tuning complete ✓")
+        _append_log(job_id, f"  Base model : {model}")
+        _append_log(job_id, f"  Adapter    : LoRA r={lora_rank} ({quant})")
+        _append_log(job_id, f"  Final loss : {loss:.4f}  |  perplexity: {math.exp(loss):.3f}")
+        _set_progress(job_id, 100)
+        _set_status(job_id, "completed")
+
+    except Exception as exc:
+        _append_log(job_id, f"ERROR: {exc}")
+        _set_status(job_id, "error", str(exc))
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 
 @app.post("/api/train/{project_id}")
 def submit_job(project_id: int, req: TrainRequest):
     job_id = str(uuid.uuid4())[:8]
-    name   = f"{req.training_type.upper()} · {req.model_name} · proj-{project_id}"
+    is_llm = req.training_type in ("llm-text", "vlm-finetune")
+    if is_llm:
+        ds_label = req.text_dataset or f"dataset-{project_id}"
+        name = f"{req.training_type.upper()} · {req.model_name} · {ds_label}"
+    else:
+        name = f"{req.training_type.upper()} · {req.model_name} · proj-{project_id}"
+
+    dataset_label = req.text_dataset if (is_llm and req.text_dataset) else f"LS project {project_id}"
 
     with get_db() as conn:
         conn.execute(
             """INSERT INTO jobs
                (id, name, project_id, dataset, training_type, model_name, engine,
                 epochs, batch_size, learning_rate, optimizer, imgsz, notes,
+                lora_rank, quantization, max_seq_len, chat_template, grad_accum, text_dataset,
                 status, progress, log, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?)""",
             (
-                job_id, name, project_id,
-                f"LS project {project_id}",
+                job_id, name, project_id, dataset_label,
                 req.training_type, req.model_name, req.engine,
                 req.epochs, req.batch_size, req.learning_rate,
                 req.optimizer, req.imgsz, req.notes,
+                req.lora_rank, req.quantization, req.max_seq_len,
+                req.chat_template, req.grad_accum, req.text_dataset,
                 time.time(),
             ),
         )
         conn.commit()
 
-    # Fetch row as dict to pass to thread
     with get_db() as conn:
         row = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
-    t = threading.Thread(target=run_training, args=(row,), daemon=True)
-    t.start()
+    target_fn = run_llm_training if is_llm else run_training
+    threading.Thread(target=target_fn, args=(row,), daemon=True).start()
 
     return {"job_id": job_id, "message": f"Training job {job_id} queued for {req.model_name}"}
 
@@ -546,6 +703,102 @@ def modal_status_ep():
     }
 
 
+# ─── Text Datasets ─────────────────────────────────────────────────────────────────
+
+import os as _os
+
+@app.post("/api/text-datasets/upload")
+async def upload_text_dataset(file: UploadFile = File(...)):
+    """Upload a .jsonl (or .json / .txt) text dataset file."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename")
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ("jsonl", "json", "txt", "csv"):
+        raise HTTPException(status_code=400, detail="Unsupported format. Use .jsonl, .json, .txt, or .csv")
+    ds_id = str(uuid.uuid4())[:8]
+    save_dir = "/data/text-datasets"
+    _os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/{ds_id}.{ext}"
+    raw = await file.read()
+    size_bytes = len(raw)
+    with open(save_path, "wb") as f:
+        f.write(raw)
+    # Count rows
+    row_count = 0
+    try:
+        import json as _json
+        if ext == "jsonl":
+            row_count = sum(1 for line in raw.decode("utf-8").splitlines() if line.strip())
+        elif ext == "json":
+            data = _json.loads(raw)
+            row_count = len(data) if isinstance(data, list) else 1
+        else:
+            row_count = sum(1 for line in raw.decode("utf-8").splitlines() if line.strip())
+    except Exception:
+        row_count = 0
+    # Detect format
+    ds_format = "plain"
+    try:
+        if ext == "jsonl":
+            first = _json.loads(raw.decode("utf-8").splitlines()[0])
+            if "conversations" in first or "messages" in first:
+                ds_format = "sharegpt"
+            elif "instruction" in first:
+                ds_format = "alpaca"
+            elif "text" in first or "content" in first:
+                ds_format = "plain"
+    except Exception:
+        pass
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO text_datasets (id, name, format, path, row_count, size_bytes, created_at) VALUES (?,?,?,?,?,?,?)",
+            (ds_id, file.filename, ds_format, save_path, row_count, size_bytes, time.time()),
+        )
+        conn.commit()
+    return {"id": ds_id, "name": file.filename, "format": ds_format, "row_count": row_count, "size_bytes": size_bytes}
+
+
+@app.get("/api/text-datasets")
+def list_text_datasets():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM text_datasets ORDER BY created_at DESC").fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        # Add preview rows if file exists
+        preview = []
+        try:
+            import json as _json
+            with open(d["path"], "r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i >= 3:
+                        break
+                    try:
+                        preview.append(_json.loads(line))
+                    except Exception:
+                        preview.append({"text": line.strip()})
+        except Exception:
+            pass
+        d["preview"] = preview
+        results.append(d)
+    return {"datasets": results}
+
+
+@app.delete("/api/text-datasets/{ds_id}")
+def delete_text_dataset(ds_id: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT path FROM text_datasets WHERE id = ?", (ds_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Not found")
+        try:
+            _os.remove(row["path"])
+        except Exception:
+            pass
+        conn.execute("DELETE FROM text_datasets WHERE id = ?", (ds_id,))
+        conn.commit()
+    return {"ok": True}
+
+
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
@@ -571,9 +824,15 @@ _SEG_LABELS = [
 ]
 
 from fastapi import UploadFile, File, Form as FForm
+from typing import Optional
 
 @app.post("/api/inference")
-async def run_inference(model_id: str = FForm(...), image: UploadFile = File(...)):
+async def run_inference(
+    model_id: str = FForm(...),
+    image: Optional[UploadFile] = File(None),
+    prompt: str = FForm(""),
+    system_prompt: str = FForm(""),
+):
     with get_db() as conn:
         row = conn.execute(
             "SELECT * FROM jobs WHERE id = ? AND status = 'completed'", (model_id,)
@@ -583,7 +842,7 @@ async def run_inference(model_id: str = FForm(...), image: UploadFile = File(...
 
     job = dict(row)
     training_type = job["training_type"]
-    fname = image.filename or "upload"
+    fname = (image.filename if image else None) or prompt[:20] or "upload"
     # seed RNG from filename for reproducible-ish demo results
     rng = random.Random(abs(hash(fname)) % (2**31))
 
@@ -660,6 +919,27 @@ async def run_inference(model_id: str = FForm(...), image: UploadFile = File(...
         return {
             "type": "segmentation",
             "masks": masks,
+            "inference_time_ms": elapsed,
+            "model_name": job["model_name"],
+        }
+
+    elif training_type in ("llm-text", "vlm-finetune"):
+        # Text / VL generation — image is consumed but response is text
+        prompts = [
+            "Based on the imaging findings, this appears consistent with bilateral lower-lobe consolidation suggesting community-acquired pneumonia. Recommend clinical correlation and CBC with differential.",
+            "The scan demonstrates a well-defined hyperdense lesion in the right hepatic lobe measuring approximately 3.2 × 2.8 cm. Differential includes hepatocellular carcinoma vs. metastasis. Recommend MRI with contrast and AFP levels.",
+            "Findings are consistent with moderate left pleural effusion with associated compressive atelectasis. No pneumothorax identified. Clinical correlation advised.",
+            "The retinal fundus image shows neovascularization at the disc (NVD) and multiple flame hemorrhages consistent with proliferative diabetic retinopathy. Urgent ophthalmology referral recommended.",
+            "CT demonstrates a 1.5 cm pulmonary nodule in the right upper lobe with spiculated margins. Per Fleischner Society guidelines, recommend PET-CT and multidisciplinary tumor board review.",
+        ]
+        response = rng.choice(prompts)
+        elapsed = round((time.time() - t_start) * 1000 + rng.uniform(200, 800), 1)
+        tokens = len(response.split())
+        return {
+            "type": training_type,
+            "response": response,
+            "tokens_generated": tokens,
+            "tokens_per_second": round(tokens / (elapsed / 1000), 1),
             "inference_time_ms": elapsed,
             "model_name": job["model_name"],
         }
