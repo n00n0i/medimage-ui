@@ -99,7 +99,7 @@ export default function Jobs() {
   }
 
   const deleteJob = async (jobId: string) => {
-    await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' })
+    await fetch(`/api/jobs/${jobId}?from_view=jobs`, { method: 'DELETE' })
     setSelected(prev => { const s = new Set(prev); s.delete(jobId); return s })
     fetchJobs(true)
   }
@@ -120,7 +120,7 @@ export default function Jobs() {
 
   const deleteSelected = async () => {
     setDeletingBulk(true)
-    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}`, { method: 'DELETE' })))
+    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}?from_view=jobs`, { method: 'DELETE' })))
     setSelected(new Set())
     setDeletingBulk(false)
     fetchJobs(true)

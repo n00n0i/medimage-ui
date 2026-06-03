@@ -87,10 +87,10 @@ export default function Models() {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/jobs')
+      const res = await fetch('/api/jobs?view=models')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      const completed: Model[] = (data.jobs || []).filter((j: Model) => j.status === 'completed')
+      const completed: Model[] = data.jobs || []
       setModels(completed)
     } catch (e: any) {
       setError(e.message)
@@ -161,7 +161,7 @@ export default function Models() {
     if (!deleteId) return
     setDeleting(true)
     try {
-      await fetch(`/api/jobs/${deleteId}`, { method: 'DELETE' })
+      await fetch(`/api/jobs/${deleteId}?from_view=models`, { method: 'DELETE' })
       setDeleteId(null)
       setSelected(prev => { const s = new Set(prev); s.delete(deleteId); return s })
       fetchModels()
@@ -187,7 +187,7 @@ export default function Models() {
 
   const deleteSelected = async () => {
     setDeletingBulk(true)
-    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}`, { method: 'DELETE' })))
+    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}?from_view=models`, { method: 'DELETE' })))
     setSelected(new Set())
     setDeletingBulk(false)
     fetchModels()

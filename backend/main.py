@@ -57,9 +57,17 @@ def init_db():
                 created_at   REAL,
                 started_at   REAL,
                 finished_at  REAL,
-                error        TEXT
+                error        TEXT,
+                hidden_in_jobs   INTEGER DEFAULT 0,
+                hidden_in_models INTEGER DEFAULT 0
             )
         """)
+        # Migrate existing DB: add columns if missing
+        for col in ("hidden_in_jobs", "hidden_in_models"):
+            try:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} INTEGER DEFAULT 0")
+            except Exception:
+                pass
         conn.commit()
 
 
@@ -247,10 +255,14 @@ def submit_job(project_id: int, req: TrainRequest):
 
 
 @app.get("/api/jobs")
-def list_jobs():
+def list_jobs(view: str = "jobs"):
+    if view == "models":
+        where = "WHERE status = 'completed' AND hidden_in_models = 0"
+    else:
+        where = "WHERE hidden_in_jobs = 0"
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM jobs ORDER BY created_at DESC"
+            f"SELECT * FROM jobs {where} ORDER BY created_at DESC"
         ).fetchall()
     jobs = []
     for r in rows:
@@ -303,10 +315,18 @@ def patch_job(job_id: str, req: PatchJobRequest):
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str):
+def delete_job(job_id: str, from_view: str = "jobs"):
     with get_db() as conn:
-        conn.execute("UPDATE jobs SET status = 'error', error = 'Cancelled by user' WHERE id = ? AND status IN ('queued', 'running')", (job_id,))
-        conn.execute("DELETE FROM jobs WHERE id = ? AND status NOT IN ('running')", (job_id,))
+        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if from_view == "models":
+            conn.execute("UPDATE jobs SET hidden_in_models = 1 WHERE id = ?", (job_id,))
+        else:
+            # Cancel if still active, then hide from jobs view
+            if row["status"] in ("queued", "running"):
+                conn.execute("UPDATE jobs SET status = 'error', error = 'Cancelled by user' WHERE id = ?", (job_id,))
+            conn.execute("UPDATE jobs SET hidden_in_jobs = 1 WHERE id = ?", (job_id,))
         conn.commit()
     return {"ok": True}
 
