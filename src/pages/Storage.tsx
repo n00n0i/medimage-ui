@@ -78,6 +78,7 @@ export default function Storage() {
   const [search, setSearch]           = useState('')
   const cfg = loadMinioConfig()
   const [consoleUrl, setConsoleUrl]   = useState(cfg.consoleUrl)
+  const [consoleLogging, setConsoleLogging] = useState(false)
   const [modal, setModal]             = useState<ModalState>('none')
   const [newBucketName, setNewBucketName] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<{ bucket: string; key?: string } | null>(null)
@@ -344,6 +345,22 @@ export default function Storage() {
     }
   }
 
+  /* ── Auto-login to MinIO Console ────────────────────────── */
+  async function openConsole() {
+    setConsoleLogging(true)
+    const cfg = loadMinioConfig()
+    try {
+      await fetch('/minio-console/api/v1/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessKey: cfg.accessKey, secretKey: cfg.secretKey }),
+        credentials: 'include',
+      })
+    } catch { /* ignore — console will show login form */ }
+    setConsoleLogging(false)
+    window.open('/minio-console/', '_blank', 'noopener')
+  }
+
   /* ── Copy URL ─────────────────────────────────────────────── */
   function copyUrl(bucket: string, key: string) {
     const url = `${consoleUrl.replace(/\/$/, '')}/buckets/${bucket}/objects/${encodeURIComponent(key)}`
@@ -441,15 +458,17 @@ export default function Storage() {
           >
             <RefreshCw size={13} />Refresh
           </button>
-          <a
-            href={consoleUrl}
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
             className="btn btn-secondary"
             style={{ fontSize: 12, padding: '5px 12px' }}
+            onClick={openConsole}
+            disabled={consoleLogging}
           >
-            <ExternalLink size={13} />Console
-          </a>
+            {consoleLogging
+              ? <RefreshCw size={13} className="animate-spin" />
+              : <ExternalLink size={13} />}
+            Console
+          </button>
           <button
             className="btn btn-secondary"
             style={{ fontSize: 12, padding: '5px 10px' }}
@@ -481,8 +500,50 @@ export default function Storage() {
             })() : undefined}
             icon={<HardDrive size={15} />}
           />
-          <StatCard label="MinIO Console" value="Open →"                   icon={<ExternalLink size={15} />}
-            sub={consoleUrl.replace(/^https?:\/\//, '')} />
+          {/* MinIO Console status card */}
+          <div className="stat-card" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', marginBottom: 6 }}>
+              <ExternalLink size={15} />
+              <span className="stat-label">MinIO Console</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
+              <div style={{
+                width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                background: connected ? 'var(--success)' : 'var(--danger)',
+                boxShadow: connected ? '0 0 5px var(--success)' : '0 0 5px var(--danger)',
+              }} />
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
+                {connected ? 'Online' : 'Offline'}
+              </span>
+            </div>
+            {diskInfo && (() => {
+              const freePct = Math.min(100, (diskInfo.freeBytes / diskInfo.totalBytes) * 100)
+              return (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+                  Disk: <span style={{ color: freePct < 15 ? 'var(--danger)' : freePct < 30 ? 'oklch(0.75 0.15 60)' : 'var(--success)', fontWeight: 500 }}>
+                    {fmtSize(diskInfo.freeBytes)} free
+                  </span>
+                  {' '}/ {fmtSize(diskInfo.totalBytes)}
+                </div>
+              )
+            })()}
+            {!diskInfo && (
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+                {buckets.length} bucket{buckets.length !== 1 ? 's' : ''} · {fmtSize(totalSizeBytes)} used
+              </div>
+            )}
+            <button
+              className="btn btn-primary btn-sm"
+              style={{ width: '100%', justifyContent: 'center', fontSize: 12, padding: '5px 0' }}
+              onClick={openConsole}
+              disabled={consoleLogging}
+            >
+              {consoleLogging
+                ? <RefreshCw size={12} className="animate-spin" />
+                : <ExternalLink size={12} />}
+              {consoleLogging ? 'Logging in…' : 'Open Console'}
+            </button>
+          </div>
         </div>
       )}
 
