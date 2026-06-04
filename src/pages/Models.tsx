@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search } from 'lucide-react'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search, Cloud, Wifi, WifiOff, Save, Eye, EyeOff, Globe, Copy, Check } from 'lucide-react'
 
 interface HFModel {
   id: string
@@ -27,6 +27,11 @@ interface Model {
   epochs: number
   batch_size: number
   source?: string
+  s3_weights_path?: string
+  modal_url?: string
+  modal_api_key?: string
+  ray_serve_url?: string
+  inference_provider?: string
 }
 
 // ─── Pretrained presets ───────────────────────────────────────────────────────
@@ -306,6 +311,9 @@ export default function Models() {
         </div>
       </div>
 
+      {/* Global endpoint config */}
+      <GlobalEndpointConfig />
+
       {/* Bulk action toolbar */}
       {selected.size > 0 && (
         <div style={{
@@ -448,6 +456,16 @@ export default function Models() {
                       </span>
                     )}
                     <DomainBadge model={m.model} />
+                    {m.modal_url && m.inference_provider === 'modal' && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#8b5cf620', color: '#8b5cf6', display: 'flex', alignItems: 'center', gap: 3 }}>
+                        <Cloud size={9} /> Modal
+                      </span>
+                    )}
+                    {m.ray_serve_url && m.inference_provider === 'ray' && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#f59e0b20', color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 3 }}>
+                        <Wifi size={9} /> Ray
+                      </span>
+                    )}
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
                     {m.model} &middot; {m.engine} &middot; {m.dataset} &middot; {m.epochs} epochs
@@ -671,6 +689,812 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
         <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={onDelete}>
           <Trash2 size={13} /> Delete
         </button>
+      </div>
+
+      {/* Deployment section — all model types */}
+      <DeploySection
+        modelId={detail.id}
+        trainingType={detail.training_type}
+        initialProvider={detail.inference_provider ?? ''}
+        initialModalUrl={detail.modal_url ?? ''}
+        initialModalKey={detail.modal_api_key ?? ''}
+        initialRayUrl={detail.ray_serve_url ?? ''}
+        s3Path={detail.s3_weights_path ?? ''}
+      />
+    </div>
+  )
+}
+
+// ─── Shared sub-components ──────────────────────────────────────────────────
+
+function StatusBadge({ online, checking }: { online: boolean | null; checking: boolean }) {
+  if (checking) return <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}><Loader size={10} className="animate-spin" /> Checking…</span>
+  if (online === true)  return <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><Wifi size={10} /> Online</span>
+  if (online === false) return <span style={{ fontSize: 11, fontWeight: 600, color: '#ef4444', display: 'flex', alignItems: 'center', gap: 4 }}><WifiOff size={10} /> Offline</span>
+  return null
+}
+
+const SERVE_SCRIPT = `# serve_inference.py — H-Forge Ray Serve inference endpoint
+# Install: pip install "ray[serve]" fastapi uvicorn python-multipart pillow
+# Deploy:  serve run serve_inference.py:deployment --host 0.0.0.0 --port 8000
+
+from ray import serve
+from fastapi import FastAPI, File, Form, UploadFile
+from typing import Optional
+
+_app = FastAPI()
+
+@serve.deployment(num_replicas=1, ray_actor_options={"num_cpus": 2})
+@serve.ingress(_app)
+class InferenceApp:
+    def __init__(self):
+        # ─── Load your model weights here ─────────────
+        # import torch
+        # self.model = torch.load("/path/to/weights.pt")
+        # self.model.eval()
+        # ─────────────────────────────────────────
+        self.model = None
+
+    @_app.post("/inference")
+    async def infer(
+        self,
+        training_type: str = Form(...),
+        model_id: str = Form(""),
+        conf_threshold: float = Form(0.5),
+        image: Optional[UploadFile] = File(None),
+        prompt: str = Form(""),
+        system_prompt: str = Form(""),
+    ):
+        img = await image.read() if image else None
+        # ─── Return format per training_type ─────────────────
+        # "classification" → {"type":"classification","predictions":[{"label":…,"confidence":…}],"top_label":…}
+        # "detection"      → {"type":"detection","detections":[{"class_name":…,"confidence":…,"bbox":[x,y,w,h]}]}
+        # "segmentation"   → {"type":"segmentation","masks":[{"class_name":…}],"num_masks":…}
+        # "llm-text"       → {"type":"llm-text","response":"…","tokens":…,"inference_time_ms":…}
+        return {"type": training_type, "error": "model not loaded — edit __init__ to load weights"}
+
+    @_app.get("/health")
+    async def health(self):
+        return {"status": "ok", "model_loaded": self.model is not None}
+
+deployment = InferenceApp.bind()
+`
+
+function RayServeTab({ rayUrl, setRayUrl, onAutoSave }: {
+  rayUrl: string
+  setRayUrl: (v: string) => void
+  onAutoSave: (serveUrl: string) => Promise<void>
+}) {
+  const [showScript, setShowScript] = useState(false)
+  const [copied, setCopied]         = useState(false)
+  const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'running' | 'error'>('idle')
+  const [deployLogs, setDeployLogs] = useState<string[]>([])
+  const [showLogs, setShowLogs]     = useState(false)
+
+  // Auto-fill dashboard URL from localStorage ray_head_url
+  const [dashUrl, setDashUrl] = useState(() => localStorage.getItem('ray_head_url') || '')
+
+  // Derive serve URL (8265→8000) whenever dashUrl changes
+  useEffect(() => {
+    if (dashUrl) {
+      try {
+        const u = new URL(dashUrl)
+        const serve = `${u.protocol}//${u.hostname}:8000`
+        if (serve !== rayUrl) setRayUrl(serve)
+      } catch {
+        const serve = dashUrl.replace(':8265', ':8000').replace(/\/$/, '')
+        if (serve !== rayUrl) setRayUrl(serve)
+      }
+    }
+  }, [dashUrl]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sync deploy state on mount
+  useEffect(() => {
+    fetch('/api/ray-serve/status').then(r => r.ok ? r.json() : null).then(d => {
+      if (!d) return
+      setDeployStatus(d.status)
+      setDeployLogs(d.logs || [])
+      if (d.status === 'running' && d.url && !rayUrl) setRayUrl(d.url)
+    }).catch(() => {})
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Poll while deploying
+  useEffect(() => {
+    if (deployStatus !== 'deploying') return
+    const id = setInterval(async () => {
+      try {
+        const r = await fetch('/api/ray-serve/status')
+        const d = r.ok ? await r.json() : null
+        if (!d) return
+        setDeployStatus(d.status)
+        setDeployLogs(d.logs || [])
+        if (d.status !== 'deploying') {
+          clearInterval(id)
+          if (d.status === 'running' && d.url) {
+            setRayUrl(d.url)
+            await onAutoSave(d.url)
+          }
+        }
+      } catch { /* ignore */ }
+    }, 3000)
+    return () => clearInterval(id)
+  }, [deployStatus]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function deploy() {
+    if (!dashUrl) return
+    setDeployStatus('deploying')
+    setDeployLogs(['ส่ง job ไปยัง Ray cluster…'])
+    setShowLogs(true)
+    try {
+      const r = await fetch('/api/ray-serve/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ray_dashboard_url: dashUrl, api_host: window.location.hostname }),
+      })
+      if (!r.ok) {
+        const e = await r.json()
+        setDeployStatus('error')
+        setDeployLogs([e.detail || 'Deploy failed'])
+      }
+    } catch (e) {
+      setDeployStatus('error')
+      setDeployLogs([(e as Error).message])
+    }
+  }
+
+  function copyScript() {
+    navigator.clipboard.writeText(SERVE_SCRIPT).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  const inp: React.CSSProperties = {
+    width: '100%', boxSizing: 'border-box', padding: '7px 10px', fontSize: 12,
+    background: 'var(--bg-card)', border: '1px solid var(--border-subtle)',
+    borderRadius: 7, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)',
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+          Deploy inference app บน <strong style={{ color: '#f59e0b' }}>Ray cluster</strong> ที่รันอยู่
+        </p>
+        {deployStatus === 'running' && <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><Wifi size={10} /> Deployed</span>}
+        {deployStatus === 'error'   && <span style={{ fontSize: 11, fontWeight: 600, color: '#ef4444' }}>Error</span>}
+      </div>
+
+      {/* Deployed URL */}
+      {rayUrl && deployStatus === 'running' && (
+        <div style={{ padding: '7px 10px', borderRadius: 7, background: '#f59e0b15', border: '1px solid #f59e0b30', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Wifi size={12} color="#f59e0b" style={{ flexShrink: 0 }} />
+          <code style={{ fontSize: 11, flex: 1, color: '#f59e0b', wordBreak: 'break-all' }}>{rayUrl}</code>
+          <a href={rayUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-muted)', display: 'flex' }}><ExternalLink size={12} /></a>
+        </div>
+      )}
+
+      {/* Ray Dashboard URL */}
+      <div>
+        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Ray Dashboard URL (port 8265)</label>
+        <input type="url" value={dashUrl} onChange={e => setDashUrl(e.target.value)}
+          placeholder="http://100.68.53.118:8265"
+          style={inp}
+        />
+        <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
+          auto-filled จาก Ray Cluster page — serve endpoint จะเป็น port 8000 บน host เดียวกัน
+        </p>
+      </div>
+
+      {/* Deploy button */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button
+          className="btn btn-sm"
+          style={{ display: 'flex', alignItems: 'center', gap: 5, background: '#f59e0b', color: '#fff', border: 'none' }}
+          onClick={deploy}
+          disabled={deployStatus === 'deploying' || !dashUrl}
+        >
+          {deployStatus === 'deploying' ? <Loader size={11} className="animate-spin" /> : <Cloud size={11} />}
+          {deployStatus === 'running' ? 'Redeploy' : deployStatus === 'deploying' ? 'Deploying…' : 'Deploy Inference App'}
+        </button>
+        {deployLogs.length > 0 && (
+          <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={() => setShowLogs(v => !v)}>
+            <Terminal size={11} /> Logs
+          </button>
+        )}
+        {deployStatus === 'running' && <span style={{ fontSize: 11, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={11} /> Active</span>}
+      </div>
+
+      {showLogs && deployLogs.length > 0 && (
+        <pre style={{
+          margin: 0, padding: '8px 10px', fontSize: 10, lineHeight: 1.5, borderRadius: 7,
+          background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
+          maxHeight: 160, overflowY: 'auto', border: '1px solid var(--border-subtle)',
+        }}>{deployLogs.join('\n')}</pre>
+      )}
+
+      {/* Script for advanced users */}
+      <div style={{ borderRadius: 7, border: '1px solid var(--border-subtle)', overflow: 'hidden' }}>
+        <button
+          onClick={() => setShowScript(v => !v)}
+          style={{
+            width: '100%', display: 'flex', alignItems: 'center', gap: 6, padding: '7px 12px',
+            background: 'var(--bg-base)', border: 'none', cursor: 'pointer',
+            fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textAlign: 'left',
+          }}
+        >
+          <Terminal size={11} />
+          <code style={{ flex: 1 }}>serve_inference.py</code>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', marginRight: 4 }}>ดู / แก้ script</span>
+          <ChevronDown size={11} style={{ transform: showScript ? 'rotate(180deg)' : undefined, transition: 'transform 0.18s' }} />
+        </button>
+        {showScript && (
+          <div style={{ position: 'relative' }}>
+            <pre style={{
+              margin: 0, padding: '10px 14px', fontSize: 10.5, lineHeight: 1.55, overflowX: 'auto',
+              background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
+              borderTop: '1px solid var(--border-subtle)',
+            }}>{SERVE_SCRIPT}</pre>
+            <button
+              onClick={copyScript}
+              style={{
+                position: 'absolute', top: 8, right: 8,
+                background: copied ? '#22c55e20' : 'var(--bg-card)',
+                border: `1px solid ${copied ? '#22c55e' : 'var(--border-subtle)'}`,
+                borderRadius: 6, padding: '4px 8px', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', gap: 4,
+                fontSize: 11, color: copied ? '#22c55e' : 'var(--text-muted)',
+              }}
+            >
+              {copied ? <Check size={11} /> : <Copy size={11} />}
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Modal Deploy Tab ─────────────────────────────────────────────────────────
+
+function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, checking }: {
+  modalUrl: string
+  setModalUrl: (v: string) => void
+  modalKey: string
+  setModalKey: (v: string) => void
+  online: boolean | null
+  checking: boolean
+}) {
+  const [tokenId, setTokenId]         = useState(() => {
+    try { const s = JSON.parse(localStorage.getItem('ray_modal_config') || '{}') as Record<string, string>; return s.tokenId || '' } catch { return '' }
+  })
+  const [tokenSecret, setTokenSecret] = useState(() => {
+    try { const s = JSON.parse(localStorage.getItem('ray_modal_config') || '{}') as Record<string, string>; return s.tokenSecret || '' } catch { return '' }
+  })
+  const [gpuType, setGpuType]         = useState('T4')
+  const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'running' | 'error'>('idle')
+  const [deployLogs, setDeployLogs]   = useState<string[]>([])
+  const [showLogs, setShowLogs]       = useState(false)
+  const [showSecret, setShowSecret]   = useState(false)
+  const [showApiKey, setShowApiKey]   = useState(false)
+
+  // Persist tokens whenever they change
+  useEffect(() => {
+    try {
+      const prev = JSON.parse(localStorage.getItem('ray_modal_config') || '{}')
+      localStorage.setItem('ray_modal_config', JSON.stringify({ ...prev, tokenId, tokenSecret }))
+    } catch { /* ignore */ }
+  }, [tokenId, tokenSecret])
+
+  // Sync deploy state on mount
+  useEffect(() => {
+    fetch('/api/modal/inference/status').then(r => r.ok ? r.json() : null).then(d => {
+      if (!d) return
+      setDeployStatus(d.status)
+      setDeployLogs(d.logs || [])
+      if (d.status === 'running' && d.url && !modalUrl) setModalUrl(d.url)
+    }).catch(() => {})
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Poll while deploying
+  useEffect(() => {
+    if (deployStatus !== 'deploying') return
+    const id = setInterval(async () => {
+      try {
+        const r = await fetch('/api/modal/inference/status')
+        const d = r.ok ? await r.json() : null
+        if (!d) return
+        setDeployStatus(d.status)
+        setDeployLogs(d.logs || [])
+        if (d.status !== 'deploying') {
+          clearInterval(id)
+          if (d.status === 'running' && d.url) setModalUrl(d.url)
+        }
+      } catch { /* ignore */ }
+    }, 3000)
+    return () => clearInterval(id)
+  }, [deployStatus]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function deploy() {
+    if (!tokenId || !tokenSecret) return
+    setDeployStatus('deploying')
+    setDeployLogs(['กำลัง deploy บน Modal.com… (ใช้เวลา 1–3 นาที)'])
+    setShowLogs(true)
+    try {
+      const r = await fetch('/api/modal/inference/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token_id: tokenId, token_secret: tokenSecret, gpu_type: gpuType }),
+      })
+      if (!r.ok) {
+        const e = await r.json()
+        setDeployStatus('error')
+        setDeployLogs([e.detail || 'Deploy failed'])
+      }
+    } catch (e) {
+      setDeployStatus('error')
+      setDeployLogs([(e as Error).message])
+    }
+  }
+
+  const inp: React.CSSProperties = {
+    width: '100%', boxSizing: 'border-box', padding: '7px 10px', fontSize: 12,
+    background: 'var(--bg-card)', border: '1px solid var(--border-subtle)',
+    borderRadius: 7, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)',
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+          Deploy inference app บน <strong style={{ color: '#8b5cf6' }}>Modal.com</strong> GPU
+        </p>
+        <StatusBadge online={online} checking={checking} />
+      </div>
+
+      {/* Deployed URL display */}
+      {modalUrl && (
+        <div style={{ padding: '7px 10px', borderRadius: 7, background: '#8b5cf615', border: '1px solid #8b5cf630', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Cloud size={12} color="#8b5cf6" style={{ flexShrink: 0 }} />
+          <code style={{ fontSize: 11, flex: 1, color: '#8b5cf6', wordBreak: 'break-all' }}>{modalUrl}</code>
+          <a href={modalUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-muted)', display: 'flex' }}><ExternalLink size={12} /></a>
+          <button onClick={() => setModalUrl('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex' }}><X size={12} /></button>
+        </div>
+      )}
+
+      {/* Token ID */}
+      <div>
+        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Modal Token ID</label>
+        <input type="text" value={tokenId} onChange={e => setTokenId(e.target.value)}
+          placeholder="ak-xxxxxxxxxxxxxxxx"
+          style={inp}
+        />
+      </div>
+
+      {/* Token Secret */}
+      <div>
+        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Modal Token Secret</label>
+        <div style={{ position: 'relative' }}>
+          <input type={showSecret ? 'text' : 'password'} value={tokenSecret} onChange={e => setTokenSecret(e.target.value)}
+            placeholder="as-xxxxxxxxxxxxxxxx"
+            style={{ ...inp, paddingRight: 32 }}
+          />
+          <button onClick={() => setShowSecret(v => !v)} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex' }}>
+            {showSecret ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+        <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
+          ดู token ได้ที่ <a href="https://modal.com/settings" target="_blank" rel="noopener noreferrer" style={{ color: '#8b5cf6' }}>modal.com/settings</a> — Token ID เก็บไว้ใน localStorage แล้ว
+        </p>
+      </div>
+
+      {/* GPU type */}
+      <div>
+        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>GPU Type</label>
+        <select value={gpuType} onChange={e => setGpuType(e.target.value)} style={{ ...inp, cursor: 'pointer' }}>
+          <option value="T4">T4 (ประหยัด)</option>
+          <option value="A10G">A10G (แนะนำ)</option>
+          <option value="A100">A100 (สูงสุด)</option>
+          <option value="cpu">CPU only</option>
+        </select>
+      </div>
+
+      {/* Deploy button + status */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button
+          className="btn btn-sm"
+          style={{ display: 'flex', alignItems: 'center', gap: 5, background: '#8b5cf6', color: '#fff', border: 'none' }}
+          onClick={deploy}
+          disabled={deployStatus === 'deploying' || !tokenId || !tokenSecret}
+        >
+          {deployStatus === 'deploying' ? <Loader size={11} className="animate-spin" /> : <Cloud size={11} />}
+          {deployStatus === 'running' ? 'Redeploy' : deployStatus === 'deploying' ? 'Deploying…' : 'Deploy Inference App'}
+        </button>
+        {deployLogs.length > 0 && (
+          <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={() => setShowLogs(v => !v)}>
+            <Terminal size={11} /> Logs
+          </button>
+        )}
+        {deployStatus === 'running' && <span style={{ fontSize: 11, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={11} /> Deployed</span>}
+        {deployStatus === 'error'   && <span style={{ fontSize: 11, color: '#ef4444' }}>Deploy failed</span>}
+      </div>
+
+      {showLogs && deployLogs.length > 0 && (
+        <pre style={{
+          margin: 0, padding: '8px 10px', fontSize: 10, lineHeight: 1.5, borderRadius: 7,
+          background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
+          maxHeight: 160, overflowY: 'auto', border: '1px solid var(--border-subtle)',
+        }}>{deployLogs.join('\n')}</pre>
+      )}
+
+      {/* API key for already-deployed endpoint */}
+      {modalUrl && (
+        <div>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>API Key (ถ้ามี)</label>
+          <div style={{ position: 'relative' }}>
+            <input type={showApiKey ? 'text' : 'password'} value={modalKey} onChange={e => setModalKey(e.target.value)}
+              placeholder="Bearer token (เว้นว่างถ้าไม่มี)"
+              style={{ ...inp, paddingRight: 32 }}
+            />
+            <button onClick={() => setShowApiKey(v => !v)} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex' }}>
+              {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Global Endpoint Config ──────────────────────────────────────────────────
+
+function GlobalEndpointConfig() {
+  type Tab = 'simulate' | 'modal' | 'ray'
+  const [tab, setTab]           = useState<Tab>('simulate')
+  const [modalUrl, setModalUrl] = useState('')
+  const [modalKey, setModalKey] = useState('')
+  const [rayUrl, setRayUrl]     = useState('')
+  const [saving, setSaving]     = useState(false)
+  const [saved, setSaved]       = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [modalOnline, setModalOnline] = useState<boolean | null>(null)
+  const [rayOnline, setRayOnline]     = useState<boolean | null>(null)
+  const [checking, setChecking]       = useState(false)
+
+  useEffect(() => {
+    fetch('/api/settings/inference').then(r => r.ok ? r.json() : null).then(d => {
+      if (!d) return
+      if (d.provider) setTab(d.provider as Tab)
+      if (d.modal_url) setModalUrl(d.modal_url)
+      if (d.modal_api_key) setModalKey(d.modal_api_key)
+      if (d.ray_serve_url) setRayUrl(d.ray_serve_url)
+    }).catch(() => {})
+  }, [])
+
+  async function checkStatus() {
+    setChecking(true)
+    try {
+      if (tab === 'modal') {
+        const r = await fetch('/api/settings/inference/modal-status')
+        const d = r.ok ? await r.json() : { online: false }
+        setModalOnline(d.online)
+      } else if (tab === 'ray') {
+        const r = await fetch('/api/settings/inference/ray-status')
+        const d = r.ok ? await r.json() : { online: false }
+        setRayOnline(d.online)
+      }
+    } catch {
+      if (tab === 'modal') setModalOnline(false)
+      else setRayOnline(false)
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  async function save() {
+    setSaving(true)
+    try {
+      await fetch('/api/settings/inference', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: tab === 'simulate' ? '' : tab,
+          modal_url: modalUrl,
+          modal_api_key: modalKey,
+          ray_serve_url: rayUrl,
+        }),
+      })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+      if (tab === 'modal' && modalUrl) checkStatus()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const TABS: { id: Tab; label: string; color: string }[] = [
+    { id: 'simulate', label: 'Simulate',  color: '#6b7280' },
+    { id: 'modal',    label: 'Modal',     color: '#8b5cf6' },
+    { id: 'ray',      label: 'Ray Serve', color: '#f59e0b' },
+  ]
+
+  const activeColor = TABS.find(t => t.id === tab)?.color ?? '#6b7280'
+
+  return (
+    <div style={{ marginBottom: 20, borderRadius: 12, border: `1px solid ${activeColor}40`, background: 'var(--bg-card)', overflow: 'hidden' }}>
+      {/* Always-visible header */}
+      <button
+        onClick={() => setExpanded(v => !v)}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', gap: 10,
+          padding: '13px 18px', background: 'none', border: 'none', cursor: 'pointer',
+          textAlign: 'left',
+        }}
+      >
+        <Globe size={15} color={activeColor} />
+        <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--text-primary)' }}>
+          Global Inference Default
+        </span>
+        <span style={{
+          fontSize: 11, fontWeight: 700, padding: '2px 9px', borderRadius: 10,
+          background: activeColor + '20', color: activeColor,
+        }}>
+          {tab === 'simulate' ? 'Simulate' : tab === 'modal' ? 'Modal' : 'Ray Serve'}
+        </span>
+        {(tab === 'modal' && modalOnline !== null) && (
+          <span style={{ fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4, color: modalOnline ? '#22c55e' : '#ef4444' }}>
+            {modalOnline ? <Wifi size={10} /> : <WifiOff size={10} />}
+            {modalOnline ? 'Online' : 'Offline'}
+          </span>
+        )}
+        {(tab === 'ray' && rayOnline !== null) && (
+          <span style={{ fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4, color: rayOnline ? '#22c55e' : '#ef4444' }}>
+            {rayOnline ? <Wifi size={10} /> : <WifiOff size={10} />}
+            {rayOnline ? 'Online' : 'Offline'}
+          </span>
+        )}
+        <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>
+          ทุก model ที่ไม่ได้ตั้งเองจะใช้ค่านี้
+        </span>
+        <ChevronDown size={14} color="var(--text-muted)" style={{ transform: expanded ? 'rotate(180deg)' : undefined, transition: 'transform 0.18s' }} />
+      </button>
+
+      {expanded && (
+        <div style={{ padding: '0 18px 16px', borderTop: `1px solid ${activeColor}30` }}>
+          {/* Tab switcher */}
+          <div style={{ display: 'flex', gap: 6, margin: '14px 0 14px' }}>
+            {TABS.map(t => (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                style={{
+                  padding: '4px 14px', borderRadius: 8, fontSize: 12, fontWeight: 600,
+                  cursor: 'pointer', border: 'none',
+                  background: tab === t.id ? t.color + '25' : 'var(--bg-base)',
+                  color: tab === t.id ? t.color : 'var(--text-muted)',
+                  outline: tab === t.id ? `1.5px solid ${t.color}60` : 'none',
+                }}
+              >{t.label}</button>
+            ))}
+          </div>
+
+          {tab === 'simulate' && (
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6, marginBottom: 14 }}>
+              ทุก model จะใช้ข้อมูล simulation — ไม่รัน model จริง เหมาะสำหรับ demo
+            </p>
+          )}
+
+          {tab === 'modal' && (
+            <div style={{ marginBottom: 14 }}>
+              <ModalDeployTab
+                modalUrl={modalUrl} setModalUrl={setModalUrl}
+                modalKey={modalKey} setModalKey={setModalKey}
+                online={modalOnline} checking={checking && tab === 'modal'}
+              />
+            </div>
+          )}
+
+          {tab === 'ray' && (
+            <div style={{ marginBottom: 14 }}>
+              <RayServeTab
+                rayUrl={rayUrl} setRayUrl={setRayUrl}
+                onAutoSave={async (url) => {
+                  setRayUrl(url)
+                  setTab('ray')
+                  await fetch('/api/settings/inference', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider: 'ray', modal_url: modalUrl, modal_api_key: modalKey, ray_serve_url: url }),
+                  })
+                  setSaved(true); setTimeout(() => setSaved(false), 2000)
+                }}
+              />
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={save} disabled={saving}>
+              {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
+              {saved ? 'Saved!' : 'Save & Apply to All'}
+            </button>
+            {tab !== 'simulate' && (modalUrl || rayUrl) && (
+              <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={checkStatus} disabled={checking}>
+                {checking ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={11} />} Check Status
+              </button>
+            )}
+          </div>
+          <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 10 }}>
+            model ที่ตั้ง endpoint เองจะใช้ค่าของตัวเองแทน — global setting เป็นเพียง fallback
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ─── Deploy Section (Modal.com + Ray Serve endpoint config) ──────────────────
+
+function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl, initialModalKey, initialRayUrl, s3Path }: {
+  modelId: string
+  trainingType: string
+  initialProvider: string
+  initialModalUrl: string
+  initialModalKey: string
+  initialRayUrl: string
+  s3Path: string
+}) {
+  type Tab = 'simulate' | 'modal' | 'ray'
+  const [tab, setTab]         = useState<Tab>((initialProvider as Tab) || 'simulate')
+  const [modalUrl, setModalUrl]   = useState(initialModalUrl)
+  const [modalKey, setModalKey]   = useState(initialModalKey)
+  const [rayUrl, setRayUrl]       = useState(initialRayUrl)
+  const [saving, setSaving]       = useState(false)
+  const [saved, setSaved]         = useState(false)
+  const [modalOnline, setModalOnline] = useState<boolean | null>(null)
+  const [checkingModal, setCheckingModal] = useState(false)
+
+  useEffect(() => {
+    if (initialModalUrl) checkStatus()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function checkStatus() {
+    setCheckingModal(true)
+    try {
+      const r = await fetch(`/api/jobs/${modelId}/modal-status`)
+      const d = r.ok ? await r.json() : { online: false }
+      setModalOnline(d.online)
+    } catch {
+      setModalOnline(false)
+    } finally {
+      setCheckingModal(false)
+    }
+  }
+
+  async function save() {
+    setSaving(true)
+    try {
+      await fetch(`/api/jobs/${modelId}/deployment`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          modal_url: modalUrl,
+          modal_api_key: modalKey,
+          ray_serve_url: rayUrl,
+          inference_provider: tab === 'simulate' ? '' : tab,
+        }),
+      })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+      if (tab === 'modal' && modalUrl) checkStatus()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function clearAll() {
+    await fetch(`/api/jobs/${modelId}/deployment`, { method: 'DELETE' })
+    setModalUrl(''); setModalKey(''); setRayUrl(''); setTab('simulate')
+    setModalOnline(null)
+  }
+
+  const TABS: { id: Tab; label: string; color: string }[] = [
+    { id: 'simulate', label: 'Simulate',  color: '#6b7280' },
+    { id: 'modal',    label: 'Modal',     color: '#8b5cf6' },
+    { id: 'ray',      label: 'Ray Serve', color: '#f59e0b' },
+  ]
+
+  const _isLLM = trainingType === 'llm-text' || trainingType === 'vlm-finetune'; void _isLLM
+
+  return (
+    <div style={{ marginTop: 18, borderRadius: 10, background: 'var(--bg-base)', border: '1px solid var(--border-subtle)', overflow: 'hidden' }}>
+      {/* Header */}
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Cloud size={14} color="#8b5cf6" />
+        <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>Inference Provider</span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          {TABS.map(t => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              style={{
+                padding: '3px 10px', borderRadius: 8, fontSize: 11, fontWeight: 600,
+                cursor: 'pointer', border: 'none',
+                background: tab === t.id ? t.color + '25' : 'transparent',
+                color: tab === t.id ? t.color : 'var(--text-muted)',
+                outline: tab === t.id ? `1.5px solid ${t.color}50` : 'none',
+              }}
+            >{t.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ padding: '14px 16px' }}>
+        {/* S3 weights path (display only, shown for all tabs) */}
+        {s3Path && (
+          <div style={{ marginBottom: 14, padding: '8px 10px', borderRadius: 7, background: '#0ea5e910', border: '1px solid #0ea5e930' }}>
+            <p style={{ fontSize: 10, color: '#0ea5e9', fontWeight: 600, marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>S3 / MinIO Weights</p>
+            <code style={{ fontSize: 11, color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{s3Path}</code>
+          </div>
+        )}
+
+        {/* Simulate tab */}
+        {tab === 'simulate' && (
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            Inference ใช้ข้อมูล simulation — ไม่มีการรัน model จริง เหมาะสำหรับ demo และทดสอบ UI
+          </p>
+        )}
+
+        {/* Modal tab */}
+        {tab === 'modal' && (
+          <ModalDeployTab
+            modalUrl={modalUrl} setModalUrl={setModalUrl}
+            modalKey={modalKey} setModalKey={setModalKey}
+            online={modalOnline} checking={checkingModal}
+          />
+        )}
+
+        {/* Ray Serve tab */}
+        {tab === 'ray' && (
+          <RayServeTab
+            rayUrl={rayUrl} setRayUrl={setRayUrl}
+            onAutoSave={async (url) => {
+              setRayUrl(url)
+              await fetch(`/api/jobs/${modelId}/deployment`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ modal_url: modalUrl, modal_api_key: modalKey, ray_serve_url: url, inference_provider: 'ray' }),
+              })
+              setTab('ray')
+              setSaved(true); setTimeout(() => setSaved(false), 2000)
+            }}
+          />
+        )}
+
+        {/* Buttons */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: tab === 'simulate' ? 12 : 14 }}>
+          <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={save} disabled={saving}>
+            {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
+            {saved ? 'Saved!' : 'Save & Activate'}
+          </button>
+          {tab === 'modal' && modalUrl && (
+            <>
+              <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={checkStatus} disabled={checkingModal}>
+                {checkingModal ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={11} />} Check
+              </button>
+              <a href={modalUrl} target="_blank" rel="noopener noreferrer" className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5, textDecoration: 'none' }}>
+                <ExternalLink size={11} /> Open
+              </a>
+            </>
+          )}
+          {tab === 'modal' && rayUrl && null}
+          {(modalUrl || modalKey || rayUrl) && (
+            <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--danger)' }} onClick={clearAll}>
+              <X size={11} /> Clear All
+            </button>
+          )}
+        </div>
       </div>
     </div>
   )

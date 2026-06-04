@@ -13,6 +13,7 @@
     "@noble/hashes": "^2.2.0",
     "@tailwindcss/vite": "^4.3.0",
     "axios": "^1.16.1",
+    "keycloak-js": "^26.2.4",
     "lucide-react": "^1.16.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",

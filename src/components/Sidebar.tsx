@@ -1,22 +1,26 @@
 import { NavLink } from 'react-router-dom'
 import {
   FolderSync, Database, Brain, ListChecks, LayoutDashboard,
-  ChevronLeft, ChevronRight, Activity, Server, HardDrive, BrainCircuit, BookOpen, FlaskConical
+  ChevronLeft, ChevronRight, Activity, Server, HardDrive, BrainCircuit, BookOpen, FlaskConical, Zap, Cloud, LogOut, User, Users, UserCircle,
 } from 'lucide-react'
 import { useState } from 'react'
+import keycloak from '../keycloak'
 
-const navItems = [
-  { to: '/projects',     label: 'Projects',     icon: FolderSync,       desc: 'Manage datasets' },
-  { to: '/datasets',     label: 'Datasets',     icon: Database,         desc: 'Storage & sync' },
-  { to: '/storage',      label: 'Storage',      icon: HardDrive,        desc: 'MinIO buckets' },
-  { to: '/train',        label: 'Train',        icon: Brain,            desc: 'Model training' },
-  { to: '/jobs',         label: 'Jobs',         icon: ListChecks,       desc: 'Running jobs' },
-  { to: '/models',       label: 'Models',       icon: BrainCircuit,     desc: 'Trained models' },
-  { to: '/playground',   label: 'Playground',   icon: FlaskConical,     desc: 'Test inference' },
-  { to: '/ray-cluster',  label: 'Ray Cluster',  icon: Server,           desc: 'Cluster & GPUs' },
-  { to: '/notebook',     label: 'Notebook',     icon: BookOpen,         desc: 'Jupyter Notebook' },
-  { to: '/status',       label: 'Status',       icon: Activity,         desc: 'System health' },
-  { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  desc: 'Analytics' },
+const allNavItems = [
+  { to: '/projects',     label: 'Projects',     icon: FolderSync,       adminOnly: false },
+  { to: '/datasets',     label: 'Datasets',     icon: Database,         adminOnly: false },
+  { to: '/storage',      label: 'Storage',      icon: HardDrive,        adminOnly: false },
+  { to: '/train',        label: 'Train',        icon: Brain,            adminOnly: false },
+  { to: '/jobs',         label: 'Jobs',         icon: ListChecks,       adminOnly: false },
+  { to: '/models',       label: 'Models',       icon: BrainCircuit,     adminOnly: false },
+  { to: '/playground',   label: 'Playground',   icon: FlaskConical,     adminOnly: false },
+  { to: '/api-service',  label: 'API Service',  icon: Zap,              adminOnly: false },
+  { to: '/ray-cluster',    label: 'Ray Cluster',    icon: Server,           adminOnly: false },
+  { to: '/modal-cluster',  label: 'Modal Cluster',  icon: Cloud,            adminOnly: false },
+  { to: '/notebook',     label: 'Notebook',     icon: BookOpen,         adminOnly: false },
+  { to: '/status',       label: 'Status',       icon: Activity,         adminOnly: false },
+  { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  adminOnly: false },
+  { to: '/users',        label: 'Users',        icon: Users,            adminOnly: true  },
 ]
 
 interface SidebarProps {
@@ -25,6 +29,9 @@ interface SidebarProps {
 
 export default function Sidebar({ onCollapsedChange }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false)
+  const roles = (keycloak.tokenParsed as any)?.realm_access?.roles ?? []
+  const isAdmin = roles.includes('platform-admin')
+  const navItems = allNavItems.filter(item => !item.adminOnly || isAdmin)
 
   return (
     <aside
@@ -74,7 +81,7 @@ export default function Sidebar({ onCollapsedChange }: SidebarProps) {
         {!collapsed && (
           <div>
             <div style={{ fontWeight: 800, fontSize: 15, color: 'var(--text-primary)', letterSpacing: '-0.02em', lineHeight: 1.2 }}>
-              MedImage
+              H-Forge
             </div>
             <div style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 1 }}>
               AI Platform
@@ -84,7 +91,7 @@ export default function Sidebar({ onCollapsedChange }: SidebarProps) {
       </div>
 
       {/* Nav Items */}
-      <nav style={{ flex: 1, padding: '12px 10px', display: 'flex', flexDirection: 'column', gap: 3, overflow: 'hidden' }}>
+      <nav style={{ flex: 1, padding: '12px 10px', display: 'flex', flexDirection: 'column', gap: 3, overflowY: 'auto', overflowX: 'hidden' }}>
         {navItems.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
@@ -152,6 +159,87 @@ export default function Sidebar({ onCollapsedChange }: SidebarProps) {
           </div>
         )}
 
+        {/* User + Logout */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: collapsed ? '8px 0' : '8px 10px',
+          borderRadius: 8,
+          background: 'var(--bg-elevated)',
+          justifyContent: collapsed ? 'center' : 'flex-start',
+        }}>
+          <NavLink to="/profile" title="Profile" style={{ display: 'contents', textDecoration: 'none' }}>
+          <div style={{ width: 26, height: 26, borderRadius: '50%',
+            background: 'var(--primary)', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer',
+          }}>
+            <User size={13} color="#fff" />
+          </div>
+          </NavLink>
+          {!collapsed && (
+            <>
+              <div style={{ flex: 1, overflow: 'hidden' }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {keycloak.tokenParsed?.preferred_username ?? keycloak.tokenParsed?.email ?? 'User'}
+                </div>
+                <div style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Authenticated</div>
+              </div>
+              <NavLink
+                to="/profile"
+                title="Profile"
+                style={{ display: 'flex', alignItems: 'center', padding: 4, borderRadius: 6,
+                  color: 'var(--text-muted)', textDecoration: 'none', flexShrink: 0,
+                  transition: 'color 0.12s ease',
+                }}
+                className="logout-btn"
+              >
+                <UserCircle size={14} />
+              </NavLink>
+              <button
+                title="Sign out"
+                onClick={() => keycloak.logout()}
+                style={{
+                  background: 'transparent', border: 'none', cursor: 'pointer',
+                  color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+                  padding: 4, borderRadius: 6, transition: 'color 0.12s ease',
+                  flexShrink: 0,
+                }}
+                className="logout-btn"
+              >
+                <LogOut size={14} />
+              </button>
+            </>
+          )}
+          {collapsed && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center' }}>
+              <NavLink
+                to="/profile"
+                title="Profile"
+                style={{ display: 'flex', alignItems: 'center', padding: 4, borderRadius: 6,
+                  color: 'var(--text-muted)', textDecoration: 'none',
+                  transition: 'color 0.12s ease',
+                }}
+                className="logout-btn"
+              >
+                <UserCircle size={14} />
+              </NavLink>
+              <button
+                title="Sign out"
+                onClick={() => keycloak.logout()}
+                style={{
+                  background: 'transparent', border: 'none', cursor: 'pointer',
+                  color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+                  padding: 4, borderRadius: 6, transition: 'color 0.12s ease',
+                }}
+                className="logout-btn"
+              >
+                <LogOut size={14} />
+              </button>
+            </div>
+          )}
+        </div>
+
         {/* Collapse Button */}
         <button
           onClick={() => setCollapsed(c => { const next = !c; onCollapsedChange?.(next); return next })}
@@ -188,6 +276,9 @@ export default function Sidebar({ onCollapsedChange }: SidebarProps) {
         .collapse-btn:hover {
           background: var(--bg-elevated) !important;
           color: var(--text-primary) !important;
+        }
+        .logout-btn:hover {
+          color: var(--danger, #ef4444) !important;
         }
         .sidebar-nav-item:focus-visible,
         .collapse-btn:focus-visible {

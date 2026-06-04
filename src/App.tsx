@@ -8,9 +8,13 @@ import Jobs from './pages/Jobs'
 import Models from './pages/Models'
 import Notebook from './pages/Notebook'
 import RayCluster from './pages/RayCluster'
+import ModalCluster from './pages/ModalCluster'
 import Storage from './pages/Storage'
 import Status from './pages/Status'
 import Playground from './pages/Playground'
+import ApiService from './pages/ApiService'
+import Users from './pages/Users'
+import Profile from './pages/Profile'
 import Sidebar from './components/Sidebar'
 import './index.css'
 
@@ -56,10 +60,14 @@ function AppInner() {
             <Route path="/models"    element={<Models />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/ray-cluster" element={<RayCluster />} />
+            <Route path="/modal-cluster" element={<ModalCluster />} />
             <Route path="/storage" element={<Storage />} />
             <Route path="/notebook" element={<Notebook />} />
             <Route path="/status" element={<Status />} />
             <Route path="/playground" element={<Playground />} />
+            <Route path="/api-service" element={<ApiService />} />
+            <Route path="/users" element={<Users />} />
+            <Route path="/profile" element={<Profile />} />
           </Routes>
         </main>
       </div>

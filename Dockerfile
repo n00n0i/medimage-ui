@@ -1,4 +1,10 @@
 FROM nginx:alpine
+RUN apk add --no-cache openssl && \
+    mkdir -p /etc/nginx/ssl && \
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout /etc/nginx/ssl/key.pem \
+      -out /etc/nginx/ssl/cert.pem \
+      -subj "/CN=h-forge/O=H-Forge/C=TH"
 COPY dist/ /usr/share/nginx/html/
 # Use sed to substitute __BACKEND_URL__ at container start (avoids envsubst conflicts)
 COPY nginx.conf /etc/nginx/nginx.conf.tmpl

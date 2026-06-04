@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   FlaskConical, Upload, Play, X, Loader2, ImageIcon,
   Zap, CheckCircle2, AlertCircle, ChevronDown, MessageSquare, Eye,
-  Send,
+  Send, History, Trash2, Clock,
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -13,6 +13,9 @@ interface Model {
   training_type: string
   model: string
   engine: string
+  modal_url?: string
+  ray_serve_url?: string
+  inference_provider?: string
 }
 
 interface TextResult {
@@ -22,6 +25,7 @@ interface TextResult {
   tokens_per_second: number
   inference_time_ms: number
   model_name: string
+  simulated?: boolean
 }
 
 interface ClsResult {
@@ -64,6 +68,61 @@ interface SegResult {
 }
 
 type InferenceResult = ClsResult | DetResult | SegResult
+
+// ─── History ─────────────────────────────────────────────────────────────────
+
+interface HistoryEntry {
+  id: string
+  timestamp: number
+  mode: 'image' | 'text' | 'vl'
+  modelId: string
+  modelName: string
+  modelType: string
+  // image
+  imageName?: string
+  imageThumbnail?: string
+  imageResult?: InferenceResult
+  // text / vl
+  systemPrompt?: string
+  userPrompt?: string
+  vlImageThumbnail?: string
+  textResult?: TextResult
+}
+
+const HISTORY_KEY = 'playground_history'
+const MAX_HISTORY = 50
+
+function loadHistory(): HistoryEntry[] {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]') } catch { return [] }
+}
+
+function saveHistory(h: HistoryEntry[]) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, MAX_HISTORY))) } catch { /* quota */ }
+}
+
+async function makeThumbnail(file: File): Promise<string> {
+  return new Promise(resolve => {
+    const img = new Image()
+    const url = URL.createObjectURL(file)
+    img.onload = () => {
+      const maxW = 120, maxH = 80
+      const scale = Math.min(maxW / img.width, maxH / img.height, 1)
+      const c = document.createElement('canvas')
+      c.width = Math.round(img.width * scale)
+      c.height = Math.round(img.height * scale)
+      c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height)
+      URL.revokeObjectURL(url)
+      resolve(c.toDataURL('image/jpeg', 0.7))
+    }
+    img.onerror = () => { URL.revokeObjectURL(url); resolve('') }
+    img.src = url
+  })
+}
+
+function fmtTime(ts: number): string {
+  const d = new Date(ts)
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
 
 // ─── Colours per training type ────────────────────────────────────────────────
 
@@ -203,6 +262,19 @@ export default function Playground() {
   const imgRef    = useRef<HTMLImageElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  // History
+  const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
+  const [historyOpen, setHistoryOpen] = useState(true)
+
+  const deleteHistoryEntry = (id: string) => {
+    setHistory(h => { const next = h.filter(e => e.id !== id); saveHistory(next); return next })
+  }
+  const clearHistory = () => { setHistory([]); saveHistory([]) }
+
+  const pushHistory = (entry: HistoryEntry) => {
+    setHistory(h => { const next = [entry, ...h].slice(0, MAX_HISTORY); saveHistory(next); return next })
+  }
+
   // Fetch completed models
   useEffect(() => {
     setModelsLoading(true)
@@ -215,6 +287,9 @@ export default function Playground() {
           training_type: j.training_type,
           model:         j.model,
           engine:        j.engine,
+          modal_url:          j.modal_url ?? '',
+          ray_serve_url:      j.ray_serve_url ?? '',
+          inference_provider: j.inference_provider ?? '',
         }))
         setModels(ms)
         if (ms.length > 0) setSelectedModel(ms[0])
@@ -251,6 +326,20 @@ export default function Playground() {
       }
       const data = await res.json()
       setTextResult({ ...data, type: 'text' })
+      // push to history
+      const vlThumb = (playMode === 'vl' && vlImageFile) ? await makeThumbnail(vlImageFile) : undefined
+      pushHistory({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        mode: playMode as 'text' | 'vl',
+        modelId: selectedModel.id,
+        modelName: selectedModel.name,
+        modelType: selectedModel.training_type,
+        systemPrompt,
+        userPrompt,
+        vlImageThumbnail: vlThumb,
+        textResult: { ...data, type: 'text' },
+      })
     } catch (e: any) {
       setTextError(e.message ?? 'Inference failed')
     } finally {
@@ -308,6 +397,19 @@ export default function Playground() {
       }
       const data: InferenceResult = await res.json()
       setResult(data)
+      // push to history
+      const thumb = imageFile ? await makeThumbnail(imageFile) : ''
+      pushHistory({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        mode: 'image',
+        modelId: selectedModel.id,
+        modelName: selectedModel.name,
+        modelType: selectedModel.training_type,
+        imageName: imageFile?.name,
+        imageThumbnail: thumb,
+        imageResult: data,
+      })
     } catch (e: any) {
       setError(e.message ?? 'Inference failed')
     } finally {
@@ -409,6 +511,13 @@ export default function Playground() {
                   }}>
                     {TYPE_LABEL[selectedModel.training_type]}
                   </span>
+                  {selectedModel.inference_provider === 'modal' ? (
+                    <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#8b5cf620', color: '#8b5cf6', flexShrink: 0 }}>Modal</span>
+                  ) : selectedModel.inference_provider === 'ray' ? (
+                    <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#f59e0b20', color: '#f59e0b', flexShrink: 0 }}>Ray</span>
+                  ) : (
+                    <span style={{ fontSize: 9, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: 'var(--bg-base)', color: 'var(--text-muted)', flexShrink: 0 }}>Sim</span>
+                  )}
                 </>
               ) : (
                 <span style={{ color: 'var(--text-muted)' }}>No completed models</span>
@@ -450,6 +559,13 @@ export default function Playground() {
                     }}>
                       {TYPE_LABEL[m.training_type]}
                     </span>
+                    {m.inference_provider === 'modal' ? (
+                      <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#8b5cf620', color: '#8b5cf6', flexShrink: 0 }}>Modal</span>
+                    ) : m.inference_provider === 'ray' ? (
+                      <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#f59e0b20', color: '#f59e0b', flexShrink: 0 }}>Ray</span>
+                    ) : (
+                      <span style={{ fontSize: 9, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: 'var(--bg-base)', color: 'var(--text-muted)', flexShrink: 0 }}>Sim</span>
+                    )}
                   </button>
                 ))}
               </div>
@@ -590,6 +706,11 @@ export default function Playground() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <CheckCircle2 size={16} color="#10b981" />
                     <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--text-primary)' }}>Response</span>
+                    {textResult.simulated && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 8, background: '#f59e0b20', color: '#f59e0b' }}>
+                        Simulated
+                      </span>
+                    )}
                   </div>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{textResult.tokens_generated} tokens · {textResult.tokens_per_second.toFixed(0)} tok/s · {textResult.inference_time_ms} ms</span>
                 </div>
@@ -1007,6 +1128,176 @@ export default function Playground() {
           )}
         </div>
       </div>}
+
+      {/* ── History ── */}
+      <div style={{ marginTop: 36 }}>
+        {/* History header */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, marginBottom: historyOpen ? 14 : 0,
+          cursor: 'pointer', userSelect: 'none',
+        }} onClick={() => setHistoryOpen(o => !o)}>
+          <History size={16} style={{ color: 'var(--text-muted)' }} />
+          <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--text-primary)' }}>
+            History
+          </span>
+          {history.length > 0 && (
+            <span style={{
+              fontSize: 11, fontWeight: 700, padding: '1px 7px', borderRadius: 10,
+              background: 'var(--primary-dim)', color: 'var(--primary-hover)',
+            }}>{history.length}</span>
+          )}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            {history.length > 0 && historyOpen && (
+              <button
+                onClick={e => { e.stopPropagation(); clearHistory() }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 5,
+                  padding: '4px 10px', borderRadius: 6, border: '1px solid #ef444440',
+                  background: 'transparent', color: '#ef4444', fontSize: 12, fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                <Trash2 size={12} /> Clear All
+              </button>
+            )}
+            <ChevronDown size={15} style={{ color: 'var(--text-muted)', transform: historyOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
+          </div>
+        </div>
+
+        {historyOpen && (
+          history.length === 0 ? (
+            <div style={{
+              border: '1px dashed var(--border-subtle)', borderRadius: 12,
+              padding: '32px 0', textAlign: 'center', color: 'var(--text-muted)',
+            }}>
+              <Clock size={28} style={{ opacity: 0.2, display: 'block', margin: '0 auto 8px' }} />
+              <span style={{ fontSize: 13 }}>No inference history yet</span>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {history.map(entry => (
+                <div
+                  key={entry.id}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 12,
+                    padding: '10px 14px', borderRadius: 10,
+                    background: 'var(--bg-surface)',
+                    border: '1px solid var(--border-default)',
+                    cursor: 'pointer',
+                    transition: 'border-color 0.15s',
+                  }}
+                  onClick={() => {
+                    // Restore the run into main view
+                    const m = entry.mode === 'image' ? 'image' : entry.mode === 'text' ? 'text' : 'vl'
+                    setPlayMode(m)
+                    const matchedModel = models.find(mm => mm.id === entry.modelId)
+                    if (matchedModel) setSelectedModel(matchedModel)
+                    if (entry.imageResult) { setResult(entry.imageResult); setError(null) }
+                    if (entry.textResult) { setTextResult(entry.textResult); setTextError(null) }
+                    if (entry.userPrompt !== undefined) setUserPrompt(entry.userPrompt)
+                    if (entry.systemPrompt !== undefined) setSystemPrompt(entry.systemPrompt)
+                    window.scrollTo({ top: 0, behavior: 'smooth' })
+                  }}
+                >
+                  {/* Thumbnail or icon */}
+                  {entry.imageThumbnail ? (
+                    <img src={entry.imageThumbnail} alt="" style={{ width: 56, height: 40, objectFit: 'cover', borderRadius: 6, flexShrink: 0, background: '#000' }} />
+                  ) : entry.vlImageThumbnail ? (
+                    <img src={entry.vlImageThumbnail} alt="" style={{ width: 56, height: 40, objectFit: 'cover', borderRadius: 6, flexShrink: 0, background: '#000' }} />
+                  ) : (
+                    <div style={{
+                      width: 56, height: 40, borderRadius: 6, flexShrink: 0,
+                      background: TYPE_COLOR[entry.modelType] + '18',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      <MessageSquare size={16} style={{ color: TYPE_COLOR[entry.modelType] }} />
+                    </div>
+                  )}
+
+                  {/* Info */}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                      <span style={{
+                        fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 4,
+                        background: TYPE_COLOR[entry.modelType] + '20',
+                        color: TYPE_COLOR[entry.modelType],
+                        flexShrink: 0,
+                      }}>
+                        {TYPE_LABEL[entry.modelType] ?? entry.modelType}
+                      </span>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {entry.modelName}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {entry.mode === 'image'
+                        ? entry.imageName ?? 'Image inference'
+                        : entry.userPrompt
+                          ? `"${entry.userPrompt.slice(0, 80)}${entry.userPrompt.length > 80 ? '…' : ''}"`
+                          : 'Text inference'
+                      }
+                    </div>
+                  </div>
+
+                  {/* Result summary */}
+                  <div style={{ flexShrink: 0, textAlign: 'right', minWidth: 90 }}>
+                    {entry.imageResult?.type === 'classification' && (
+                      <div style={{ fontSize: 12, fontWeight: 700, color: '#10b981' }}>
+                        {entry.imageResult.top_label}
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
+                          {(entry.imageResult.top_confidence * 100).toFixed(0)}%
+                        </div>
+                      </div>
+                    )}
+                    {entry.imageResult?.type === 'detection' && (
+                      <div style={{ fontSize: 12, fontWeight: 700, color: '#f59e0b' }}>
+                        {entry.imageResult.count} detections
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
+                          {entry.imageResult.inference_time_ms} ms
+                        </div>
+                      </div>
+                    )}
+                    {entry.imageResult?.type === 'segmentation' && (
+                      <div style={{ fontSize: 12, fontWeight: 700, color: '#10b981' }}>
+                        {entry.imageResult.masks.length} regions
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
+                          {entry.imageResult.inference_time_ms} ms
+                        </div>
+                      </div>
+                    )}
+                    {entry.textResult && (
+                      <div style={{ fontSize: 12, fontWeight: 700, color: '#8b5cf6' }}>
+                        {entry.textResult.tokens_generated} tokens
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
+                          {entry.textResult.tokens_per_second.toFixed(0)} tok/s
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Timestamp */}
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', flexShrink: 0, minWidth: 90, textAlign: 'right' }}>
+                    {fmtTime(entry.timestamp)}
+                  </div>
+
+                  {/* Delete */}
+                  <button
+                    onClick={e => { e.stopPropagation(); deleteHistoryEntry(entry.id) }}
+                    style={{
+                      flexShrink: 0, background: 'transparent', border: 'none', cursor: 'pointer',
+                      color: 'var(--text-muted)', padding: 4, borderRadius: 6,
+                      display: 'flex', alignItems: 'center',
+                    }}
+                    title="Remove from history"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )
+        )}
+      </div>
     </div>
   )
 }

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare } from 'lucide-react'
+import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
 type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'export-edge' | 'self-supervised' | 'llm-text'
@@ -37,6 +37,7 @@ interface TrainingConfig {
   chatTemplate: string
   gradAccum: number
   textDatasetId: string
+  cluster: 'ray' | 'modal'
 }
 
 // ─── Training Matrix ───────────────────────────────────────────────────────────
@@ -235,11 +236,25 @@ export default function TrainModel() {
     chatTemplate: 'alpaca',
     gradAccum: 4,
     textDatasetId: '',
+    cluster: 'ray',
   })
   const [toast, setToast] = useState<{msg: string; type: 'success' | 'error'} | null>(null)
   const [launching, setLaunching] = useState(false)
   const [jobId, setJobId] = useState('')
   const [showAllModels, setShowAllModels] = useState(false)
+  const [clusterStatus, setClusterStatus] = useState<{
+    ray:   { available: boolean; url: string; info: string }
+    modal: { available: boolean; status: string; ray_url: string | null }
+  } | null>(null)
+
+  // Fetch cluster availability when on step 3
+  useEffect(() => {
+    if (step !== 3) return
+    fetch('/api/train/cluster-status', { credentials: 'include' })
+      .then(r => r.json())
+      .then(setClusterStatus)
+      .catch(() => {})
+  }, [step])
 
   // Reset showAllModels when training type changes
   useEffect(() => { setShowAllModels(false) }, [config.trainingType])
@@ -388,6 +403,7 @@ export default function TrainModel() {
           learning_rate: config.learningRate,
           optimizer:     config.optimizer,
           notes:         config.notes,
+          cluster:       config.cluster,
           // LLM fields
           lora_rank:     config.loraRank,
           quantization:  config.quantization,
@@ -859,7 +875,72 @@ export default function TrainModel() {
       {step === 3 && (
         <div>
           <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>Config & Launch</h2>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>ตั้งค่า hyperparameters แล้ว launch training ไปที่ Ray cluster</p>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>ตั้งค่า hyperparameters แล้ว launch training ไปที่ cluster ที่เลือก</p>
+
+          {/* ── Cluster Selector ── */}
+          <div className="card mb-6">
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 12 }}>
+              Training Cluster
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {/* Ray Cluster */}
+              <button
+                onClick={() => set('cluster', 'ray')}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '12px 16px', borderRadius: 10, cursor: 'pointer',
+                  background: config.cluster === 'ray' ? 'var(--primary-dim)' : 'var(--bg-secondary)',
+                  border: `2px solid ${config.cluster === 'ray' ? 'var(--primary)' : 'var(--border)'}`,
+                  textAlign: 'left', width: '100%',
+                }}
+              >
+                <Server size={20} color={config.cluster === 'ray' ? 'var(--primary)' : 'var(--text-muted)'} style={{ flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>Ray Cluster (On-Prem)</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                    {clusterStatus
+                      ? (clusterStatus.ray.available
+                          ? <span style={{ color: 'var(--success)' }}>● Connected — {clusterStatus.ray.url}</span>
+                          : <span style={{ color: 'var(--error)' }}>● Unavailable — {clusterStatus.ray.info}</span>)
+                      : <span style={{ color: 'var(--text-muted)' }}>Checking...</span>}
+                  </div>
+                </div>
+                {config.cluster === 'ray' && <CheckCircle size={16} color="var(--primary)" style={{ flexShrink: 0 }} />}
+              </button>
+
+              {/* Modal Cluster */}
+              <button
+                onClick={() => {
+                  if (clusterStatus && !clusterStatus.modal.available) {
+                    showToast('Modal cluster is not running — start it in Modal Cluster page first', 'error')
+                    return
+                  }
+                  set('cluster', 'modal')
+                }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '12px 16px', borderRadius: 10, cursor: 'pointer',
+                  background: config.cluster === 'modal' ? 'rgba(139,92,246,0.08)' : 'var(--bg-secondary)',
+                  border: `2px solid ${config.cluster === 'modal' ? 'rgba(139,92,246,0.6)' : 'var(--border)'}`,
+                  textAlign: 'left', width: '100%',
+                  opacity: (clusterStatus && !clusterStatus.modal.available) ? 0.6 : 1,
+                }}
+              >
+                <Cloud size={20} color={config.cluster === 'modal' ? '#8b5cf6' : 'var(--text-muted)'} style={{ flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>Modal Cluster (Cloud GPU)</div>
+                  <div style={{ fontSize: 11, marginTop: 2 }}>
+                    {clusterStatus
+                      ? (clusterStatus.modal.available
+                          ? <span style={{ color: 'var(--success)' }}>● Running</span>
+                          : <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — start in Modal Cluster page</span>)
+                      : <span style={{ color: 'var(--text-muted)' }}>Checking...</span>}
+                  </div>
+                </div>
+                {config.cluster === 'modal' && <CheckCircle size={16} color="#8b5cf6" style={{ flexShrink: 0 }} />}
+              </button>
+            </div>
+          </div>
 
           {/* Re-train banner */}
           {retrainSource && (

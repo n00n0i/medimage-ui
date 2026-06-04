@@ -30,7 +30,7 @@ interface ServiceDef {
 const SERVICES: ServiceDef[] = [
   {
     id: 'api',
-    label: 'MedImage API',
+    label: 'H-Forge API',
     description: 'Training & jobs backend',
     containerName: 'medimage-medimage-api-1',
     portLabel: ':8000',
@@ -96,16 +96,11 @@ async function probe(
 // ── Individual service checks ─────────────────────────────────────────────
 
 async function checkApi(): Promise<{ ok: boolean; ms: number; detail: string | null }> {
-  const { ok, ms, body } = await probe('/api/jobs')
-  const count = Array.isArray(body?.jobs) ? body.jobs.length : null
+  const { ok, ms } = await probe('/api/health')
   return {
     ok,
     ms,
-    detail: ok
-      ? count !== null
-        ? `FastAPI · ${count} job${count !== 1 ? 's' : ''} in DB`
-        : 'FastAPI · SQLite'
-      : null,
+    detail: ok ? 'FastAPI · SQLite' : null,
   }
 }
 

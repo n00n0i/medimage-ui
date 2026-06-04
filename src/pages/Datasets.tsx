@@ -16,7 +16,6 @@ interface HFDataset {
 
 const LS_API   = '/api/ls'
 const LS_TOKEN = 'medimage-ls-token-2026'
-const LS_BASE  = 'http://localhost:8085'
 
 interface LSProject {
   id: number
@@ -54,13 +53,6 @@ interface TextDataset {
   preview?: any[]
 }
 
-async function fetchLSCreds(): Promise<{ email: string; password: string } | null> {
-  try {
-    const r = await fetch('/api/ls-config')
-    return r.ok ? await r.json() : null
-  } catch { return null }
-}
-
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { cls: string; icon: React.ReactNode; label: string }> = {
     completed: { cls: 'badge badge-success', icon: <CheckCircle2 size={11} />, label: 'Synced'  },
@@ -72,9 +64,12 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={c.cls}>{c.icon}{c.label}</span>
 }
 
+// Module-level cache: persists data across navigations so no flicker on re-visit
+let _datasetsCache: Dataset[] = []
+
 export default function Datasets() {
-  const [loading,  setLoading]  = useState(true)
-  const [datasets, setDatasets] = useState<Dataset[]>([])
+  const [loading,  setLoading]  = useState(_datasetsCache.length === 0)
+  const [datasets, setDatasets] = useState<Dataset[]>(_datasetsCache)
   const [syncing,  setSyncing]  = useState<Set<number>>(new Set())
   const [toast,    setToast]    = useState<{ msg: string; type: string } | null>(null)
   const [tab, setTab] = useState<'image' | 'text'>('image')
@@ -91,7 +86,7 @@ export default function Datasets() {
   }
 
   const fetchDatasets = useCallback(async () => {
-    setLoading(true)
+    if (_datasetsCache.length === 0) setLoading(true)
     try {
       const projRes = await axios.get(`${LS_API}/projects/`, {
         headers: { Authorization: `Token ${LS_TOKEN}` },
@@ -129,6 +124,7 @@ export default function Datasets() {
         }
       }))
 
+      _datasetsCache = results
       setDatasets(results)
     } catch (e: any) {
       showToast(`Error: ${e.message}`, 'error')
@@ -187,37 +183,9 @@ export default function Datasets() {
   const fmtBytes = (b: number) =>
     b < 1024 ? `${b} B` : b < 1024 * 1024 ? `${(b/1024).toFixed(1)} KB` : `${(b/1024/1024).toFixed(1)} MB`
 
-  const openInLS = useCallback(async (projectId: number) => {
-    // Use unique name to avoid cross-origin reuse of a previous ls-N popup.
-    const win = window.open('about:blank', `ls-${projectId}-${Date.now()}`)
-    if (!win) return
-    try {
-      const creds = await fetchLSCreds()
-      if (!creds?.password) {
-        win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
-        return
-      }
-      // Step 1: GET login page via nginx proxy (same-origin) → sets csrftoken cookie for localhost
-      const html = await fetch('/api/ls-login/').then(r => r.text())
-      const csrf = html.match(/name="csrfmiddlewaretoken"\s+value="([^"]+)"/)?.[1]
-      if (!csrf) throw new Error('CSRF not found')
-      // Step 2: POST login via nginx proxy (same-origin) → sets sessionid cookie for localhost
-      // Cookies are host-only for 'localhost' (port-agnostic per RFC 6265),
-      // so sessionid will be sent to localhost:8085 as well.
-      await fetch('/api/ls-login/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          csrfmiddlewaretoken: csrf,
-          email: creds.email,
-          password: creds.password,
-        }).toString(),
-      })
-      // Step 3: Navigate popup to LS — sessionid cookie is valid for all localhost ports
-      win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
-    } catch {
-      win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
-    }
+  const openInLS = useCallback((projectId: number) => {
+    // Backend handles LS login server-side, sets sessionid cookie, then redirects to LS
+    window.open(`/api/ls-goto/${projectId}`, `ls-${projectId}-${Date.now()}`)
   }, [])
 
   const syncAll = async (ds: Dataset) => {
@@ -250,16 +218,18 @@ export default function Datasets() {
             {tab === 'image' ? 'Label Studio annotation projects — datasets backed by MinIO S3' : 'Text & Instruction datasets for LLM/VLM fine-tuning'}
           </p>
         </div>
-        <button className="btn btn-secondary btn-sm" onClick={tab === 'image' ? fetchDatasets : fetchTextDatasets}>
-          <RefreshCw size={14} />Refresh
-        </button>
-        <button
-          className="btn btn-primary btn-sm"
-          style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#f97316', borderColor: '#f97316' }}
-          onClick={() => setShowHFImport(true)}
-        >
-          <Package size={14} /> Import from HuggingFace
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button className="btn btn-secondary btn-sm" onClick={tab === 'image' ? fetchDatasets : fetchTextDatasets} disabled={loading || textLoading}>
+            <RefreshCw size={14} />Refresh
+          </button>
+          <button
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            onClick={() => setShowHFImport(true)}
+          >
+            <Package size={14} /> Import from HuggingFace
+          </button>
+        </div>
       </div>
 
       {/* Tab switcher */}
@@ -410,7 +380,7 @@ export default function Datasets() {
       {/* ── Image Datasets Tab ── */}
       {tab === 'image' && (
         <>
-        {loading ? (
+        {loading && datasets.length === 0 ? (
           <div className="flex items-center justify-center h-64"><div className="loading-spinner" /></div>
         ) : datasets.length === 0 ? (
           <div style={{ textAlign: 'center', padding: '64px 0', color: 'var(--text-muted)' }}>

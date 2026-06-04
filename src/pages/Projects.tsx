@@ -9,15 +9,6 @@ import {
 
 const LS_API   = '/api/ls'
 const LS_TOKEN = 'medimage-ls-token-2026'
-const LS_BASE  = 'http://localhost:8085'
-
-async function fetchLSCreds(): Promise<{ email: string; password: string } | null> {
-  try {
-    const r = await fetch('/api/ls-config')
-    if (!r.ok) return null
-    return await r.json()
-  } catch { return null }
-}
 
 function deriveBucket(title: string, fallback: string) {
   return title.replace(/-bucket$/i, '').toLowerCase() || fallback
@@ -57,9 +48,12 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={c.cls}>{c.icon}{c.label}</span>
 }
 
+// Module-level cache: persists data across navigations so no flicker on re-visit
+let _projectsCache: Project[] = []
+
 export default function Projects() {
-  const [projects,    setProjects]    = useState<Project[]>([])
-  const [loading,     setLoading]     = useState(true)
+  const [projects,    setProjects]    = useState<Project[]>(_projectsCache)
+  const [loading,     setLoading]     = useState(_projectsCache.length === 0)
   const [expanded,    setExpanded]    = useState<number | null>(null)
   const [toasts,      setToasts]      = useState<Toast[]>([])
   const [showCreate,  setShowCreate]  = useState(false)
@@ -75,38 +69,15 @@ export default function Projects() {
   const [newBucketInline, setNewBucketInline] = useState('')
   const [creatingBucket,  setCreatingBucket]  = useState(false)
 
-  const openInLS = useCallback(async (projectId: number) => {
-    // Open popup before any await to pass browser popup-blocker check.
-    // Use unique name to avoid cross-origin reuse of a previous ls-N popup.
-    const win = window.open('about:blank', `ls-${projectId}-${Date.now()}`)
-    if (!win) return
-    try {
-      const creds = await fetchLSCreds()
-      if (!creds?.password) {
-        win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
-        return
-      }
-      // Step 1: GET login page via nginx proxy (same-origin) → sets csrftoken cookie for localhost
-      const html = await fetch('/api/ls-login/').then(r => r.text())
-      const csrf = html.match(/name="csrfmiddlewaretoken"\s+value="([^"]+)"/)?.[1]
-      if (!csrf) throw new Error('CSRF not found')
-      // Step 2: POST login via nginx proxy (same-origin) → sets sessionid cookie for localhost
-      // Cookies are host-only for 'localhost' (port-agnostic per RFC 6265),
-      // so sessionid will be sent to localhost:8085 as well.
-      await fetch('/api/ls-login/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          csrfmiddlewaretoken: csrf,
-          email: creds.email,
-          password: creds.password,
-        }).toString(),
-      })
-      // Step 3: Navigate popup to LS — sessionid cookie is valid for all localhost ports
-      win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
-    } catch {
-      win.location.href = `${LS_BASE}/projects/${projectId}/settings/`
-    }
+  const openInLS = useCallback((projectId: number) => {
+    // Use <a target="_blank"> so VS Code built-in browser opens in external browser
+    const a = document.createElement('a')
+    a.href = `/api/ls-goto/${projectId}`
+    a.target = '_blank'
+    a.rel = 'noopener noreferrer'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
   }, [])
 
   const toast = useCallback((msg: string, type: Toast['type']) => {
@@ -142,7 +113,7 @@ export default function Projects() {
   }, [])
 
   const fetchProjects = useCallback(async () => {
-    setLoading(true)
+    if (_projectsCache.length === 0) setLoading(true)
     try {
       const lsRes = await axios.get(`${LS_API}/projects/`, {
         headers: { Authorization: `Token ${LS_TOKEN}` },
@@ -151,6 +122,7 @@ export default function Projects() {
       const list: Project[] = await Promise.all(
         raw.map((p: any) => enrichProject(p.id, p.title || `Project ${p.id}`))
       )
+      _projectsCache = list
       setProjects(list)
     } catch (e: any) {
       toast(`Error loading projects: ${e.message}`, 'error')
@@ -295,7 +267,7 @@ export default function Projects() {
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 3 }}>Label Studio annotation projects · synced from MinIO</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-secondary btn-sm" onClick={fetchProjects}><RefreshCw size={14} />Refresh</button>
+          <button className="btn btn-secondary btn-sm" onClick={fetchProjects} disabled={loading}><RefreshCw size={14} />Refresh</button>
           <button className="btn btn-primary btn-sm" onClick={() => {
             setShowCreate(true)
             setSelectedBuckets([])
@@ -341,8 +313,8 @@ export default function Projects() {
         </div>
       )}
 
-      {/* Skeleton */}
-      {loading && (
+      {/* Skeleton — only on first load */}
+      {loading && projects.length === 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
           {[1, 2, 3].map(i => (
             <div key={i} className="card" style={{ padding: '20px' }}>

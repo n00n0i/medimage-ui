@@ -21,7 +21,7 @@ export default function Navbar() {
           <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center">
             <span className="text-white font-bold text-sm">MI</span>
           </div>
-          <span className="font-semibold text-gray-100">MedImage</span>
+          <span className="font-semibold text-gray-100">H-Forge</span>
         </div>
         {navItems.map(({ to, label, icon: Icon }) => (
           <NavLink

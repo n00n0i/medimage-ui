@@ -31,8 +31,8 @@ services:
     volumes:
       - minio-data:/data
     ports:
+      - "9000:9000"   # MinIO S3 API (needed by Ray cluster workers)
       - "9001:9001"   # MinIO Console (browser-accessible)
-      # port 9000 ไม่ expose ออกไปตรงๆ — ใช้ผ่าน nginx proxy /api/minio แทน
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
