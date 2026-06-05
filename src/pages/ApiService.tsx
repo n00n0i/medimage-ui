@@ -217,6 +217,8 @@ export default function ApiService() {
   }
 
   const deleteKey = (id: string) => {
+    const key = apiKeys.find(k => k.id === id)
+    if (!confirm(`Revoke API key "${key?.name ?? id}"?\n\nKey นี้จะใช้งานไม่ได้ทันที`)) return
     const updated = apiKeys.filter(k => k.id !== id)
     setApiKeys(updated)
     saveKeys(updated)

@@ -1,6 +1,20 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search, Cloud, Wifi, WifiOff, Save, Eye, EyeOff, Globe, StopCircle } from 'lucide-react'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search, Cloud, Wifi, WifiOff, Save, Eye, EyeOff, Globe, StopCircle, Copy, Check } from 'lucide-react'
+
+function CopyLogButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      title="Copy logs"
+      onClick={() => { navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000) }) }}
+      style={{ position: 'absolute', top: 4, right: 4, background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', borderRadius: 4, padding: '2px 5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3, color: copied ? '#10b981' : 'var(--text-muted)', fontSize: 10 }}
+    >
+      {copied ? <Check size={10} /> : <Copy size={10} />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  )
+}
 
 interface HFModel {
   id: string
@@ -275,6 +289,7 @@ export default function Models() {
   }
 
   const deleteSelected = async () => {
+    if (!confirm(`ลบ ${selected.size} model ที่เลือก?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
     setDeletingBulk(true)
     await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}?from_view=models`, { method: 'DELETE' })))
     setSelected(new Set())
@@ -637,6 +652,21 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
       .then(setDetail)
   }, [modelId])
 
+  const downloadWeights = async () => {
+    try {
+      const res = await fetch(`/api/jobs/${modelId}/download-weights`)
+      if (!res.ok) throw new Error((await res.json()).detail || 'Download failed')
+      const { url, filename } = await res.json()
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.target = '_blank'
+      a.click()
+    } catch (e: any) {
+      alert(`Download failed: ${e.message}`)
+    }
+  }
+
   if (!detail) return (
     <div style={{ padding: '12px 20px 16px', borderTop: '1px solid var(--border-subtle)', color: 'var(--text-muted)', fontSize: 12 }}>
       <Loader size={13} className="animate-spin" style={{ display: 'inline-block', marginRight: 8 }} />Loading...
@@ -680,6 +710,11 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
         <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onRetrain}>
           <RotateCcw size={13} /> Re-train
         </button>
+        {detail.s3_weights_path && (
+          <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--primary)', borderColor: 'var(--primary)' }} onClick={downloadWeights}>
+            <Download size={13} /> Download Weights
+          </button>
+        )}
         <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onLog}>
           <Terminal size={13} /> View Log
         </button>
@@ -869,7 +904,10 @@ function RayServeTab({ rayUrl, setRayUrl, onAutoSave, modelId }: {
             )}
           </div>
           {showModelLogs && modelDeployLogs.length > 0 && (
-            <pre style={{ margin: '8px 0 0', padding: '6px 8px', fontSize: 10, lineHeight: 1.5, borderRadius: 6, background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', maxHeight: 120, overflowY: 'auto', border: '1px solid var(--border-subtle)' }}>{modelDeployLogs.join('\n')}</pre>
+            <div style={{ position: 'relative', margin: '8px 0 0' }}>
+              <pre style={{ margin: 0, padding: '6px 8px', fontSize: 10, lineHeight: 1.5, borderRadius: 6, background: 'var(--bg-base)', color: modelDeployStatus === 'error' ? '#ef4444' : 'var(--text-secondary)', fontFamily: 'var(--font-mono)', maxHeight: 120, overflowY: 'auto', border: `1px solid ${modelDeployStatus === 'error' ? '#ef444440' : 'var(--border-subtle)'}` }}>{modelDeployLogs.join('\n')}</pre>
+              <CopyLogButton text={modelDeployLogs.join('\n')} />
+            </div>
           )}
         </div>
       )}

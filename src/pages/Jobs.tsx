@@ -1,6 +1,6 @@
 
 import { useState, useEffect, useRef } from 'react'
-import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square } from 'lucide-react'
+import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square, Wifi, Database, Send, Brain, Save, Package, ShieldCheck, RotateCcw, Copy, Check } from 'lucide-react'
 import GpuMonitor from '../components/GpuMonitor'
 
 interface Job {
@@ -11,6 +11,7 @@ interface Job {
   engine: string
   status: 'queued' | 'running' | 'completed' | 'error'
   progress: number
+  pipeline_step: string
   created_at: number | null
   started_at: number | null
   finished_at: number | null
@@ -20,9 +21,92 @@ interface Job {
   batch_size: number
 }
 
+// Pipeline definitions per job type
+type StepDef = { key: string; label: string; icon: React.ElementType }
+
+const TRAIN_STEPS: StepDef[] = [
+  { key: 'connect',  label: 'Connect',        icon: Wifi },
+  { key: 'export',   label: 'Export Dataset', icon: Database },
+  { key: 'submit',   label: 'Submit',         icon: Send },
+  { key: 'training', label: 'Training',       icon: Brain },
+  { key: 'saving',   label: 'Save Weights',   icon: Save },
+  { key: 'done',     label: 'Done',           icon: CheckCircle2 },
+]
+
+const IMPORT_STEPS: StepDef[] = [
+  { key: 'validate', label: 'Validate',  icon: ShieldCheck },
+  { key: 'register', label: 'Register',  icon: Package },
+  { key: 'done',     label: 'Done',      icon: CheckCircle2 },
+]
+
+function getPipelineSteps(job: Job): StepDef[] {
+  // import jobs have source = 'pretrained' or training_type = 'import'
+  if (job.training_type === 'import' || ['validate', 'register'].includes(job.pipeline_step)) {
+    return IMPORT_STEPS
+  }
+  return TRAIN_STEPS
+}
+
+function PipelineStepper({ job }: { job: Job }) {
+  const steps = getPipelineSteps(job)
+  const currentKey = job.pipeline_step || (job.status === 'queued' ? '' : '')
+  const currentIdx = steps.findIndex(s => s.key === currentKey)
+  // If completed → all done; if error → highlight current as error
+  const allDone = job.status === 'completed'
+  const hasError = job.status === 'error'
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 0, marginBottom: 12, flexWrap: 'wrap' }}>
+      {steps.map((step, i) => {
+        const isDone = allDone || (currentIdx >= 0 && i < currentIdx)
+        const isCurrent = !allDone && currentIdx === i
+        const isError = hasError && isCurrent
+
+        let dotColor = 'var(--text-muted)'
+        let labelColor = 'var(--text-muted)'
+        let borderColor = 'var(--border-subtle)'
+        if (isDone) { dotColor = 'var(--success, #22c55e)'; borderColor = 'var(--success, #22c55e)'; labelColor = 'var(--success, #22c55e)' }
+        if (isCurrent && !isError) { dotColor = 'var(--primary)'; borderColor = 'var(--primary)'; labelColor = 'var(--primary)' }
+        if (isError) { dotColor = 'var(--danger)'; borderColor = 'var(--danger)'; labelColor = 'var(--danger)' }
+
+        const Icon = step.icon
+
+        return (
+          <div key={step.key} style={{ display: 'flex', alignItems: 'center' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+              <div style={{
+                width: 28, height: 28, borderRadius: '50%',
+                border: `2px solid ${borderColor}`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: isDone ? borderColor : isCurrent ? `${borderColor}20` : 'transparent',
+                transition: 'all 0.25s ease',
+              }}>
+                {isCurrent && !isError
+                  ? <Loader size={13} color={dotColor} className="animate-spin" />
+                  : <Icon size={13} color={isDone ? '#fff' : dotColor} />
+                }
+              </div>
+              <span style={{ fontSize: 10, color: labelColor, whiteSpace: 'nowrap', fontWeight: isCurrent ? 600 : 400 }}>
+                {step.label}
+              </span>
+            </div>
+            {i < steps.length - 1 && (
+              <div style={{
+                width: 24, height: 2, marginBottom: 14, flexShrink: 0,
+                background: isDone ? 'var(--success, #22c55e)' : 'var(--border-subtle)',
+                transition: 'background 0.25s ease',
+              }} />
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 const STATUS_CONFIG = {
-  queued:    { icon: Clock,        color: 'text-gray-400',   badge: 'badge-warning', label: 'Queued'    },
-  running:   { icon: Loader,       color: 'text-blue-400',   badge: 'badge-primary', label: 'Running'   },
+  queued:    { icon: Clock,        color: 'text-gray-400',  badge: 'badge-warning', label: 'Queued'    },
+  running:   { icon: Loader,       color: 'text-blue-400',  badge: 'badge-primary', label: 'Running'   },
   completed: { icon: CheckCircle2, color: 'text-green-400', badge: 'badge-success', label: 'Completed' },
   error:     { icon: XCircle,      color: 'text-red-400',   badge: 'badge-danger',  label: 'Failed'    },
 }
@@ -48,6 +132,8 @@ export default function Jobs() {
   const [filter, setFilter] = useState<string>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [deletingBulk, setDeletingBulk] = useState(false)
+  const [retrying, setRetrying] = useState<Set<string>>(new Set())
+  const [copiedError, setCopiedError] = useState<string | null>(null)
   const [logJob, setLogJob] = useState<{id: string; name: string} | null>(null)
   const [logText, setLogText] = useState<string>('')
   const [logLoading, setLogLoading] = useState(false)
@@ -99,9 +185,22 @@ export default function Jobs() {
   }
 
   const deleteJob = async (jobId: string) => {
+    const job = jobs.find((j: Job) => j.id === jobId)
+    if (!confirm(`ลบ job "${job?.name ?? jobId}"?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
     await fetch(`/api/jobs/${jobId}?from_view=jobs`, { method: 'DELETE' })
     setSelected(prev => { const s = new Set(prev); s.delete(jobId); return s })
     fetchJobs(true)
+  }
+
+  const retryJob = async (jobId: string) => {
+    setRetrying(prev => new Set([...prev, jobId]))
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/retry`, { method: 'POST' })
+      if (!res.ok) throw new Error(await res.text())
+      await fetchJobs(true)
+    } finally {
+      setRetrying(prev => { const s = new Set(prev); s.delete(jobId); return s })
+    }
   }
 
   const toggleSelect = (id: string) => {
@@ -119,6 +218,7 @@ export default function Jobs() {
   }
 
   const deleteSelected = async () => {
+    if (!confirm(`ลบ ${selected.size} job ที่เลือก?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
     setDeletingBulk(true)
     await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}?from_view=jobs`, { method: 'DELETE' })))
     setSelected(new Set())
@@ -258,24 +358,25 @@ export default function Jobs() {
                   <span className={`badge ${cfg.badge} flex-shrink-0`}>{cfg.label}</span>
                 </div>
 
-                {/* Progress bar */}
-                {job.status === 'running' && (
-                  <div className="mb-3">
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
-                      <span>Progress</span>
-                      <span style={{ color: 'var(--primary-hover)', fontWeight: 500 }}>{job.progress}%</span>
-                    </div>
-                    <div className="progress-bar">
-                      <div className="progress-bar-fill" style={{ width: `${job.progress}%` }} />
-                    </div>
-                  </div>
+                {/* Pipeline stepper for running / completed / error */}
+                {(job.status === 'running' || job.status === 'completed' || (job.status === 'error' && job.pipeline_step)) && (
+                  <PipelineStepper job={job} />
                 )}
 
                 {/* Error message */}
                 {job.status === 'error' && job.error && (
                   <div style={{ marginBottom: 12, background: 'var(--danger-dim)', borderRadius: 8, padding: '10px 12px' }}>
-                    <div style={{ fontSize: 12, color: 'var(--danger)', fontWeight: 500, marginBottom: 4 }}>Error</div>
-                    <div style={{ fontSize: 12, color: 'var(--danger)' }}>{job.error}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <div style={{ fontSize: 12, color: 'var(--danger)', fontWeight: 500 }}>Error</div>
+                      <button
+                        onClick={() => { navigator.clipboard.writeText(job.error!); setCopiedError(job.id); setTimeout(() => setCopiedError(null), 2000) }}
+                        title="Copy error"
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 4, color: copiedError === job.id ? 'var(--success, #22c55e)' : 'var(--danger)', display: 'flex', alignItems: 'center' }}
+                      >
+                        {copiedError === job.id ? <Check size={13} /> : <Copy size={13} />}
+                      </button>
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--danger)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{job.error}</div>
                   </div>
                 )}
 
@@ -302,6 +403,17 @@ export default function Jobs() {
                   >
                     Ray Dashboard
                   </a>
+                  {job.status === 'error' && (
+                    <button
+                      className="btn btn-sm"
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--warning, #f59e0b)', color: '#fff', border: 'none' }}
+                      onClick={() => retryJob(job.id)}
+                      disabled={retrying.has(job.id)}
+                    >
+                      {retrying.has(job.id) ? <Loader size={13} className="animate-spin" /> : <RotateCcw size={13} />}
+                      Retry
+                    </button>
+                  )}
                   {job.status !== 'running' && (
                     <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={() => deleteJob(job.id)}>
                       <Trash2 size={13} /> Delete

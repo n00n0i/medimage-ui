@@ -3,7 +3,7 @@ import axios from 'axios'
 import {
   Database, RefreshCw, ExternalLink, CheckCircle2, XCircle,
   AlertCircle, Loader2, HardDrive, FolderSync, Upload, FileText, Trash2,
-  Search, Package,
+  Search, Package, Wand2, X,
 } from 'lucide-react'
 
 interface HFDataset {
@@ -79,6 +79,10 @@ export default function Datasets() {
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [showHFImport, setShowHFImport] = useState(false)
+  const [autoLabelProject, setAutoLabelProject] = useState<Dataset | null>(null)
+  const [autoLabelEngine, setAutoLabelEngine] = useState('Ultralytics')
+  const [autoLabelModel, setAutoLabelModel] = useState('yolov8s.pt')
+  const [autoLabeling, setAutoLabeling] = useState(false)
 
   const showToast = (msg: string, type = 'success') => {
     setToast({ msg, type })
@@ -208,6 +212,34 @@ export default function Datasets() {
     d ? new Date(d).toLocaleString('th-TH', {
       day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
     }) : '—'
+
+  const AUTO_LABEL_PRESETS = [
+    { engine: 'Ultralytics', model: 'yolov8s.pt',                     label: 'YOLOv8-Small (General)'         },
+    { engine: 'Ultralytics', model: 'yolov8n.pt',                     label: 'YOLOv8-Nano (Fast/Edge)'        },
+    { engine: 'HuggingFace', model: 'facebook/detr-resnet-50',        label: 'DETR ResNet-50'                 },
+    { engine: 'MedSAM',      model: 'medsam_vit_b',                   label: 'MedSAM (Medical Segmentation)'  },
+    { engine: 'HuggingFace', model: 'microsoft/rad-dino',             label: 'RAD-DINO (Radiology)'           },
+  ]
+
+  const runAutoLabel = async () => {
+    if (!autoLabelProject) return
+    setAutoLabeling(true)
+    try {
+      const res = await axios.post(`/api/autolabel/${autoLabelProject.projectId}`, {
+        project_id: autoLabelProject.projectId,
+        model: autoLabelModel,
+        engine: autoLabelEngine,
+        task_ids: [],
+      }, { withCredentials: true })
+      showToast(`Auto-label เสร็จ: ${res.data.labeled}/${res.data.total} tasks`, 'success')
+      setAutoLabelProject(null)
+      fetchDatasets()
+    } catch (e: any) {
+      showToast(e?.response?.data?.detail || 'Auto-label failed', 'error')
+    } finally {
+      setAutoLabeling(false)
+    }
+  }
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -468,6 +500,14 @@ export default function Datasets() {
                 >
                   <ExternalLink size={12} />Open in LS
                 </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  style={{ flex: 1 }}
+                  title="Auto-generate pre-annotations with a pre-trained model"
+                  onClick={() => { setAutoLabelProject(ds); setAutoLabelEngine('Ultralytics'); setAutoLabelModel('yolov8s.pt') }}
+                >
+                  <Wand2 size={12} />Auto-label
+                </button>
               </div>
             </div>
           )
@@ -475,6 +515,50 @@ export default function Datasets() {
       </div>
       )}
       </>
+      )}
+
+      {/* Auto-label modal */}
+      {autoLabelProject && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div className="card" style={{ width: 440, padding: 24 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Wand2 size={18} style={{ color: 'var(--primary)' }} />
+                <h3 style={{ fontWeight: 600 }}>Auto-label</h3>
+              </div>
+              <button className="btn btn-secondary btn-sm" onClick={() => setAutoLabelProject(null)}><X size={14} /></button>
+            </div>
+            <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
+              Generate pre-annotations สำหรับ <strong>{autoLabelProject.projectTitle}</strong> ด้วย pre-trained model
+            </p>
+            <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>เลือก Model</label>
+            <select
+              className="input"
+              style={{ marginBottom: 16 }}
+              value={`${autoLabelEngine}|${autoLabelModel}`}
+              onChange={e => {
+                const [eng, mdl] = e.target.value.split('|')
+                setAutoLabelEngine(eng)
+                setAutoLabelModel(mdl)
+              }}
+            >
+              {AUTO_LABEL_PRESETS.map(p => (
+                <option key={`${p.engine}|${p.model}`} value={`${p.engine}|${p.model}`}>{p.label}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16, padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: 6 }}>
+              Engine: <strong>{autoLabelEngine}</strong> · Model: <code style={{ fontSize: 11 }}>{autoLabelModel}</code>
+              <br />
+              จะ generate pre-annotations สำหรับทุก task ที่ยังไม่มี annotation
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setAutoLabelProject(null)} disabled={autoLabeling}>Cancel</button>
+              <button className="btn btn-primary" style={{ flex: 1 }} onClick={runAutoLabel} disabled={autoLabeling}>
+                {autoLabeling ? <><Loader2 size={14} className="animate-spin" />Running…</> : <><Wand2 size={14} />Start Auto-label</>}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {showHFImport && (

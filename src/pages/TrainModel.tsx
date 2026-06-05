@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { Brain, Cpu, Sparkles, Database, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle } from 'lucide-react'
+import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
-type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'export-edge' | 'self-supervised' | 'llm-text'
+type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
 type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
 type TargetType  = 'prelabel' | 'finetune' | 'export'
 
@@ -15,6 +15,7 @@ interface TrainOption {
   hardware: string
   description: string
   compatible: boolean
+  zeroShot?: boolean
 }
 
 interface TrainingConfig {
@@ -54,6 +55,11 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'vit-b',      label: 'ViT-Base (Vision Transformer)', engine: 'TIMM',      model: 'vit_base_patch16_224',          hardware: 'GPU 12GB+',    description: 'Pure transformer — เหมาะกับ dataset ขนาดใหญ่, multi-class defect',          compatible: false },
     { value: 'dino-s',     label: 'DINOv2-Small',                engine: 'TIMM',        model: 'vit_small_patch14_dinov2',      hardware: 'GPU 8GB+',     description: 'Self-supervised feature backbone — few-shot classification, anomaly detection', compatible: true },
     { value: 'efficientvit', label: 'EfficientViT-M5',           engine: 'TIMM',        model: 'efficientvit_m5',               hardware: 'GPU 6GB+',     description: 'Ultra-fast edge transformer — real-time line inspection, <1ms latency',       compatible: true  },
+    // ── Medical pre-trained ─────────────────────────────────────────────────────
+    { value: 'rad-dino',   label: 'RAD-DINO (Radiology)',        engine: 'HuggingFace', model: 'microsoft/rad-dino',            hardware: 'GPU 8GB+',     description: 'Pre-trained บน 1M+ chest X-ray (CheXpert, MIMIC) — fine-tune ได้สำหรับ X-ray classification', compatible: true  },
+    { value: 'txrv-densenet', label: 'CheXNet DenseNet121',      engine: 'PyTorch',     model: 'densenet121-res224-all',        hardware: 'GPU 6GB+',     description: 'Pre-trained บน 800k+ chest X-ray (TorchXRayVision) — pneumonia, effusion, nodule', compatible: true  },
+    { value: 'uni-pathology', label: 'UNI (Pathology ViT-L)',    engine: 'HuggingFace', model: 'MahmoodLab/UNI',               hardware: 'GPU 16GB+',    description: 'Pre-trained บน 100k+ pathology slides (TCGA) — tissue classification, cancer grading', compatible: false },
+    { value: 'monai-densenet', label: 'MONAI DenseNet121',        engine: 'MONAI',       model: 'monai-densenet121',             hardware: 'GPU 8GB+',     description: 'MONAI medical classification — CT/MRI/X-ray, auto-handle DICOM & NIfTI format',  compatible: true  },
   ],
 
   // ── Object Detection ─────────────────────────────────────────────────────────
@@ -64,21 +70,19 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'yolonano',   label: 'YOLOv8-Nano',                engine: 'Ultralytics', model: 'yolov8n.pt',                    hardware: 'CPU / Edge',   description: 'Edge-optimized — Jetson Orin, Hailo, industrial smart camera',               compatible: true  },
     { value: 'yolov9-c',   label: 'YOLOv9-C',                   engine: 'Ultralytics', model: 'yolov9c.pt',                    hardware: 'GPU 12GB+',    description: 'Programmable gradient — better small defect detection vs YOLOv8',            compatible: false },
     { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: false },
-    { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
-    { value: 'grounding',  label: 'Grounding DINO',             engine: 'HuggingFace', model: 'IDEA-Research/grounding-dino-base', hardware: 'GPU 12GB+', description: 'Open-vocabulary detection — detect any object with text prompt',             compatible: false },
+    { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet-50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
   segmentation: [
-    { value: 'sam-b',      label: 'SAM-Base',                   engine: 'Meta SAM',    model: 'sam_b.pt',                      hardware: 'GPU 12GB+',    description: 'Zero-shot segmentation — prompt ด้วย point/box, ไม่ต้อง label mask',        compatible: true  },
-    { value: 'sam-l',      label: 'SAM-Large',                  engine: 'Meta SAM',    model: 'sam_l.pt',                      hardware: 'GPU 20GB+',    description: 'High precision boundary — fine crack, scratch, burr segmentation',           compatible: false },
-    { value: 'sam2',       label: 'SAM 2 (Video)',              engine: 'Meta SAM2',   model: 'sam2_l.pt',                     hardware: 'GPU 16GB+',    description: 'Video segmentation — track defects across frames on conveyor belt',          compatible: false },
     { value: 'unet',       label: 'UNet ResNet34',              engine: 'Segmentation Models PyTorch', model: 'resnet34-unet', hardware: 'GPU 8GB+', description: 'Classic — surface defect, corrosion, weld bead segmentation',               compatible: true  },
     { value: 'unetpp',     label: 'UNet++ (ResNet34)',          engine: 'Segmentation Models PyTorch', model: 'resnet34-unetplusplus', hardware: 'GPU 10GB+', description: 'Nested UNet — ดีสำหรับ boundary ซับซ้อน เช่น crack, delamination',      compatible: true  },
     { value: 'deeplabv3',  label: 'DeepLabV3+ (ResNet101)',     engine: 'TorchVision', model: 'resnet101-deeplabv3',            hardware: 'GPU 10GB+',    description: 'Atrous conv — semantic segmentation บน aerial, industrial floor plan',       compatible: true  },
     { value: 'maskrcnn',   label: 'Mask R-CNN',                 engine: 'TorchVision', model: 'maskrcnn_resnet50_fpn',          hardware: 'GPU 12GB+',    description: 'Instance segmentation — individual part isolation, robotic grasping',         compatible: false },
     { value: 'yoloseg',    label: 'YOLOv8-Seg',                engine: 'Ultralytics', model: 'yolov8m-seg.pt',                hardware: 'GPU 10GB+',    description: 'Fast instance seg — real-time defect segmentation on production line',        compatible: true  },
-    { value: 'segment-anything2', label: 'EfficientSAM',       engine: 'TIMM',        model: 'efficientsam_s',                hardware: 'GPU 8GB+',     description: 'Lightweight SAM — edge deployment, real-time segmentation on Jetson',        compatible: false },
+    { value: 'monai-unet', label: 'MONAI UNet (Medical)',        engine: 'MONAI',       model: 'monai-unet',                    hardware: 'GPU 8GB+',     description: 'MONAI UNet — organ/tumor segmentation, CT/MRI, handles DICOM & NIfTI automatically', compatible: true  },
+    { value: 'medsam',     label: 'MedSAM (Fine-tune)',          engine: 'MedSAM',      model: 'medsam_vit_b',                  hardware: 'GPU 12GB+',    description: 'SAM fine-tuned บน medical images — segment อวัยวะ/tumor ด้วย bounding box prompt', compatible: false },
+    { value: 'nnunet-2d',  label: 'nnU-Net 2D Auto',            engine: 'nnU-Net',     model: 'nnunet-2d',                     hardware: 'GPU 16GB+',    description: 'Auto-configure segmentation pipeline — MICCAI standard, organ/tumor, CT/MRI', compatible: false },
   ],
 
   // ── LLM Text Fine-tuning ─────────────────────────────────────────────────────
@@ -91,6 +95,10 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'gemma2-2b',   label: 'Gemma-2-2B-Instruct',    engine: 'Unsloth', model: 'unsloth/gemma-2-2b-it-bnb-4bit',           hardware: 'GPU 6GB+',   description: 'Google Gemma 2 2B — ขนาดเล็กมาก, ดีสำหรับ classification text, FAQ bot',       compatible: true  },
     { value: 'deepseek-r1', label: 'DeepSeek-R1-8B',          engine: 'Unsloth', model: 'unsloth/DeepSeek-R1-0528-Qwen3-8B-bnb-4bit', hardware: 'GPU 20GB+', description: 'Reasoning model — RCA (root cause analysis), troubleshooting chain-of-thought',  compatible: false },
     { value: 'qwen3-14b',   label: 'Qwen3-14B',               engine: 'Unsloth', model: 'unsloth/Qwen3-14B-bnb-4bit',               hardware: 'GPU 24GB+',  description: 'Top-tier reasoning — complex process optimization, multi-step planning',         compatible: false },
+    { value: 'medgemma-27b', label: 'MedGemma-27B-IT',        engine: 'Unsloth', model: 'google/medgemma-27b-it',                   hardware: 'GPU 48GB+',  description: 'Google medical LLM — pre-trained บน medical text, ดีสำหรับ clinical NLP, radiology report',  compatible: false },
+    { value: 'meditron-7b',  label: 'Meditron-7B',            engine: 'Unsloth', model: 'epfl-llm/meditron-7b',                    hardware: 'GPU 14GB+',  description: 'EPFL+Yale — fine-tuned จาก Llama 2 บน medical corpus, ดีสำหรับ clinical reasoning, medical QA', compatible: false },
+    { value: 'biomistral-7b', label: 'BioMistral-7B',         engine: 'Unsloth', model: 'BioMistral/BioMistral-7B',                hardware: 'GPU 14GB+',  description: 'Fine-tune จาก Mistral บน PubMed — medical Q&A, summarization, literature review',              compatible: false },
+    { value: 'openbiollm-8b', label: 'OpenBioLLM-8B',         engine: 'Unsloth', model: 'aaditya/Llama3-OpenBioLLM-8B',           hardware: 'GPU 16GB+',  description: 'Saama — Llama 3 fine-tuned บน biomedical corpus, ดีสำหรับ drug research, biomedical NLP',       compatible: true  },
   ],
 
   // ── VLM Fine-tuning ───────────────────────────────────────────────────────────
@@ -98,8 +106,8 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'LLaVA',      model: 'llava-v1.6-mistral-7b',          hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: false },
     { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',   engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit', hardware: 'GPU 16GB+', description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: false },
     { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'HuggingFace', model: 'OpenGVLab/InternVL2-8B',        hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: false },
-    { value: 'phi4v',       label: 'Phi-4-Vision',            engine: 'Microsoft',  model: 'microsoft/Phi-4-multimodal-instruct', hardware: 'GPU 12GB+', description: 'Compact VLM — fast inference, ดีสำหรับ edge visual assistant บน smart camera', compatible: false },
     { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'HuggingFace', model: 'google/paligemma2-3b-pt-448',   hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: false },
+    { value: 'medgemma-4b', label: 'MedGemma-4B-IT',          engine: 'HuggingFace', model: 'google/medgemma-4b-it',         hardware: 'GPU 12GB+',  description: 'Google medical VLM — pre-trained บน medical images & text, ดีสำหรับ radiology, pathology, dermatology', compatible: true  },
     { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'HuggingFace', model: 'HuggingFaceTB/SmolVLM-500M-Instruct', hardware: 'GPU 6GB+', description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
   ],
 
@@ -114,13 +122,6 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   ],
 
   // ── Export ────────────────────────────────────────────────────────────────────
-  'export-edge': [
-    { value: 'tflite',     label: 'TensorFlow Lite',           engine: 'TF-Lite',  model: 'model.tflite',                  hardware: 'CPU / Mobile', description: 'Raspberry Pi, Android, Edge TPU — int8 quantization',                     compatible: true  },
-    { value: 'onnx',       label: 'ONNX Runtime',              engine: 'ONNX',     model: 'model.onnx',                    hardware: 'CPU / GPU',    description: 'Universal — รันได้ทุก platform, GPU acceleration via OrtValue',           compatible: true  },
-    { value: 'tensorrt',   label: 'TensorRT',                  engine: 'NVIDIA',   model: 'model.plan',                    hardware: 'NVIDIA GPU',   description: 'Optimized for NVIDIA — Jetson Orin, AGX, T4, A100, <1ms latency',        compatible: true  },
-    { value: 'openvino',   label: 'OpenVINO',                  engine: 'Intel',    model: 'model.xml',                     hardware: 'Intel CPU/iGPU', description: 'Intel optimized — Core, Xeon, Myriad X, industrial IPC deployment',     compatible: true  },
-    { value: 'coreml',     label: 'CoreML',                    engine: 'Apple',    model: 'model.mlmodel',                 hardware: 'Apple Neural', description: 'iOS/iPadOS — ANE acceleration, AR industrial inspection app',             compatible: true  },
-  ],
 }
 
 // ─── Data-type compatibility per model ───────────────────────────────────────────────
@@ -142,6 +143,20 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'vit-b':             ['rgb', 'general'],
   'dino-s':            ['rgb', 'thermal', 'microscopy', 'general'],
   'efficientvit':      ['rgb', 'general'],
+  'rad-dino':          ['xray', 'microscopy', 'rgb'],
+  'txrv-densenet':     ['xray'],
+  'uni-pathology':     ['microscopy', 'xray'],
+  // MedGemma
+  'medgemma-4b':       ['xray', 'microscopy', 'rgb', 'general'],
+  'medgemma-27b':      _A,
+  'meditron-7b':       _A,
+  'biomistral-7b':     _A,
+  'openbiollm-8b':     _A,
+  // MONAI / MedSAM / nnU-Net
+  'monai-densenet':    ['xray', 'microscopy', 'rgb'],
+  'monai-unet':        ['xray', 'microscopy', 'rgb'],
+  'medsam':            ['xray', 'microscopy', 'rgb'],
+  'nnunet-2d':         ['xray', 'microscopy', 'rgb'],
   // Detection
   'yolov8-s':          _C,
   'yolov8-m':          _C,
@@ -150,17 +165,12 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'yolov9-c':          _C,
   'rt-detr':           _C,
   'detr':              ['rgb', 'general'],
-  'grounding':         ['rgb', 'general'],
   // Segmentation
-  'sam-b':             _V,
-  'sam-l':             _V,
-  'sam2':              _C,
   'unet':              _V,
   'unetpp':            _X,
   'deeplabv3':         _C,
   'maskrcnn':          _C,
   'yoloseg':           _C,
-  'segment-anything2': ['rgb', 'general'],
   // LLM text (data type irrelevant — text model)
   'llama31-8b':        _A,
   'llama32-3b':        _A,
@@ -174,7 +184,6 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'llava16-7b':        ['rgb', 'xray', 'microscopy', 'general'],
   'qwen2vl-7b':        _V,
   'internvl2':         _V,
-  'phi4v':             ['rgb', 'general'],
   'paligemma':         ['rgb', 'general'],
   'smolvlm':           ['rgb', 'general'],
   // Self-supervised / anomaly
@@ -381,6 +390,17 @@ export default function TrainModel() {
     }
     if (llm && !config.textDatasetId) {
       showToast('กรุณาเลือก text dataset', 'error')
+      return
+    }
+
+    // Block zero-shot / open-vocabulary models that cannot be fine-tuned
+    const ZERO_SHOT_MODELS = ['grounding-dino', 'groundingdino', 'owl-vit', 'owlvit', 'owlv2', 'sam']
+    const modelLower = config.model.toLowerCase()
+    if (ZERO_SHOT_MODELS.some(z => modelLower.includes(z))) {
+      showToast(
+        `❌ ${config.model} เป็น zero-shot model — ไม่รองรับการ fine-tune\nใช้ DETR หรือ YOLOS แทน เช่น facebook/detr-resnet-50`,
+        'error'
+      )
       return
     }
     setLaunching(true)
@@ -598,30 +618,6 @@ export default function TrainModel() {
               </div>
             </button>
 
-            {/* Export Edge */}
-            <button
-              onClick={() => { set('trainingType', 'export-edge'); nextStep() }}
-              className="card text-left"
-              style={config.trainingType === 'export-edge' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
-            >
-              <div className="flex items-center gap-3 mb-3">
-                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <Database size={18} style={{ color: 'var(--primary-hover)' }} />
-                </div>
-                <div>
-                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Export Edge</h3>
-                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>TF-Lite / ONNX / TensorRT</p>
-                </div>
-              </div>
-              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                Export trained model ไปเป็น TF-Lite, ONNX, TensorRT สำหรับ deploy บน edge board
-              </p>
-              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
-                <span>{countForType('export-edge')} formats</span>
-                <ChevronDown size={12} />
-              </div>
-            </button>
-
             {/* LLM Text Fine-tuning */}
             <button
               onClick={() => { set('trainingType', 'llm-text'); nextStep() }}
@@ -779,7 +775,11 @@ export default function TrainModel() {
                   className="card text-left"
                 >
                   <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
-                    <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{opt.label}</h3>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{opt.label}</h3>
+                      {opt.zeroShot && <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--warning, #f59e0b)20', color: 'var(--warning, #f59e0b)', border: '1px solid var(--warning, #f59e0b)', fontWeight: 600 }}>Zero-Shot</span>}
+                      {['TF-Lite','ONNX','NVIDIA','Intel','Apple'].includes(opt.engine) && <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: '#6366f120', color: '#6366f1', border: '1px solid #6366f1', fontWeight: 600 }}>Export-Only</span>}
+                    </div>
                     <span className="badge badge-success" style={{ fontSize: 11 }}>{opt.hardware}</span>
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8, lineHeight: 1.5 }}>{opt.description}</p>
@@ -835,7 +835,11 @@ export default function TrainModel() {
                 {incompatibleOptions.map(opt => (
                   <button key={opt.value} className="card text-left" onClick={() => handleModelSelect(opt)} style={{ cursor: 'pointer', width: '100%' }}>
                     <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
-                      <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-muted)' }}>{opt.label}</h3>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-muted)' }}>{opt.label}</h3>
+                        {opt.zeroShot && <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: '#f59e0b20', color: '#f59e0b', border: '1px solid #f59e0b', fontWeight: 600 }}>Zero-Shot</span>}
+                        {['TF-Lite','ONNX','NVIDIA','Intel','Apple'].includes(opt.engine) && <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: '#6366f120', color: '#6366f1', border: '1px solid #6366f1', fontWeight: 600 }}>Export-Only</span>}
+                      </div>
                       <span className="badge badge-warning" style={{ fontSize: 11 }}>{opt.hardware}</span>
                     </div>
                     <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>{opt.description}</p>
