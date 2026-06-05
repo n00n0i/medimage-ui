@@ -25,7 +25,6 @@ interface TextResult {
   tokens_per_second: number
   inference_time_ms: number
   model_name: string
-  simulated?: boolean
 }
 
 interface ClsResult {
@@ -706,11 +705,6 @@ export default function Playground() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <CheckCircle2 size={16} color="#10b981" />
                     <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--text-primary)' }}>Response</span>
-                    {textResult.simulated && (
-                      <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 8, background: '#f59e0b20', color: '#f59e0b' }}>
-                        Simulated
-                      </span>
-                    )}
                   </div>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{textResult.tokens_generated} tokens · {textResult.tokens_per_second.toFixed(0)} tok/s · {textResult.inference_time_ms} ms</span>
                 </div>

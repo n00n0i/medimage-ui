@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search, Cloud, Wifi, WifiOff, Save, Eye, EyeOff, Globe, Copy, Check } from 'lucide-react'
+import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search, Cloud, Wifi, WifiOff, Save, Eye, EyeOff, Globe, StopCircle } from 'lucide-react'
 
 interface HFModel {
   id: string
@@ -714,65 +714,18 @@ function StatusBadge({ online, checking }: { online: boolean | null; checking: b
   return null
 }
 
-const SERVE_SCRIPT = `# serve_inference.py — H-Forge Ray Serve inference endpoint
-# Install: pip install "ray[serve]" fastapi uvicorn python-multipart pillow
-# Deploy:  serve run serve_inference.py:deployment --host 0.0.0.0 --port 8000
-
-from ray import serve
-from fastapi import FastAPI, File, Form, UploadFile
-from typing import Optional
-
-_app = FastAPI()
-
-@serve.deployment(num_replicas=1, ray_actor_options={"num_cpus": 2})
-@serve.ingress(_app)
-class InferenceApp:
-    def __init__(self):
-        # ─── Load your model weights here ─────────────
-        # import torch
-        # self.model = torch.load("/path/to/weights.pt")
-        # self.model.eval()
-        # ─────────────────────────────────────────
-        self.model = None
-
-    @_app.post("/inference")
-    async def infer(
-        self,
-        training_type: str = Form(...),
-        model_id: str = Form(""),
-        conf_threshold: float = Form(0.5),
-        image: Optional[UploadFile] = File(None),
-        prompt: str = Form(""),
-        system_prompt: str = Form(""),
-    ):
-        img = await image.read() if image else None
-        # ─── Return format per training_type ─────────────────
-        # "classification" → {"type":"classification","predictions":[{"label":…,"confidence":…}],"top_label":…}
-        # "detection"      → {"type":"detection","detections":[{"class_name":…,"confidence":…,"bbox":[x,y,w,h]}]}
-        # "segmentation"   → {"type":"segmentation","masks":[{"class_name":…}],"num_masks":…}
-        # "llm-text"       → {"type":"llm-text","response":"…","tokens":…,"inference_time_ms":…}
-        return {"type": training_type, "error": "model not loaded — edit __init__ to load weights"}
-
-    @_app.get("/health")
-    async def health(self):
-        return {"status": "ok", "model_loaded": self.model is not None}
-
-deployment = InferenceApp.bind()
-`
-
-function RayServeTab({ rayUrl, setRayUrl, onAutoSave }: {
+function RayServeTab({ rayUrl, setRayUrl, onAutoSave, modelId }: {
   rayUrl: string
   setRayUrl: (v: string) => void
   onAutoSave: (serveUrl: string) => Promise<void>
+  modelId?: string
 }) {
-  const [showScript, setShowScript] = useState(false)
-  const [copied, setCopied]         = useState(false)
-  const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'running' | 'error'>('idle')
-  const [deployLogs, setDeployLogs] = useState<string[]>([])
-  const [showLogs, setShowLogs]     = useState(false)
+  const [modelDeployStatus, setModelDeployStatus] = useState<'idle' | 'deploying' | 'running' | 'error'>('idle')
+  const [modelDeployLogs, setModelDeployLogs] = useState<string[]>([])
+  const [showModelLogs, setShowModelLogs] = useState(false)
 
   // Auto-fill dashboard URL from localStorage ray_head_url
-  const [dashUrl, setDashUrl] = useState(() => localStorage.getItem('ray_head_url') || '')
+  const [dashUrl, setDashUrl] = useState(() => localStorage.getItem('ray_head_url') || 'http://100.68.53.118:8265')
 
   // Derive serve URL (8265→8000) whenever dashUrl changes
   useEffect(() => {
@@ -788,26 +741,29 @@ function RayServeTab({ rayUrl, setRayUrl, onAutoSave }: {
     }
   }, [dashUrl]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Sync deploy state on mount
+  // Sync per-model deploy state on mount
   useEffect(() => {
-    fetch('/api/ray-serve/status').then(r => r.ok ? r.json() : null).then(d => {
+    if (!modelId) return
+    fetch(`/api/jobs/${modelId}/deploy-ray/status`).then(r => r.ok ? r.json() : null).then(d => {
       if (!d) return
-      setDeployStatus(d.status)
-      setDeployLogs(d.logs || [])
-      if (d.status === 'running' && d.url && !rayUrl) setRayUrl(d.url)
+      setModelDeployStatus(d.status)
+      setModelDeployLogs(d.logs || [])
+      if (d.status === 'running' && d.url) {
+        setRayUrl(d.url)
+      }
     }).catch(() => {})
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [modelId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Poll while deploying
+  // Poll while per-model deploying
   useEffect(() => {
-    if (deployStatus !== 'deploying') return
+    if (modelDeployStatus !== 'deploying' || !modelId) return
     const id = setInterval(async () => {
       try {
-        const r = await fetch('/api/ray-serve/status')
+        const r = await fetch(`/api/jobs/${modelId}/deploy-ray/status`)
         const d = r.ok ? await r.json() : null
         if (!d) return
-        setDeployStatus(d.status)
-        setDeployLogs(d.logs || [])
+        setModelDeployStatus(d.status)
+        setModelDeployLogs(d.logs || [])
         if (d.status !== 'deploying') {
           clearInterval(id)
           if (d.status === 'running' && d.url) {
@@ -816,142 +772,107 @@ function RayServeTab({ rayUrl, setRayUrl, onAutoSave }: {
           }
         }
       } catch { /* ignore */ }
-    }, 3000)
+    }, 4000)
     return () => clearInterval(id)
-  }, [deployStatus]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [modelDeployStatus, modelId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function deploy() {
-    if (!dashUrl) return
-    setDeployStatus('deploying')
-    setDeployLogs(['ส่ง job ไปยัง Ray cluster…'])
-    setShowLogs(true)
+  async function stopModel() {
+    if (!modelId) return
+    setModelDeployStatus('deploying')
+    setModelDeployLogs(['Stopping Ray Serve deployment…'])
+    setShowModelLogs(true)
     try {
-      const r = await fetch('/api/ray-serve/deploy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ray_dashboard_url: dashUrl, api_host: window.location.hostname }),
-      })
-      if (!r.ok) {
-        const e = await r.json()
-        setDeployStatus('error')
-        setDeployLogs([e.detail || 'Deploy failed'])
-      }
+      const r = await fetch(`/api/jobs/${modelId}/deploy-ray/stop`, { method: 'POST' })
+      const d = r.ok ? await r.json() : null
+      setModelDeployStatus('idle')
+      setModelDeployLogs(d?.logs || ['Stopped'])
+      setRayUrl('')
+      await onAutoSave('')
     } catch (e) {
-      setDeployStatus('error')
-      setDeployLogs([(e as Error).message])
+      setModelDeployStatus('error')
+      setModelDeployLogs([(e as Error).message])
     }
   }
 
-  function copyScript() {
-    navigator.clipboard.writeText(SERVE_SCRIPT).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    })
-  }
-
-  const inp: React.CSSProperties = {
-    width: '100%', boxSizing: 'border-box', padding: '7px 10px', fontSize: 12,
-    background: 'var(--bg-card)', border: '1px solid var(--border-subtle)',
-    borderRadius: 7, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)',
+  async function deployModel() {
+    setModelDeployStatus('deploying')
+    setModelDeployLogs(['Submitting model to Ray cluster…'])
+    setShowModelLogs(true)
+    try {
+      const r = await fetch(`/api/jobs/${modelId}/deploy-ray`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ray_dashboard_url: dashUrl }),
+      })
+      if (!r.ok) {
+        const e = await r.json()
+        setModelDeployStatus('error')
+        setModelDeployLogs([e.detail || 'Deploy failed'])
+      }
+    } catch (e) {
+      setModelDeployStatus('error')
+      setModelDeployLogs([(e as Error).message])
+    }
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
-          Deploy inference app บน <strong style={{ color: '#f59e0b' }}>Ray cluster</strong> ที่รันอยู่
-        </p>
-        {deployStatus === 'running' && <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><Wifi size={10} /> Deployed</span>}
-        {deployStatus === 'error'   && <span style={{ fontSize: 11, fontWeight: 600, color: '#ef4444' }}>Error</span>}
-      </div>
 
-      {/* Deployed URL */}
-      {rayUrl && deployStatus === 'running' && (
-        <div style={{ padding: '7px 10px', borderRadius: 7, background: '#f59e0b15', border: '1px solid #f59e0b30', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Wifi size={12} color="#f59e0b" style={{ flexShrink: 0 }} />
-          <code style={{ fontSize: 11, flex: 1, color: '#f59e0b', wordBreak: 'break-all' }}>{rayUrl}</code>
-          <a href={rayUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-muted)', display: 'flex' }}><ExternalLink size={12} /></a>
+      {/* ── Per-model one-click deploy (only when modelId provided) ── */}
+      {modelId && (
+        <div style={{ padding: '10px 12px', borderRadius: 8, background: modelDeployStatus === 'running' ? '#10b98110' : '#f59e0b0a', border: `1px solid ${modelDeployStatus === 'running' ? '#10b98130' : '#f59e0b25'}` }}>
+          <div style={{ marginBottom: 8 }}>
+            <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Ray Dashboard URL (port 8265)</label>
+            <input type="url" value={dashUrl} onChange={e => setDashUrl(e.target.value)}
+              placeholder="http://100.68.53.118:8265"
+              style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 7, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}
+            />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Cloud size={13} color="#f59e0b" />
+              Deploy โมเดลนี้บน Ray Cluster
+            </span>
+            {modelDeployStatus === 'running' && <span style={{ fontSize: 11, fontWeight: 600, color: '#10b981', display: 'flex', alignItems: 'center', gap: 4 }}><Wifi size={10} /> Live</span>}
+            {modelDeployStatus === 'error'   && <span style={{ fontSize: 11, fontWeight: 600, color: '#ef4444' }}>Error</span>}
+          </div>
+          {modelDeployStatus === 'running' && rayUrl && (
+            <div style={{ padding: '5px 8px', borderRadius: 6, background: '#10b98115', border: '1px solid #10b98130', display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+              <CheckCircle2 size={11} color="#10b981" style={{ flexShrink: 0 }} />
+              <code style={{ fontSize: 10, flex: 1, color: '#10b981', wordBreak: 'break-all' }}>{rayUrl}</code>
+              <a href={rayUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-muted)', display: 'flex' }}><ExternalLink size={11} /></a>
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              className="btn btn-sm"
+              style={{ display: 'flex', alignItems: 'center', gap: 5, background: '#f59e0b', color: '#fff', border: 'none' }}
+              onClick={deployModel}
+              disabled={modelDeployStatus === 'deploying' || !dashUrl}
+            >
+              {modelDeployStatus === 'deploying' ? <Loader size={11} className="animate-spin" /> : <Cloud size={11} />}
+              {modelDeployStatus === 'running' ? 'Redeploy' : modelDeployStatus === 'deploying' ? 'Deploying\u2026' : 'Deploy to Ray'}
+            </button>
+            {modelDeployLogs.length > 0 && (
+              <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={() => setShowModelLogs(v => !v)}>
+                <Terminal size={11} /> Logs
+              </button>
+            )}
+            {modelDeployStatus === 'running' && (
+              <button
+                className="btn btn-sm"
+                style={{ display: 'flex', alignItems: 'center', gap: 5, background: '#ef444420', color: '#ef4444', border: '1px solid #ef444440' }}
+                onClick={stopModel}
+              >
+                <StopCircle size={11} /> Stop
+              </button>
+            )}
+          </div>
+          {showModelLogs && modelDeployLogs.length > 0 && (
+            <pre style={{ margin: '8px 0 0', padding: '6px 8px', fontSize: 10, lineHeight: 1.5, borderRadius: 6, background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', maxHeight: 120, overflowY: 'auto', border: '1px solid var(--border-subtle)' }}>{modelDeployLogs.join('\n')}</pre>
+          )}
         </div>
       )}
-
-      {/* Ray Dashboard URL */}
-      <div>
-        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Ray Dashboard URL (port 8265)</label>
-        <input type="url" value={dashUrl} onChange={e => setDashUrl(e.target.value)}
-          placeholder="http://100.68.53.118:8265"
-          style={inp}
-        />
-        <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
-          auto-filled จาก Ray Cluster page — serve endpoint จะเป็น port 8000 บน host เดียวกัน
-        </p>
-      </div>
-
-      {/* Deploy button */}
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-        <button
-          className="btn btn-sm"
-          style={{ display: 'flex', alignItems: 'center', gap: 5, background: '#f59e0b', color: '#fff', border: 'none' }}
-          onClick={deploy}
-          disabled={deployStatus === 'deploying' || !dashUrl}
-        >
-          {deployStatus === 'deploying' ? <Loader size={11} className="animate-spin" /> : <Cloud size={11} />}
-          {deployStatus === 'running' ? 'Redeploy' : deployStatus === 'deploying' ? 'Deploying…' : 'Deploy Inference App'}
-        </button>
-        {deployLogs.length > 0 && (
-          <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={() => setShowLogs(v => !v)}>
-            <Terminal size={11} /> Logs
-          </button>
-        )}
-        {deployStatus === 'running' && <span style={{ fontSize: 11, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={11} /> Active</span>}
-      </div>
-
-      {showLogs && deployLogs.length > 0 && (
-        <pre style={{
-          margin: 0, padding: '8px 10px', fontSize: 10, lineHeight: 1.5, borderRadius: 7,
-          background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
-          maxHeight: 160, overflowY: 'auto', border: '1px solid var(--border-subtle)',
-        }}>{deployLogs.join('\n')}</pre>
-      )}
-
-      {/* Script for advanced users */}
-      <div style={{ borderRadius: 7, border: '1px solid var(--border-subtle)', overflow: 'hidden' }}>
-        <button
-          onClick={() => setShowScript(v => !v)}
-          style={{
-            width: '100%', display: 'flex', alignItems: 'center', gap: 6, padding: '7px 12px',
-            background: 'var(--bg-base)', border: 'none', cursor: 'pointer',
-            fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textAlign: 'left',
-          }}
-        >
-          <Terminal size={11} />
-          <code style={{ flex: 1 }}>serve_inference.py</code>
-          <span style={{ fontSize: 10, color: 'var(--text-muted)', marginRight: 4 }}>ดู / แก้ script</span>
-          <ChevronDown size={11} style={{ transform: showScript ? 'rotate(180deg)' : undefined, transition: 'transform 0.18s' }} />
-        </button>
-        {showScript && (
-          <div style={{ position: 'relative' }}>
-            <pre style={{
-              margin: 0, padding: '10px 14px', fontSize: 10.5, lineHeight: 1.55, overflowX: 'auto',
-              background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
-              borderTop: '1px solid var(--border-subtle)',
-            }}>{SERVE_SCRIPT}</pre>
-            <button
-              onClick={copyScript}
-              style={{
-                position: 'absolute', top: 8, right: 8,
-                background: copied ? '#22c55e20' : 'var(--bg-card)',
-                border: `1px solid ${copied ? '#22c55e' : 'var(--border-subtle)'}`,
-                borderRadius: 6, padding: '4px 8px', cursor: 'pointer',
-                display: 'flex', alignItems: 'center', gap: 4,
-                fontSize: 11, color: copied ? '#22c55e' : 'var(--text-muted)',
-              }}
-            >
-              {copied ? <Check size={11} /> : <Copy size={11} />}
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
-          </div>
-        )}
-      </div>
     </div>
   )
 }
@@ -1150,8 +1071,8 @@ function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, 
 // ─── Global Endpoint Config ──────────────────────────────────────────────────
 
 function GlobalEndpointConfig() {
-  type Tab = 'simulate' | 'modal' | 'ray'
-  const [tab, setTab]           = useState<Tab>('simulate')
+  type Tab = 'modal' | 'ray'
+  const [tab, setTab]           = useState<Tab>('ray')
   const [modalUrl, setModalUrl] = useState('')
   const [modalKey, setModalKey] = useState('')
   const [rayUrl, setRayUrl]     = useState('')
@@ -1199,7 +1120,7 @@ function GlobalEndpointConfig() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          provider: tab === 'simulate' ? '' : tab,
+          provider: tab,
           modal_url: modalUrl,
           modal_api_key: modalKey,
           ray_serve_url: rayUrl,
@@ -1214,12 +1135,11 @@ function GlobalEndpointConfig() {
   }
 
   const TABS: { id: Tab; label: string; color: string }[] = [
-    { id: 'simulate', label: 'Simulate',  color: '#6b7280' },
     { id: 'modal',    label: 'Modal',     color: '#8b5cf6' },
     { id: 'ray',      label: 'Ray Serve', color: '#f59e0b' },
   ]
 
-  const activeColor = TABS.find(t => t.id === tab)?.color ?? '#6b7280'
+  const activeColor = TABS.find(t => t.id === tab)?.color ?? '#f59e0b'
 
   return (
     <div style={{ marginBottom: 20, borderRadius: 12, border: `1px solid ${activeColor}40`, background: 'var(--bg-card)', overflow: 'hidden' }}>
@@ -1240,7 +1160,7 @@ function GlobalEndpointConfig() {
           fontSize: 11, fontWeight: 700, padding: '2px 9px', borderRadius: 10,
           background: activeColor + '20', color: activeColor,
         }}>
-          {tab === 'simulate' ? 'Simulate' : tab === 'modal' ? 'Modal' : 'Ray Serve'}
+          {tab === 'modal' ? 'Modal' : 'Ray Serve'}
         </span>
         {(tab === 'modal' && modalOnline !== null) && (
           <span style={{ fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4, color: modalOnline ? '#22c55e' : '#ef4444' }}>
@@ -1279,12 +1199,6 @@ function GlobalEndpointConfig() {
             ))}
           </div>
 
-          {tab === 'simulate' && (
-            <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6, marginBottom: 14 }}>
-              ทุก model จะใช้ข้อมูล simulation — ไม่รัน model จริง เหมาะสำหรับ demo
-            </p>
-          )}
-
           {tab === 'modal' && (
             <div style={{ marginBottom: 14 }}>
               <ModalDeployTab
@@ -1318,7 +1232,7 @@ function GlobalEndpointConfig() {
               {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
               {saved ? 'Saved!' : 'Save & Apply to All'}
             </button>
-            {tab !== 'simulate' && (modalUrl || rayUrl) && (
+            {(modalUrl || rayUrl) && (
               <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={checkStatus} disabled={checking}>
                 {checking ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={11} />} Check Status
               </button>
@@ -1345,8 +1259,8 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
   initialRayUrl: string
   s3Path: string
 }) {
-  type Tab = 'simulate' | 'modal' | 'ray'
-  const [tab, setTab]         = useState<Tab>((initialProvider as Tab) || 'simulate')
+  type Tab = 'modal' | 'ray'
+  const [tab, setTab]         = useState<Tab>((initialProvider as Tab) || 'ray')
   const [modalUrl, setModalUrl]   = useState(initialModalUrl)
   const [modalKey, setModalKey]   = useState(initialModalKey)
   const [rayUrl, setRayUrl]       = useState(initialRayUrl)
@@ -1382,7 +1296,7 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
           modal_url: modalUrl,
           modal_api_key: modalKey,
           ray_serve_url: rayUrl,
-          inference_provider: tab === 'simulate' ? '' : tab,
+          inference_provider: tab,
         }),
       })
       setSaved(true)
@@ -1395,12 +1309,11 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
 
   async function clearAll() {
     await fetch(`/api/jobs/${modelId}/deployment`, { method: 'DELETE' })
-    setModalUrl(''); setModalKey(''); setRayUrl(''); setTab('simulate')
+    setModalUrl(''); setModalKey(''); setRayUrl(''); setTab('ray')
     setModalOnline(null)
   }
 
   const TABS: { id: Tab; label: string; color: string }[] = [
-    { id: 'simulate', label: 'Simulate',  color: '#6b7280' },
     { id: 'modal',    label: 'Modal',     color: '#8b5cf6' },
     { id: 'ray',      label: 'Ray Serve', color: '#f59e0b' },
   ]
@@ -1439,13 +1352,6 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
           </div>
         )}
 
-        {/* Simulate tab */}
-        {tab === 'simulate' && (
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-            Inference ใช้ข้อมูล simulation — ไม่มีการรัน model จริง เหมาะสำหรับ demo และทดสอบ UI
-          </p>
-        )}
-
         {/* Modal tab */}
         {tab === 'modal' && (
           <ModalDeployTab
@@ -1459,6 +1365,7 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
         {tab === 'ray' && (
           <RayServeTab
             rayUrl={rayUrl} setRayUrl={setRayUrl}
+            modelId={modelId}
             onAutoSave={async (url) => {
               setRayUrl(url)
               await fetch(`/api/jobs/${modelId}/deployment`, {
@@ -1473,11 +1380,13 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
         )}
 
         {/* Buttons */}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: tab === 'simulate' ? 12 : 14 }}>
-          <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={save} disabled={saving}>
-            {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
-            {saved ? 'Saved!' : 'Save & Activate'}
-          </button>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 14 }}>
+          {tab === 'modal' && (
+            <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={save} disabled={saving}>
+              {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
+              {saved ? 'Saved!' : 'Save & Activate'}
+            </button>
+          )}
           {tab === 'modal' && modalUrl && (
             <>
               <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={checkStatus} disabled={checkingModal}>

@@ -154,7 +154,7 @@ def _sync_verify_token(token: str):
 
 # Paths excluded from JWT auth
 _KC_PUBLIC_PATHS = {"/api/health"}
-_KC_PUBLIC_PREFIXES = ("/api/ls-goto/",)
+_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/")
 
 @app.middleware("http")
 async def jwt_auth_middleware(request: Request, call_next):
@@ -1291,6 +1291,202 @@ def train_self_supervised(img_dir, model_name, epochs, imgsz, batch, lr, job_id,
     print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
 
 
+def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, optimizer,
+                    job_id, w_bucket, w_key, minio_url, minio_access, minio_secret):
+    """Fine-tune a HuggingFace vision model (DETR detection or ViT classification)."""
+    import json, os, glob, time
+    import torch
+    from PIL import Image
+    from torch.utils.data import Dataset, DataLoader
+    from transformers import AutoImageProcessor
+
+    # ── Collect images + YOLO-format labels ──────────────────────────────────
+    img_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+    all_images = []
+    for ext in img_extensions:
+        all_images += glob.glob(os.path.join(data_dir, "**", ext), recursive=True)
+    if not all_images:
+        raise RuntimeError(f"No images found in {data_dir}")
+
+    # Build class list from all label files
+    class_set = set()
+    for img_path in all_images:
+        lbl_path = os.path.splitext(img_path)[0] + ".txt"
+        if not os.path.exists(lbl_path):
+            base = os.path.basename(os.path.splitext(img_path)[0])
+            lbl_path = os.path.join(data_dir, "labels", base + ".txt")
+        if os.path.exists(lbl_path):
+            with open(lbl_path) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if parts:
+                        class_set.add(int(parts[0]))
+    # Try yaml for class names
+    yaml_files = glob.glob(os.path.join(data_dir, "*.yaml")) + glob.glob(os.path.join(data_dir, "**", "*.yaml"), recursive=True)
+    class_names = {}
+    for yf in yaml_files:
+        try:
+            import yaml
+            with open(yf) as f:
+                d = yaml.safe_load(f)
+            if isinstance(d.get("names"), list):
+                class_names = {i: n for i, n in enumerate(d["names"])}
+                break
+            elif isinstance(d.get("names"), dict):
+                class_names = {int(k): v for k, v in d["names"].items()}
+                break
+        except Exception:
+            pass
+    if not class_names:
+        class_names = {i: f"class_{i}" for i in sorted(class_set)}
+    num_classes = len(class_names)
+    id2label = {i: class_names[i] for i in range(num_classes)}
+    label2id = {v: k for k, v in id2label.items()}
+    print(f"[train] Classes: {id2label}")
+    print(f"[train] Images : {len(all_images)}")
+
+    split = max(1, int(len(all_images) * 0.9))
+    train_imgs, val_imgs = all_images[:split], all_images[split:] or all_images[:1]
+
+    processor = AutoImageProcessor.from_pretrained(model_name)
+
+    if training_type == "detection":
+        from transformers import AutoModelForObjectDetection
+
+        class YoloDetectDataset(Dataset):
+            def __init__(self, paths):
+                self.paths = paths
+            def __len__(self):
+                return len(self.paths)
+            def __getitem__(self, idx):
+                img_path = self.paths[idx]
+                image = Image.open(img_path).convert("RGB")
+                lbl_path = os.path.splitext(img_path)[0] + ".txt"
+                if not os.path.exists(lbl_path):
+                    base = os.path.basename(os.path.splitext(img_path)[0])
+                    lbl_path = os.path.join(data_dir, "labels", base + ".txt")
+                boxes, labels = [], []
+                if os.path.exists(lbl_path):
+                    with open(lbl_path) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) == 5:
+                                cls_id, cx, cy, w, h = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                                boxes.append([cx, cy, w, h])
+                                labels.append(cls_id)
+                # DETR expects center format [cx,cy,w,h] normalised — matches YOLO
+                annotations = {"image_id": idx, "annotations": [
+                    {"bbox": b, "category_id": l, "area": b[2]*b[3], "iscrowd": 0}
+                    for b, l in zip(boxes, labels)
+                ]}
+                return image, annotations
+
+        def collate_fn(batch):
+            images, anns = zip(*batch)
+            encodings = processor(images=list(images), annotations=list(anns), return_tensors="pt")
+            return encodings
+
+        model = AutoModelForObjectDetection.from_pretrained(
+            model_name, num_labels=num_classes,
+            id2label=id2label, label2id=label2id,
+            ignore_mismatched_sizes=True
+        )
+
+    elif training_type == "classification":
+        from transformers import AutoModelForImageClassification
+
+        class SimpleClassifyDataset(Dataset):
+            def __init__(self, paths):
+                self.paths = paths
+            def __len__(self):
+                return len(self.paths)
+            def __getitem__(self, idx):
+                img_path = self.paths[idx]
+                image = Image.open(img_path).convert("RGB")
+                lbl_path = os.path.splitext(img_path)[0] + ".txt"
+                label = 0
+                if os.path.exists(lbl_path):
+                    with open(lbl_path) as f:
+                        line = f.readline().strip().split()
+                        if line:
+                            label = int(line[0])
+                return image, label
+
+        def collate_fn(batch):
+            images, labels = zip(*batch)
+            encodings = processor(images=list(images), return_tensors="pt")
+            encodings["labels"] = torch.tensor(list(labels), dtype=torch.long)
+            return encodings
+
+        model = AutoModelForImageClassification.from_pretrained(
+            model_name, num_labels=num_classes,
+            id2label=id2label, label2id=label2id,
+            ignore_mismatched_sizes=True
+        )
+    else:
+        raise RuntimeError(f"HuggingFace training not supported for type={training_type}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    optimizer_fn = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    if training_type == "detection":
+        train_ds = YoloDetectDataset(train_imgs)
+        val_ds   = YoloDetectDataset(val_imgs)
+    else:
+        train_ds = SimpleClassifyDataset(train_imgs)
+        val_ds   = SimpleClassifyDataset(val_imgs)
+
+    train_dl = DataLoader(train_ds, batch_size=batch, shuffle=True,  collate_fn=collate_fn, num_workers=2)
+    val_dl   = DataLoader(val_ds,   batch_size=batch, shuffle=False, collate_fn=collate_fn, num_workers=2)
+
+    best_loss = float("inf")
+    best_path = f"/tmp/best_{job_id}.pt"
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for batch_enc in train_dl:
+            batch_enc = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                         for k, v in batch_enc.items()}
+            optimizer_fn.zero_grad()
+            outputs = model(**batch_enc)
+            loss = outputs.loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer_fn.step()
+            total_loss += loss.item()
+        avg_loss = total_loss / max(len(train_dl), 1)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_enc in val_dl:
+                batch_enc = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                             for k, v in batch_enc.items()}
+                outputs = model(**batch_enc)
+                val_loss += outputs.loss.item()
+        avg_val = val_loss / max(len(val_dl), 1)
+
+        print(f"[train] Epoch [{epoch:>3}/{epochs}]  loss={avg_loss:.4f}  val_loss={avg_val:.4f}")
+
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "config": model.config.to_dict(),
+                "id2label": id2label,
+                "label2id": label2id,
+                "training_type": training_type,
+                "model_name": model_name,
+                "val_loss": avg_val,
+            }, best_path)
+
+    print(f"[train] Best val_loss: {best_loss:.4f}")
+    upload_to_minio(best_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
+    print(f"WEIGHTS_UPLOADED:{w_key}")
+
+
 def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantization,
                         epochs, batch, grad_accum, lr, chat_template, job_id,
                         w_bucket, w_key, minio_url, minio_access, minio_secret,
@@ -1488,10 +1684,33 @@ def main():
         return
 
     # 3-VLM. HuggingFace VLM fine-tuning (LLaVA-style)
-    if training_type == "vlm-finetune" or engine == "HuggingFace":
+    if training_type == "vlm-finetune":
         train_vlm_finetune(
             model_name, text_dataset, max_seq_len, lora_rank, quantization,
             epochs, batch, grad_accum, lr, chat_template,
+            job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
+        )
+        print("[train] Complete!")
+        return
+
+    # 3-HF. HuggingFace vision model fine-tuning (DETR detection, ViT classification)
+    if engine == "HuggingFace" and training_type in ("detection", "classification", "segmentation"):
+        tmpdir = tempfile.mkdtemp(prefix="hftrain_")
+        if dataset_url:
+            import requests as _req, zipfile as _zf
+            zip_path = os.path.join(tmpdir, "dataset.zip")
+            data_dir = os.path.join(tmpdir, "data")
+            print("[train] Downloading dataset ...")
+            r = _req.get(dataset_url, stream=True, timeout=600)
+            r.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in r.iter_content(8192): f.write(chunk)
+            os.makedirs(data_dir, exist_ok=True)
+            with _zf.ZipFile(zip_path) as z: z.extractall(data_dir)
+        else:
+            data_dir = tmpdir
+        train_hf_vision(
+            data_dir, model_name, training_type, epochs, batch, lr, optimizer,
             job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
         )
         print("[train] Complete!")
@@ -1880,9 +2099,10 @@ def _run_on_ray_cluster(job: dict) -> None:
     # Export dataset from Label Studio (skip for LLM/VLM — uses HF text_dataset instead)
     engine = job.get("engine", "Ultralytics")
     training_type_for_export = job.get("training_type", "detection")
-    if engine in ("Unsloth", "HuggingFace") or training_type_for_export == "vlm-finetune":
+    _is_llm = engine == "Unsloth" or training_type_for_export in ("llm-text", "vlm-finetune")
+    if _is_llm:
         dataset_url = ""
-        _append_log(job_id, "[cluster] LLM/VLM engine — skipping LS export (uses text_dataset)")
+        _append_log(job_id, "[cluster] LLM engine — skipping LS export (uses text_dataset)")
     else:
         _append_log(job_id, f"[cluster] Exporting dataset from LS project {project_id} ...")
         # SMP segmentation and self-supervised need image data from JSON export
@@ -1941,13 +2161,20 @@ def _run_on_ray_cluster(job: dict) -> None:
         # ultralytics is pre-installed on Ray cluster — do NOT reinstall (causes numpy binary conflict)
         pip_pkgs = ["boto3>=1.34", "pyyaml", "requests"]
 
-    runtime_env = {"pip": pip_pkgs}
-
     # Define the worker function inline so cloudpickle serializes the full body
-    # (not a reference to 'main' module which doesn't exist on the Ray worker)
+    # (not a reference to 'main' module which doesn't exist on the Ray worker).
+    # pip packages are installed inside the function via subprocess to avoid
+    # requiring virtualenv on the worker node (runtime_env pip needs virtualenv).
+    _pip_pkgs_for_worker = pip_pkgs
     def _run_training_inline(script_b64_arg: str, env_vars_arg: dict) -> dict:
-        import os as _os, base64 as _b64, sys as _sys
+        import os as _os, base64 as _b64, sys as _sys, subprocess as _sp
         from io import StringIO as _StringIO
+        # Install required packages directly — avoids the virtualenv requirement
+        if _pip_pkgs_for_worker:
+            _sp.run(
+                [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
+                capture_output=True,
+            )
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
@@ -1964,31 +2191,27 @@ def _run_on_ray_cluster(job: dict) -> None:
         wp = next((ln.split(":", 1)[1].strip() for ln in output.splitlines() if ln.startswith("WEIGHTS_UPLOADED:")), None)
         return {"stdout": output, "weights_path": wp}
 
-    try:
-        with _run_on_ray_cluster._lock:
-            ray.init(address=ray_addr, ignore_reinit_error=True)
-            _append_log(job_id, f"[cluster] Connected ({len(ray.nodes())} node(s))")
+    # Keep Ray connection alive after training (don't shutdown — other threads may
+    # be using it for serve deployments concurrently)
+    with _run_on_ray_cluster._lock:
+        ray.init(address=ray_addr, ignore_reinit_error=True)
+        _append_log(job_id, f"[cluster] Connected ({len(ray.nodes())} node(s))")
 
-            remote_fn = ray.remote(_run_training_inline)
-            future    = remote_fn.options(runtime_env=runtime_env).remote(script_b64, env_vars)
-            _append_log(job_id, "[cluster] Training task submitted, waiting ...")
+        remote_fn = ray.remote(_run_training_inline)
+        future    = remote_fn.remote(script_b64, env_vars)
+        _append_log(job_id, "[cluster] Training task submitted, waiting ...")
 
-            elapsed   = 0
-            poll_sec  = 15
-            while True:
-                time.sleep(poll_sec)
-                elapsed += poll_sec
-                ready, _ = ray.wait([future], timeout=0)
-                if ready:
-                    break
-                _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s elapsed) ...")
+        elapsed  = 0
+        poll_sec = 15
+        while True:
+            time.sleep(poll_sec)
+            elapsed += poll_sec
+            ready, _ = ray.wait([future], timeout=0)
+            if ready:
+                break
+            _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s elapsed) ...")
 
-            result = ray.get(future)
-    finally:
-        try:
-            ray.shutdown()
-        except Exception:
-            pass
+        result = ray.get(future)
 
     # Save full stdout to log
     stdout = result.get("stdout", "")
@@ -2041,7 +2264,7 @@ def _set_status(job_id: str, status: str, error: str | None = None):
 
 
 def run_training(job: dict):
-    """Run vision model training — real (Ray/Modal cluster) or simulation (local)."""
+    """Run model training on Ray/Modal cluster (vision, LLM, VLM — all types)."""
     job_id  = job["id"]
     cluster = job.get("cluster", "ray")
 
@@ -2058,194 +2281,10 @@ def run_training(job: dict):
             _run_on_ray_cluster(job)
             return
 
-        # ── Local simulation fallback ───────────────────────────────────────
-        epochs  = job["epochs"]
-        model   = job["model_name"]
-        engine  = job["engine"]
-        proj_id = job["project_id"]
-
-        _append_log(job_id, f"=== MedImage Training Job ===")
-        _append_log(job_id, f"Model     : {model}")
-        _append_log(job_id, f"Engine    : {engine}")
-        _append_log(job_id, f"Epochs    : {epochs}")
-        _append_log(job_id, f"Batch size: {job['batch_size']}")
-        _append_log(job_id, f"LR        : {job['learning_rate']}")
-        _append_log(job_id, f"Optimizer : {job['optimizer']}")
-        _append_log(job_id, f"Project   : {proj_id}")
-        _append_log(job_id, "")
-
-        # Fetch dataset info from Label Studio
-        _append_log(job_id, f"Fetching dataset from Label Studio project {proj_id}...")
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                f"{LS_API_URL}/api/projects/{proj_id}/",
-                headers={"Authorization": f"Token {LS_TOKEN}"},
-            )
-            with urllib.request.urlopen(req, timeout=5) as r:
-                proj_data = json.loads(r.read())
-                task_count = proj_data.get("task_number", 0)
-                _append_log(job_id, f"Dataset    : {proj_data.get('title', proj_id)} ({task_count} tasks)")
-        except Exception as e:
-            _append_log(job_id, f"Warning: Could not fetch project info: {e}")
-
-        _append_log(job_id, "")
-        _append_log(job_id, "Starting training loop...")
-        _append_log(job_id, "")
-
-        import random
-        loss = 1.5 + random.uniform(-0.1, 0.1)
-        acc  = 0.5 + random.uniform(-0.05, 0.05)
-
-        for epoch in range(1, epochs + 1):
-            # Simulate epoch training (1–3s per epoch for demo)
-            time.sleep(max(1.0, min(3.0, 60.0 / epochs)))
-
-            loss  = loss  * 0.92 + random.uniform(-0.02, 0.02)
-            acc   = min(0.995, acc * 1.04 + random.uniform(-0.01, 0.02))
-            val_loss = loss * 1.05 + random.uniform(-0.03, 0.03)
-            val_acc  = min(0.99, acc - random.uniform(0.01, 0.04))
-
-            progress = int(epoch / epochs * 100)
-            _set_progress(job_id, progress)
-            _append_log(
-                job_id,
-                f"Epoch [{epoch:>3}/{epochs}]  "
-                f"loss={loss:.4f}  acc={acc:.4f}  "
-                f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}",
-            )
-
-        _append_log(job_id, "")
-        _append_log(job_id, f"Training completed ✓")
-        _append_log(job_id, f"Final val_acc: {val_acc:.4f}")
-        _append_log(job_id, "Model checkpoint saved to /data/models/{job_id}/best.pt")
-        _set_progress(job_id, 100)
-        _set_status(job_id, "completed")
-
-    except Exception as exc:
-        _append_log(job_id, f"ERROR: {exc}")
-        _set_status(job_id, "error", str(exc))
-
-
-def run_llm_training(job: dict):
-    """Simulate Unsloth/TRL LLM or VLM fine-tuning."""
-    job_id     = job["id"]
-    epochs     = max(1, job["epochs"])
-    model      = job["model_name"]
-    engine     = job["engine"]
-    lora_rank  = job.get("lora_rank", 16)
-    quant      = job.get("quantization", "4bit")
-    max_seq    = job.get("max_seq_len", 2048)
-    tmpl       = job.get("chat_template", "alpaca")
-    grad_accum = job.get("grad_accum", 4)
-    t_type     = job.get("training_type", "llm-text")
-    text_ds    = job.get("text_dataset", "custom dataset")
-
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET status='running', started_at=? WHERE id=?",
-                (time.time(), job_id),
-            )
-            conn.commit()
-
-        is_vlm = (t_type == "vlm-finetune")
-        _append_log(job_id, f"=== MedImage {'VLM' if is_vlm else 'LLM'} Fine-tuning ===")
-        _append_log(job_id, f"Model      : {model}")
-        _append_log(job_id, f"Engine     : {engine}")
-        _append_log(job_id, f"Quantize   : {quant} {'(QLoRA)' if quant != 'full' else '(full fine-tune)'}")
-        _append_log(job_id, f"LoRA rank  : r={lora_rank}  alpha={lora_rank*2}")
-        _append_log(job_id, f"Max seq len: {max_seq}")
-        _append_log(job_id, f"Chat tmpl  : {tmpl}")
-        _append_log(job_id, f"Grad accum : {grad_accum}")
-        _append_log(job_id, f"Epochs     : {epochs}")
-        _append_log(job_id, f"Dataset    : {text_ds}")
-        _append_log(job_id, "")
-
-        # Phase 1: Load model + tokenizer
-        _set_progress(job_id, 5)
-        _append_log(job_id, f"[1/6] Loading {model} with Unsloth FastLanguageModel ...")
-        time.sleep(random.uniform(2.0, 4.0))
-        if is_vlm:
-            _append_log(job_id, f"  ✓ Vision encoder loaded (patch_size=14, num_patches=729)")
-        _append_log(job_id, f"  ✓ Base model loaded in {quant} mode ({random.randint(3, 8)} GB VRAM)")
-        _append_log(job_id, f"  ✓ Tokenizer loaded (vocab_size={random.randint(32000, 128000)})")
-        _append_log(job_id, "")
-
-        # Phase 2: Apply LoRA
-        _set_progress(job_id, 12)
-        _append_log(job_id, f"[2/6] Applying LoRA adapters (PEFT) ...")
-        time.sleep(random.uniform(0.5, 1.5))
-        trainable = round(random.uniform(0.8, 2.5), 2)
-        total = round(random.uniform(7.0, 14.0), 1)
-        _append_log(job_id, f"  trainable params: {trainable}M / {total}B ({trainable/total*100:.2f}%) -- LoRA r={lora_rank}")
-        _append_log(job_id, f"  target modules  : q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj")
-        _append_log(job_id, "")
-
-        # Phase 3: Prepare dataset
-        _set_progress(job_id, 20)
-        _append_log(job_id, f"[3/6] Preparing dataset ({tmpl} format) ...")
-        time.sleep(random.uniform(1.0, 2.5))
-        n_train = random.randint(800, 5000)
-        n_val   = int(n_train * 0.1)
-        _append_log(job_id, f"  ✓ Loaded {n_train + n_val} samples from {text_ds}")
-        _append_log(job_id, f"  ✓ Train: {n_train}  |  Val: {n_val}")
-        _append_log(job_id, f"  ✓ Avg token length: {random.randint(128, 512)} tokens")
-        _append_log(job_id, f"  ✓ Tokenized & packed to max_seq_len={max_seq}")
-        _append_log(job_id, "")
-
-        # Phase 4: Training steps
-        _set_progress(job_id, 25)
-        _append_log(job_id, f"[4/6] Training (SFTTrainer with DeepSpeed Zero-2 offload) ...")
-        _append_log(job_id, "")
-
-        steps_per_epoch = max(10, n_train // (job.get("batch_size", 2) * grad_accum))
-        total_steps = steps_per_epoch * epochs
-        loss = 2.4 + random.uniform(-0.2, 0.2)
-        lr   = job.get("learning_rate", 2e-4)
-        step_delay = max(0.3, min(2.0, 60.0 / total_steps))
-
-        for step in range(1, total_steps + 1):
-            time.sleep(step_delay)
-            loss  = loss  * random.uniform(0.96, 0.999) + random.uniform(-0.01, 0.01)
-            loss  = max(0.05, loss)
-            pct   = int(25 + (step / total_steps) * 65)
-            _set_progress(job_id, pct)
-
-            if step == 1 or step % max(1, total_steps // 20) == 0 or step == total_steps:
-                cur_epoch = int((step - 1) / steps_per_epoch) + 1
-                tps       = random.randint(180, 420)
-                perp      = round(math.exp(loss), 3)
-                _append_log(
-                    job_id,
-                    f"Step [{step:>4}/{total_steps}] epoch={cur_epoch}/{epochs}  "
-                    f"loss={loss:.4f}  perplexity={perp:.3f}  "
-                    f"lr={lr:.2e}  tokens/s={tps}"
-                )
-
-        _append_log(job_id, "")
-
-        # Phase 5: Eval
-        _set_progress(job_id, 92)
-        _append_log(job_id, f"[5/6] Running evaluation on validation set ...")
-        time.sleep(random.uniform(1.0, 2.0))
-        eval_loss = loss * random.uniform(1.02, 1.08)
-        _append_log(job_id, f"  eval_loss={eval_loss:.4f}  eval_perplexity={math.exp(eval_loss):.3f}")
-        _append_log(job_id, "")
-
-        # Phase 6: Save adapter
-        _set_progress(job_id, 97)
-        _append_log(job_id, f"[6/6] Saving LoRA adapter ...")
-        time.sleep(random.uniform(0.5, 1.5))
-        _append_log(job_id, f"  ✓ Adapter saved to /data/models/{job_id}/lora_adapter/")
-        _append_log(job_id, f"  ✓ Tokenizer saved")
-        _append_log(job_id, "")
-        _append_log(job_id, "Fine-tuning complete ✓")
-        _append_log(job_id, f"  Base model : {model}")
-        _append_log(job_id, f"  Adapter    : LoRA r={lora_rank} ({quant})")
-        _append_log(job_id, f"  Final loss : {loss:.4f}  |  perplexity: {math.exp(loss):.3f}")
-        _set_progress(job_id, 100)
-        _set_status(job_id, "completed")
+        raise RuntimeError(
+            "No cluster configured for this job. Training requires a Ray cluster. "
+            "Set cluster=ray and ensure the Ray cluster is running."
+        )
 
     except Exception as exc:
         _append_log(job_id, f"ERROR: {exc}")
@@ -2325,8 +2364,7 @@ def submit_job(project_id: int, req: TrainRequest):
     with get_db() as conn:
         row = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
-    target_fn = run_llm_training if is_llm else run_training
-    threading.Thread(target=target_fn, args=(row,), daemon=True).start()
+    threading.Thread(target=run_training, args=(row,), daemon=True).start()
 
     return {"job_id": job_id, "message": f"Training job {job_id} queued for {req.model_name} on {cluster} cluster"}
 
@@ -2451,15 +2489,30 @@ async def get_modal_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/ray-status")
-async def get_ray_status(job_id: str, url: str = ""):
-    """Ping the Ray Serve endpoint to check if it's online."""
-    if not url:
-        with get_db() as conn:
-            row = conn.execute("SELECT ray_serve_url FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        url = (row["ray_serve_url"] if row else "") or ""
-    if not url:
-        return {"online": False}
-    return await _ping_endpoint(url, "")
+async def get_ray_status(job_id: str):
+    """Check if the Ray Serve deployment for this job is RUNNING via Ray Client."""
+    with get_db() as conn:
+        row = conn.execute("SELECT ray_serve_url, inference_provider FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row or not row["ray_serve_url"]:
+        return {"online": False, "status": "no_url"}
+    try:
+        import ray as _ray
+        from ray import serve as _serve
+        from urllib.parse import urlparse as _up
+        _host = _up(row["ray_serve_url"]).hostname or "100.68.53.118"
+        _addr = f"ray://{_host}:10001"
+        if not _ray.is_initialized():
+            _ray.init(address=_addr, ignore_reinit_error=True, log_to_driver=False)
+        _status = _serve.status()
+        _app_name = f"medimage-{job_id}"
+        _info = _status.applications.get(_app_name)
+        if _info is None:
+            return {"online": False, "status": "not_deployed"}
+        _s = str(_info.status)
+        _online = "RUNNING" in _s or "HEALTHY" in _s
+        return {"online": _online, "status": _s}
+    except Exception as e:
+        return {"online": False, "status": "error", "error": str(e)}
 
 
 @app.delete("/api/jobs/{job_id}/deployment")
@@ -2504,26 +2557,28 @@ class ImportModelRequest(BaseModel):
 
 
 def _run_import(job_id: str, req: ImportModelRequest):
-    """Simulate model download / weight loading."""
+    """Register an imported / pretrained model. No weights download needed —
+    the Ray Serve actor loads pretrained weights from MODEL_NAME at deploy time."""
     try:
         with get_db() as conn:
             conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (time.time(), job_id))
             conn.commit()
 
-        steps = [
-            (10, f"Resolving source: {req.source_url or req.source_type} …"),
-            (30, f"Downloading weights for {req.model_name} …"),
-            (55, "Verifying checksum …"),
-            (75, "Loading model architecture …"),
-            (90, "Registering model in library …"),
-            (100, f"Import complete ✓  ({req.model_name})"),
-        ]
-        for pct, msg in steps:
-            time.sleep(random.uniform(0.5, 1.2))
-            _set_progress(job_id, pct)
-            _append_log(job_id, msg)
+        _append_log(job_id, f"Registering model: {req.model_name} ({req.engine} / {req.training_type})")
+        _set_progress(job_id, 50)
 
-        _append_log(job_id, f"Model checkpoint saved to /data/models/{job_id}/weights.pt")
+        # Validate HuggingFace model exists (quick metadata fetch, no download)
+        if req.source_type == "huggingface" and req.model_name:
+            try:
+                import urllib.request as _ur
+                _url = f"https://huggingface.co/api/models/{req.model_name}"
+                _ur.urlopen(_url, timeout=10)  # noqa: S310 — validating public HF model
+                _append_log(job_id, f"HuggingFace model '{req.model_name}' verified ✓")
+            except Exception as _ve:
+                _append_log(job_id, f"Warning: could not verify HuggingFace model ({_ve}) — proceeding anyway")
+
+        _set_progress(job_id, 100)
+        _append_log(job_id, f"Model '{req.model_name}' registered. Pretrained weights will be loaded from {req.source_type} at deploy time.")
         _set_status(job_id, "completed")
     except Exception as exc:
         _append_log(job_id, f"ERROR: {exc}")
@@ -3173,6 +3228,536 @@ _SERVE_APP_PY = textwrap.dedent("""\
             return {"status": "ok", "model_loaded": self.model is not None}
 """)
 
+# ─── Per-model Ray Serve script ───────────────────────────────────────────────
+_SERVE_MODEL_PY = textwrap.dedent("""\
+    import os, io, zipfile, json, time
+    from pathlib import Path
+
+    # ── env vars ──────────────────────────────────────────────────────────────
+    TRAINING_TYPE  = os.environ["TRAINING_TYPE"]
+    ENGINE         = os.environ.get("ENGINE", "Ultralytics")
+    MODEL_NAME     = os.environ.get("MODEL_NAME", "")
+    MODEL_ID       = os.environ.get("MODEL_ID", "model")
+    MINIO_URL      = os.environ.get("MINIO_URL", "http://localhost:9000")
+    MINIO_ACCESS   = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+    MINIO_SECRET   = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+    WEIGHTS_BUCKET = os.environ.get("WEIGHTS_BUCKET", "medimage-weights")
+    WEIGHTS_KEY    = os.environ.get("WEIGHTS_KEY", "")
+    NUM_CLASSES    = int(os.environ.get("NUM_CLASSES", "2"))
+    CLASS_NAMES    = json.loads(os.environ.get("CLASS_NAMES", "[]")) or [f"class_{i}" for i in range(NUM_CLASSES)]
+    ROUTE_PREFIX   = f"/model/{MODEL_ID}"
+
+    def _download_weights():
+        import boto3
+        from botocore.exceptions import ClientError
+        if not WEIGHTS_KEY:
+            return None
+        s3 = boto3.client("s3", endpoint_url=MINIO_URL,
+                          aws_access_key_id=MINIO_ACCESS, aws_secret_access_key=MINIO_SECRET,
+                          region_name="us-east-1",
+                          config=boto3.session.Config(s3={"addressing_style": "path"}))
+        local_dir = Path(f"/tmp/mweights/{MODEL_ID}")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        raw = local_dir / "raw_weights"
+        try:
+            s3.download_file(WEIGHTS_BUCKET, WEIGHTS_KEY, str(raw))
+        except ClientError as _ce:
+            _code = _ce.response.get("Error", {}).get("Code", "")
+            if _code in ("404", "NoSuchKey", "400", "BadRequest"):
+                print(f"[serve] No fine-tuned weights found at {WEIGHTS_KEY} (code={_code}) — will load pretrained")
+                return None
+            raise
+        with open(raw, "rb") as f:
+            magic = f.read(4)
+        if magic[:2] == b"PK":
+            out = local_dir / "extracted"
+            out.mkdir(exist_ok=True)
+            with zipfile.ZipFile(raw) as z:
+                z.extractall(out)
+            return out
+        else:
+            pt = local_dir / "model.pt"
+            raw.rename(pt)
+            return pt
+
+    # ── Init Ray and deploy ───────────────────────────────────────────────────
+    import ray
+    from ray import serve
+
+    _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
+    if not ray.is_initialized():
+        ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
+
+    # Pin actors to the head node using the built-in internal head resource.
+    # Ray always exposes node:__internal_head__ on the head node.
+    _node_resource = {"node:__internal_head__": 0.001}
+
+    # ── Deployment class — plain __call__, NO @serve.ingress(FastAPI()) ───────
+    # NOTE: runtime_env pip is intentionally NOT used here because Ray cluster
+    # nodes may not have virtualenv. All required packages must be pre-installed.
+    @serve.deployment(
+        num_replicas=1,
+        ray_actor_options={
+            "num_cpus": 1,
+            "resources": _node_resource,
+        },
+        name=f"medimage-{MODEL_ID}",
+    )
+    class ModelInference:
+        def __init__(self):
+            self.model = None
+            self.tokenizer = None
+            self._hf_processor = None
+            self._hf_id2label = None
+            self._smp_engine = False
+            self.labels = CLASS_NAMES
+            self._load_error = None
+            try:
+                weights = _download_weights()
+                self._load(weights)  # None → load pretrained from MODEL_NAME
+                print(f"[serve] Model {MODEL_ID} ({TRAINING_TYPE}/{ENGINE}) loaded (fine-tuned={weights is not None})")
+            except Exception as _e:
+                self._load_error = str(_e)
+                print(f"[serve] WARNING: Model load failed for {MODEL_ID}: {_e}")
+
+        def _load(self, wp):
+            # wp=None means load pretrained from MODEL_NAME
+            tt, eng = TRAINING_TYPE, ENGINE
+            if eng == "HuggingFace" and tt in ("detection", "classification", "segmentation"):
+                import torch
+                from transformers import AutoImageProcessor
+                id2label = {i: n for i, n in enumerate(CLASS_NAMES)} if CLASS_NAMES else {}
+                num_cls = NUM_CLASSES
+                self._hf_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+                if wp is not None:
+                    pt_path = wp if (hasattr(wp, "is_file") and wp.is_file()) else (wp / "model.pt" if hasattr(wp, "__truediv__") else wp)
+                    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+                    cfg_dict = ckpt.get("config", {})
+                    id2label = ckpt.get("id2label", {int(k): v for k, v in cfg_dict.get("id2label", {}).items()}) or id2label
+                    num_cls = len(id2label) or NUM_CLASSES
+                self._hf_id2label = id2label
+                label2id = {v: k for k, v in id2label.items()}
+                if tt == "detection":
+                    from transformers import AutoModelForObjectDetection
+                    m = AutoModelForObjectDetection.from_pretrained(
+                        MODEL_NAME, num_labels=num_cls,
+                        id2label=id2label, label2id=label2id,
+                        ignore_mismatched_sizes=True)
+                elif tt == "classification":
+                    from transformers import AutoModelForImageClassification
+                    m = AutoModelForImageClassification.from_pretrained(
+                        MODEL_NAME, num_labels=num_cls,
+                        id2label=id2label, label2id=label2id,
+                        ignore_mismatched_sizes=True)
+                else:
+                    from transformers import AutoModelForSemanticSegmentation
+                    m = AutoModelForSemanticSegmentation.from_pretrained(
+                        MODEL_NAME, num_labels=num_cls, ignore_mismatched_sizes=True)
+                if wp is not None:
+                    m.load_state_dict(ckpt["model_state_dict"], strict=False)
+                self.model = m.eval()
+                return
+            if tt in ("detection", "segmentation") and eng == "Ultralytics":
+                from ultralytics import YOLO
+                # wp=None: load pretrained YOLO from MODEL_NAME (e.g. yolov8n.pt)
+                self.model = YOLO(str(wp) if wp is not None else (MODEL_NAME or "yolov8n.pt"))
+            elif tt == "classification":
+                import torch, timm
+                arch = MODEL_NAME.replace("-", "_")
+                if wp is None:
+                    self.model = timm.create_model(arch, pretrained=True, num_classes=NUM_CLASSES).eval()
+                else:
+                    ckpt = torch.load(str(wp), map_location="cpu", weights_only=False)
+                    if isinstance(ckpt, torch.nn.Module):
+                        self.model = ckpt.eval()
+                        return
+                    state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    m = timm.create_model(arch, pretrained=False, num_classes=NUM_CLASSES)
+                    m.load_state_dict(state, strict=False)
+                    self.model = m.eval()
+            elif tt == "segmentation" and eng == "Segmentation Models PyTorch":
+                import torch, segmentation_models_pytorch as smp
+                if wp is None:
+                    m = smp.Unet(encoder_name="resnet34", in_channels=3, classes=NUM_CLASSES)
+                    self.model = m.eval()
+                    self._smp_engine = True
+                else:
+                    ckpt_path = wp if wp.is_file() else (wp / "model.pt")
+                    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+                    arch = ckpt.get("arch", "unet")
+                    enc  = ckpt.get("encoder", "resnet34")
+                    nc   = ckpt.get("num_classes", NUM_CLASSES)
+                    m = getattr(smp, arch.capitalize())(encoder_name=enc, in_channels=3, classes=nc)
+                    m.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+                    self.model = m.eval()
+                    self._smp_engine = True
+            elif tt in ("llm-text", "vlm-finetune"):
+                import torch
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+                from peft import PeftModel
+                self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if wp is not None:
+                    self.model = PeftModel.from_pretrained(self.model, str(wp))
+            else:
+                import torch
+                if wp is not None:
+                    pt = wp if (wp.is_file() if hasattr(wp, "is_file") else True) else next(wp.glob("*.pt"), None)
+                    if pt:
+                        self.model = torch.load(str(pt), map_location="cpu", weights_only=False)
+
+        async def _infer(self, image_bytes=None, conf=0.5, prompt="", system_prompt=""):
+            if self.model is None:
+                return {"error": self._load_error or "Model not loaded"}
+            tt = TRAINING_TYPE
+            try:
+                # ── 1. HuggingFace transformers (detection / classification / segmentation) ──
+                if self._hf_processor is not None:
+                    if not image_bytes:
+                        return {"error": "Image required for this model type"}
+                    from PIL import Image as _Img
+                    import torch
+                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
+                    inputs = self._hf_processor(images=img, return_tensors="pt")
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                    if tt == "detection":
+                        target_sizes = torch.tensor([img.size[::-1]])
+                        res = self._hf_processor.post_process_object_detection(
+                            outputs, threshold=conf, target_sizes=target_sizes)[0]
+                        dets = []
+                        for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
+                            name = (self._hf_id2label or {}).get(label.item(), f"class_{label.item()}")
+                            x1, y1, x2, y2 = box.tolist()
+                            dets.append({"class_name": name, "confidence": round(float(score), 4),
+                                         "bbox": [x1, y1, x2 - x1, y2 - y1]})
+                        return {"type": "detection", "detections": dets}
+                    elif tt == "classification":
+                        probs = torch.softmax(outputs.logits, dim=-1)[0].tolist()
+                        id2label = self._hf_id2label or {}
+                        preds = sorted([{"label": id2label.get(i, f"class_{i}"), "confidence": p}
+                                        for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
+                        return {"type": "classification", "predictions": preds[:5],
+                                "top_label": preds[0]["label"]}
+                    elif tt == "segmentation":
+                        logits = outputs.logits  # (1, C, H, W)
+                        up = torch.nn.functional.interpolate(
+                            logits, size=img.size[::-1], mode="bilinear", align_corners=False)
+                        mask = up.argmax(dim=1)[0]
+                        total_px = mask.numel()
+                        id2label = self._hf_id2label or {}
+                        segs = []
+                        for ci in mask.unique().tolist():
+                            px = int((mask == ci).sum())
+                            segs.append({"class_name": id2label.get(ci, f"class_{ci}"),
+                                         "class_id": ci, "pixel_count": px,
+                                         "coverage": round(px / total_px, 4)})
+                        segs.sort(key=lambda x: -x["pixel_count"])
+                        return {"type": "segmentation", "segments": segs, "num_classes": len(segs)}
+                    else:
+                        return {"error": f"HuggingFace inference not implemented for type={tt}"}
+
+                # ── 2. Ultralytics YOLO (detection + instance segmentation) ─────────────
+                if tt in ("detection", "segmentation") and hasattr(self.model, "predict"):
+                    if not image_bytes:
+                        return {"error": "Image required"}
+                    from PIL import Image as _Img
+                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
+                    results = self.model.predict(img, conf=conf, verbose=False)
+                    if tt == "detection":
+                        dets = []
+                        for r in results:
+                            for box in r.boxes:
+                                ci = int(box.cls[0])
+                                name = self.labels[ci] if ci < len(self.labels) else f"class_{ci}"
+                                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                dets.append({"class_name": name, "confidence": float(box.conf[0]),
+                                             "bbox": [x1, y1, x2 - x1, y2 - y1]})
+                        return {"type": "detection", "detections": dets}
+                    else:
+                        masks = []
+                        for r in results:
+                            if r.masks is None: continue
+                            for i, _ in enumerate(r.masks):
+                                ci = int(r.boxes.cls[i])
+                                name = self.labels[ci] if ci < len(self.labels) else f"class_{ci}"
+                                masks.append({"class_name": name, "confidence": float(r.boxes.conf[i])})
+                        return {"type": "segmentation", "masks": masks, "num_masks": len(masks)}
+
+                # ── 3. Segmentation Models PyTorch (semantic segmentation) ───────────────
+                if tt == "segmentation" and self._smp_engine:
+                    import torch
+                    import torchvision.transforms as T
+                    from PIL import Image as _Img
+                    if not image_bytes:
+                        return {"error": "Image required"}
+                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
+                    orig_w, orig_h = img.size
+                    tfm = T.Compose([T.Resize((256, 256)), T.ToTensor(),
+                                     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+                    with torch.no_grad():
+                        logits = self.model(tfm(img).unsqueeze(0))  # (1, C, H, W)
+                    mask = logits.argmax(dim=1)[0]
+                    total_px = mask.numel()
+                    segs = []
+                    for ci in mask.unique().tolist():
+                        px = int((mask == ci).sum())
+                        name = self.labels[ci] if ci < len(self.labels) else f"class_{ci}"
+                        segs.append({"class_name": name, "class_id": ci,
+                                     "pixel_count": px, "coverage": round(px / total_px, 4)})
+                    segs.sort(key=lambda x: -x["pixel_count"])
+                    return {"type": "segmentation", "segments": segs,
+                            "num_classes": len(segs), "image_size": [orig_w, orig_h]}
+
+                # ── 4. PyTorch / TIMM classification ─────────────────────────────────────
+                if tt == "classification":
+                    import torch
+                    import torchvision.transforms as T
+                    from PIL import Image as _Img
+                    if not image_bytes:
+                        return {"error": "Image required"}
+                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
+                    tfm = T.Compose([T.Resize((224, 224)), T.ToTensor(),
+                                     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+                    with torch.no_grad():
+                        logits = self.model(tfm(img).unsqueeze(0))
+                        probs = torch.softmax(logits, dim=1)[0].tolist()
+                    preds = sorted([{"label": self.labels[i] if i < len(self.labels) else f"class_{i}",
+                                     "confidence": p} for i, p in enumerate(probs)],
+                                   key=lambda x: -x["confidence"])
+                    return {"type": "classification", "predictions": preds, "top_label": preds[0]["label"]}
+
+                # ── 5. LLM / VLM text generation ─────────────────────────────────────────
+                if tt in ("llm-text", "vlm-finetune"):
+                    import torch
+                    if not prompt:
+                        return {"error": "Prompt required for LLM inference"}
+                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
+                    inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
+                    t0 = time.time()
+                    with torch.no_grad():
+                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
+                    ms = int((time.time() - t0) * 1000)
+                    n_tok = out.shape[1] - inputs.input_ids.shape[1]
+                    resp = self.tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                    return {"type": tt, "response": resp, "tokens_generated": n_tok,
+                            "inference_time_ms": ms, "model_name": MODEL_NAME}
+
+                return {"error": f"No inference handler for engine={ENGINE}, type={tt}"}
+            except Exception as exc:
+                return {"error": str(exc)}
+
+        async def __call__(self, request):
+            from starlette.responses import JSONResponse
+            path = request.url.path
+            method = request.method
+            if method == "GET" and path.endswith("/health"):
+                return JSONResponse({"status": "ok", "model_loaded": self.model is not None,
+                                     "load_error": self._load_error,
+                                     "model_id": MODEL_ID, "training_type": TRAINING_TYPE,
+                                     "engine": ENGINE})
+            if method != "POST":
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            # Parse request
+            ct = request.headers.get("content-type", "")
+            conf, img_bytes, prompt, system_prompt = 0.5, None, "", ""
+            if "multipart/form-data" in ct:
+                form = await request.form()
+                conf = float(form.get("conf_threshold", 0.5))
+                prompt = form.get("prompt", "")
+                system_prompt = form.get("system_prompt", "")
+                img_file = form.get("image")
+                if img_file and hasattr(img_file, "read"):
+                    img_bytes = await img_file.read()
+            elif "application/json" in ct:
+                data = await request.json()
+                conf = float(data.get("conf_threshold", 0.5))
+                prompt = data.get("prompt", "")
+                system_prompt = data.get("system_prompt", "")
+                if "image" in data:
+                    import base64 as _b64
+                    img_bytes = _b64.b64decode(data["image"])
+            else:
+                img_bytes = await request.body()
+            result = await self._infer(image_bytes=img_bytes, conf=conf,
+                                       prompt=prompt, system_prompt=system_prompt)
+            if isinstance(result, dict) and result.get("error"):
+                return JSONResponse(result, status_code=500)
+            return JSONResponse(result)
+
+        async def infer_raw(self, image_bytes: bytes = None, conf: float = 0.5,
+                            prompt: str = "", system_prompt: str = "") -> dict:
+            # Direct Python call via Ray Client (bypasses HTTP firewall on port 8000)
+            return await self._infer(image_bytes=image_bytes, conf=conf,
+                                     prompt=prompt, system_prompt=system_prompt)
+
+    # ── Check if already RUNNING to avoid failed rolling update ──────────────
+    _app_name = f"medimage-{MODEL_ID}"
+    try:
+        _cur_status = serve.status()
+        _existing = _cur_status.applications.get(_app_name)
+        if _existing and _existing.status.value == "RUNNING":
+            print(f"[serve] {_app_name} already RUNNING — deleting before redeploy")
+            serve.delete(_app_name)
+            time.sleep(3)
+    except Exception as _se:
+        print(f"[serve] status check warning: {_se}")
+
+    serve.run(ModelInference.bind(), name=_app_name, route_prefix=ROUTE_PREFIX)
+    print(f"[serve] {_app_name} deployed at {ROUTE_PREFIX}")
+""")
+
+# Per-job deploy state
+_model_deploy_states: dict[str, dict] = {}
+
+
+def _get_model_deploy_state(job_id: str) -> dict:
+    if job_id not in _model_deploy_states:
+        _model_deploy_states[job_id] = {"status": "idle", "url": None, "logs": []}
+    return _model_deploy_states[job_id]
+
+
+def _poll_model_job(ray_dashboard_url: str, submission_id: str, serve_url: str, job_id: str) -> None:
+    state = _get_model_deploy_state(job_id)
+    for _ in range(120):
+        time.sleep(5)
+        try:
+            r = httpx.get(f"{ray_dashboard_url.rstrip('/')}/api/jobs/{submission_id}", timeout=10)
+            if r.is_success:
+                d = r.json()
+                status = d.get("status", "")
+                msg = d.get("message", "") or d.get("error_type", "")
+                state["logs"] = [f"[{status}] {msg}"] if msg else [f"Job status: {status}"]
+                if status in ("SUCCEEDED", "RUNNING"):
+                    for _ in range(24):
+                        time.sleep(5)
+                        try:
+                            h = httpx.get(f"{serve_url.rstrip('/')}/health", timeout=5)
+                            if h.is_success:
+                                state.update(status="running", url=serve_url, logs=["Model inference server is running!"])
+                                with get_db() as conn:
+                                    conn.execute("UPDATE jobs SET ray_serve_url=?, inference_provider='ray' WHERE id=?",
+                                                 (serve_url, job_id))
+                                    conn.commit()
+                                return
+                        except Exception:
+                            pass
+                    state.update(status="error", logs=["Job finished but /health unreachable at " + serve_url])
+                    return
+                elif status == "FAILED":
+                    state.update(status="error", logs=[f"Job FAILED: {msg}"])
+                    return
+        except Exception as exc:
+            state["logs"] = [str(exc)]
+    state.update(status="error", logs=["Timeout waiting for model deploy (10 min)"])
+
+
+def _submit_model_deploy(ray_dashboard_url: str, payload: dict, serve_url: str, job_id: str, max_wait: int = 600) -> None:
+    """Deploy model to Ray Serve via Ray Client (bypasses the broken Job Agent API)."""
+    import subprocess, tempfile, sys
+    state = _get_model_deploy_state(job_id)
+
+    # Extract env vars from payload
+    env_vars = payload.get("runtime_env", {}).get("env_vars", {})
+    pip_pkgs = payload.get("runtime_env", {}).get("pip", [])
+
+    # Build the deploy script: run _SERVE_MODEL_PY which calls serve.run() via ray://
+    script = _SERVE_MODEL_PY  # already updated to use RAY_ADDRESS env var
+
+    # Write to temp file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", prefix=f"medimage_deploy_{job_id}_", delete=False) as tf:
+        tf.write(script)
+        script_path = tf.name
+
+    # Prepare environment: inherit current env + model-specific vars
+    import os as _os
+    run_env = dict(_os.environ)
+    run_env.update(env_vars)
+
+    # Determine Ray Client address from dashboard URL (8265 → 10001)
+    try:
+        from urllib.parse import urlparse as _up
+        _pp = _up(ray_dashboard_url)
+        ray_client_addr = f"ray://{_pp.hostname}:10001"
+    except Exception:
+        ray_client_addr = ray_dashboard_url.replace(":8265", "").rstrip("/")
+        ray_client_addr = f"ray://{ray_client_addr.split('://')[-1]}:10001"
+    run_env["RAY_ADDRESS"] = ray_client_addr
+
+    state["logs"] = [f"Connecting to Ray at {ray_client_addr} and deploying model {job_id}…"]
+
+    try:
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, text=True, timeout=max_wait, env=run_env,
+        )
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        combined = "\n".join(filter(None, [stdout, stderr]))
+        if result.returncode == 0:
+            # serve.run() succeeded — verify app is RUNNING via Ray Client status
+            state["logs"] = [f"Deploy script succeeded.\n{combined}".strip()]
+            app_name = f"medimage-{job_id}"
+            for _ in range(24):  # up to 2 min
+                time.sleep(5)
+                try:
+                    import ray as _ray
+                    if not _ray.is_initialized():
+                        try:
+                            from urllib.parse import urlparse as _up2
+                            _pp2 = _up2(ray_dashboard_url)
+                            _rc_addr = f"ray://{_pp2.hostname}:10001"
+                        except Exception:
+                            _rc_addr = "ray://100.68.53.118:10001"
+                        _ray.init(address=_rc_addr, ignore_reinit_error=True, log_to_driver=False)
+                    from ray import serve as _serve
+                    _status = _serve.status()
+                    _app = _status.applications.get(app_name)
+                    if _app and _app.status.value == "RUNNING":
+                        state.update(status="running", url=serve_url, logs=[
+                            f"Model deployed and RUNNING at {serve_url}"
+                        ])
+                        with get_db() as conn:
+                            conn.execute(
+                                "UPDATE jobs SET ray_serve_url=?, inference_provider='ray' WHERE id=?",
+                                (serve_url, job_id),
+                            )
+                            conn.commit()
+                        return
+                    elif _app and _app.status.value == "DEPLOY_FAILED":
+                        msg = getattr(_app, "message", "") or ""
+                        state.update(status="error", logs=[f"Deployment FAILED on cluster: {msg}"])
+                        return
+                except Exception as _e:
+                    pass  # retry
+            # After timeout, check one final time via HTTP (in case port is accessible)
+            serve_health = f"{serve_url.rstrip('/')}/health"
+            try:
+                h = httpx.get(serve_health, timeout=5)
+                if h.is_success:
+                    state.update(status="running", url=serve_url, logs=["Model inference server is running!"])
+                    with get_db() as conn:
+                        conn.execute(
+                            "UPDATE jobs SET ray_serve_url=?, inference_provider='ray' WHERE id=?",
+                            (serve_url, job_id),
+                        )
+                        conn.commit()
+                    return
+            except Exception:
+                pass
+            state.update(status="error", logs=[f"Deploy succeeded but could not confirm RUNNING status for {app_name}"])
+        else:
+            state.update(status="error", logs=[f"Deploy script failed (exit {result.returncode}):\n{combined[:2000]}"])
+    except subprocess.TimeoutExpired:
+        state.update(status="error", logs=[f"Deploy timed out after {max_wait}s"])
+    except Exception as exc:
+        state.update(status="error", logs=[f"Deploy error: {exc}"])
+    finally:
+        try:
+            _os.unlink(script_path)
+        except Exception:
+            pass
+
 
 def _make_serve_zip() -> bytes:
     buf = io.BytesIO()
@@ -3404,6 +3989,128 @@ def ray_infer_status_ep():
         "url": _ray_serve_state["url"],
         "logs": _ray_serve_state["logs"][-20:],
     }
+
+
+@app.post("/api/jobs/{job_id}/deploy-ray")
+async def deploy_model_to_ray(job_id: str, body: dict = {}):
+    """Deploy a specific trained model to Ray Serve."""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=? AND status='completed'", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Model not found or not completed")
+    job = dict(row)
+
+    ray_dashboard_url = (body.get("ray_dashboard_url") or RAY_URL or "").rstrip("/")
+    if not ray_dashboard_url:
+        raise HTTPException(status_code=400, detail="ray_dashboard_url required")
+
+    state = _get_model_deploy_state(job_id)
+    if state["status"] == "deploying":
+        raise HTTPException(status_code=409, detail="Deploy already in progress for this model")
+
+    # Derive serve URL: replace 8265 → 8000, route prefix = /model/{job_id}
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(ray_dashboard_url)
+        base_serve = f"{_p.scheme}://{_p.hostname}:8000"
+    except Exception:
+        base_serve = ray_dashboard_url.replace(":8265", ":8000")
+    serve_url = f"{base_serve}/model/{job_id}"
+
+    # MinIO URL reachable from Ray workers (use public IP, not Docker service name)
+    minio_url_for_ray = MINIO_PUBLIC_URL
+    if "minio" in minio_url_for_ray and "://" in minio_url_for_ray:
+        # Docker service name not reachable from Ray — use backend host IP
+        import socket
+        try:
+            host_ip = socket.gethostbyname("host.docker.internal")
+        except Exception:
+            host_ip = "100.68.3.42"
+        minio_url_for_ray = f"http://{host_ip}:9000"
+
+    import base64 as _b64
+    script = _SERVE_MODEL_PY  # subprocess approach: script runs locally and connects via ray://
+
+    # Pip dependencies based on training_type / engine
+    engine = job.get("engine", "Ultralytics")
+    tt = job.get("training_type", "detection")
+    pip_base = ["ray[serve]", "fastapi", "uvicorn", "python-multipart", "pillow", "boto3"]
+    if tt in ("detection", "segmentation") and engine == "Ultralytics":
+        pip_base += ["ultralytics"]
+    elif tt == "classification":
+        pip_base += ["torch", "torchvision", "timm"]
+    elif tt == "segmentation" and engine == "Segmentation Models PyTorch":
+        pip_base += ["torch", "torchvision", "segmentation-models-pytorch"]
+    elif tt in ("llm-text", "vlm-finetune"):
+        pip_base += ["torch", "transformers", "peft", "accelerate"]
+
+    num_classes = job.get("num_classes") or 2
+    class_names_raw = job.get("class_names") or "[]"
+
+    payload = {
+        "runtime_env": {
+            "pip": pip_base,
+            "env_vars": {
+                "TRAINING_TYPE":  tt,
+                "ENGINE":         engine,
+                "MODEL_NAME":     job.get("model_name", ""),
+                "MODEL_ID":       job_id,
+                "MINIO_URL":      minio_url_for_ray,
+                "MINIO_ACCESS_KEY": MINIO_ACCESS_KEY,
+                "MINIO_SECRET_KEY": MINIO_SECRET_KEY,
+                "WEIGHTS_BUCKET": "medimage-weights",
+                "WEIGHTS_KEY":    job.get("s3_weights_path") or f"{job_id}/best.pt",
+                "NUM_CLASSES":    str(num_classes),
+                "CLASS_NAMES":    class_names_raw if isinstance(class_names_raw, str) else json.dumps(class_names_raw),
+            },
+        },
+    }
+
+    state.update(status="deploying", url=serve_url, logs=["Submitting model to Ray cluster…"])
+    threading.Thread(
+        target=_submit_model_deploy,
+        args=(ray_dashboard_url, payload, serve_url, job_id),
+        kwargs={"max_wait": 600},
+        daemon=True,
+    ).start()
+    return {"status": "deploying", "serve_url": serve_url}
+
+
+@app.get("/api/jobs/{job_id}/deploy-ray/status")
+def model_deploy_status(job_id: str):
+    state = _get_model_deploy_state(job_id)
+    return {
+        "status": state["status"],
+        "url": state["url"],
+        "logs": state["logs"][-20:],
+    }
+
+
+@app.post("/api/jobs/{job_id}/deploy-ray/stop")
+def model_deploy_stop(job_id: str):
+    """Delete the Ray Serve application for this model."""
+    app_name = f"medimage-{job_id}"
+    ray_client_addr = f"ray://100.68.53.118:10001"
+    logs = []
+    try:
+        import ray as _ray
+        from ray import serve as _serve
+        if not _ray.is_initialized():
+            _ray.init(address=ray_client_addr, ignore_reinit_error=True, log_to_driver=False)
+        _serve.delete(app_name)
+        logs.append(f"[stop] {app_name} deleted from Ray Serve")
+    except Exception as e:
+        logs.append(f"[stop] warning: {e}")
+    # Clear DB state
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE jobs SET ray_serve_url='', inference_provider='' WHERE id=?",
+            (job_id,),
+        )
+        conn.commit()
+    state = _get_model_deploy_state(job_id)
+    state.update(status="idle", url=None, logs=logs)
+    return {"ok": True, "logs": logs}
 
 
 import os as _os
@@ -3757,6 +4464,7 @@ async def run_inference(
     image: Optional[UploadFile] = File(None),
     prompt: str = FForm(""),
     system_prompt: str = FForm(""),
+    conf_threshold: float = FForm(0.5),
 ):
     with get_db() as conn:
         row = conn.execute(
@@ -3775,6 +4483,34 @@ async def run_inference(
     t_start = time.time()
 
     # ── Universal external routing (Modal or Ray Serve) ──────────────────────
+    async def _route_ray_client(serve_url: str, job_id_: str) -> dict:
+        """Call Ray Serve deployment directly via Ray Client (avoids HTTP firewall)."""
+        import ray as _ray
+        from ray import serve as _serve
+        try:
+            from urllib.parse import urlparse as _up
+            _parsed = _up(serve_url)
+            _host = _parsed.hostname or "100.68.53.118"
+        except Exception:
+            _host = "100.68.53.118"
+        _ray_addr = f"ray://{_host}:10001"
+        if not _ray.is_initialized():
+            _ray.init(address=_ray_addr, ignore_reinit_error=True, log_to_driver=False)
+        _app_name = f"medimage-{job_id_}"
+        _handle = _serve.get_app_handle(_app_name)
+        _img_bytes = None
+        if image:
+            _img_bytes = await image.read()
+        _result = await _handle.infer_raw.remote(
+            image_bytes=_img_bytes,
+            conf=conf_threshold,
+            prompt=prompt,
+            system_prompt=system_prompt,
+        )
+        if isinstance(_result, dict) and _result.get("error"):
+            raise RuntimeError(_result["error"])
+        return _result
+
     async def _route_external(base_url: str, api_key: str) -> dict:
         endpoint = base_url.rstrip("/") + "/inference"
         headers_ext: dict = {}
@@ -3808,7 +4544,7 @@ async def run_inference(
 
     if provider == "ray" and job.get("ray_serve_url"):
         try:
-            return await _route_external(job["ray_serve_url"], "")
+            return await _route_ray_client(job["ray_serve_url"], model_id)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Ray Serve endpoint error: {e}")
 
@@ -3828,107 +4564,154 @@ async def run_inference(
                 raise HTTPException(status_code=502, detail=f"Modal endpoint error: {e}")
         if _gprov == "ray" and _gs.get("global_ray_serve_url"):
             try:
-                return await _route_external(_gs["global_ray_serve_url"], "")
+                return await _route_ray_client(_gs["global_ray_serve_url"], model_id)
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"Ray Serve endpoint error: {e}")
 
-    # ── Simulate ─────────────────────────────────────────────────────────────
+    raise HTTPException(
+        status_code=400,
+        detail="No inference provider configured for this model. Set a Ray Serve or Modal URL in the Models page.",
+    )
 
-    if training_type == "classification":
-        logits = [rng.gauss(0, 1) for _ in _CLS_LABELS]
-        max_l = max(logits)
-        exps = [math.exp(l - max_l) for l in logits]
-        total = sum(exps)
-        probs = [e / total for e in exps]
-        predictions = sorted(
-            [{"label": l, "confidence": round(p, 4)} for l, p in zip(_CLS_LABELS, probs)],
-            key=lambda x: x["confidence"],
-            reverse=True,
-        )[:5]
-        elapsed = round((time.time() - t_start) * 1000 + rng.uniform(15, 80), 1)
-        return {
-            "type": "classification",
-            "predictions": predictions,
-            "top_label": predictions[0]["label"],
-            "top_confidence": predictions[0]["confidence"],
-            "inference_time_ms": elapsed,
-            "model_name": job["model_name"],
-        }
 
-    elif training_type == "detection":
-        num_det = rng.randint(1, 4)
-        detections = []
-        for _ in range(num_det):
-            cfg = rng.choice(_DET_LABELS)
-            x1 = rng.uniform(0.05, 0.55)
-            y1 = rng.uniform(0.05, 0.55)
-            x2 = min(0.95, x1 + rng.uniform(0.12, 0.35))
-            y2 = min(0.95, y1 + rng.uniform(0.12, 0.35))
-            detections.append({
-                "label":      cfg["label"],
-                "confidence": round(rng.uniform(0.55, 0.97), 3),
-                "bbox":       [round(x1,4), round(y1,4), round(x2,4), round(y2,4)],
-                "color":      cfg["color"],
-            })
-        detections.sort(key=lambda x: x["confidence"], reverse=True)
-        elapsed = round((time.time() - t_start) * 1000 + rng.uniform(50, 130), 1)
-        return {
-            "type": "detection",
-            "detections": detections,
-            "count": len(detections),
-            "inference_time_ms": elapsed,
-            "model_name": job["model_name"],
-        }
+# ─── Jupyter management ──────────────────────────────────────────────────────
 
-    elif training_type == "segmentation":
-        chosen = rng.sample(_SEG_LABELS, rng.randint(1, len(_SEG_LABELS)))
-        masks = []
-        for cfg in chosen:
-            cx = rng.uniform(0.2, 0.8)
-            cy = rng.uniform(0.2, 0.8)
-            rx = rng.uniform(0.06, 0.22)
-            ry = rng.uniform(0.06, 0.22)
-            n_pts = 10
-            polygon = [
-                [round(cx + rx * math.cos(2 * math.pi * i / n_pts), 4),
-                 round(cy + ry * math.sin(2 * math.pi * i / n_pts), 4)]
-                for i in range(n_pts)
-            ]
-            masks.append({
-                "label":      cfg["label"],
-                "confidence": round(rng.uniform(0.72, 0.96), 3),
-                "area_pct":   round(math.pi * rx * ry * 100, 2),
-                "color":      cfg["color"],
-                "polygon":    polygon,
-            })
-        elapsed = round((time.time() - t_start) * 1000 + rng.uniform(80, 200), 1)
-        return {
-            "type": "segmentation",
-            "masks": masks,
-            "inference_time_ms": elapsed,
-            "model_name": job["model_name"],
-        }
+_JUPYTER_CONTAINER = os.environ.get("JUPYTER_CONTAINER", "medimage-jupyter-1")
 
-    elif training_type in ("llm-text", "vlm-finetune"):
-        # ── Fallback simulate (real inference handled above via provider) ───
-        prompts = [
-            "Based on the imaging findings, this appears consistent with bilateral lower-lobe consolidation suggesting community-acquired pneumonia. Recommend clinical correlation and CBC with differential.",
-            "The scan demonstrates a well-defined hyperdense lesion in the right hepatic lobe measuring approximately 3.2 × 2.8 cm. Differential includes hepatocellular carcinoma vs. metastasis. Recommend MRI with contrast and AFP levels.",
-            "Findings are consistent with moderate left pleural effusion with associated compressive atelectasis. No pneumothorax identified. Clinical correlation advised.",
-            "The retinal fundus image shows neovascularization at the disc (NVD) and multiple flame hemorrhages consistent with proliferative diabetic retinopathy. Urgent ophthalmology referral recommended.",
-            "CT demonstrates a 1.5 cm pulmonary nodule in the right upper lobe with spiculated margins. Per Fleischner Society guidelines, recommend PET-CT and multidisciplinary tumor board review.",
-        ]
-        response = rng.choice(prompts)
-        elapsed = round((time.time() - t_start) * 1000 + rng.uniform(200, 800), 1)
-        tokens = len(response.split())
-        return {
-            "type": training_type,
-            "response": response,
-            "tokens_generated": tokens,
-            "tokens_per_second": round(tokens / (elapsed / 1000), 1),
-            "inference_time_ms": elapsed,
-            "model_name": job["model_name"],
-            "simulated": True,
-        }
 
-    raise HTTPException(status_code=400, detail=f"Unknown training_type: {training_type}")
+def _docker_request(method: str, path: str, body: bytes | None = None, timeout: int = 30) -> tuple[int, bytes]:
+    """Single HTTP request to Docker socket (Connection: close)."""
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect("/var/run/docker.sock")
+    hdrs = (
+        f"{method} {path} HTTP/1.1\r\n"
+        f"Host: localhost\r\n"
+        f"Connection: close\r\n"
+        f"Content-Type: application/json\r\n"
+    )
+    if body:
+        hdrs += f"Content-Length: {len(body)}\r\n"
+    hdrs += "\r\n"
+    sock.sendall(hdrs.encode() + (body or b""))
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    sock.close()
+    status_code = int(data.split(b" ")[1])
+    body_start = data.find(b"\r\n\r\n") + 4
+    return status_code, data[body_start:]
+
+
+async def _docker_exec(container: str, cmd: list[str]) -> tuple[int, str]:
+    """Run a command inside a container via Docker socket (no docker binary needed)."""
+    import json as _json
+
+    def _sync():
+        # Step 1: Create exec instance
+        payload = _json.dumps({"AttachStdout": True, "AttachStderr": True, "Cmd": cmd}).encode()
+        sc, body = _docker_request("POST", f"/containers/{container}/exec", payload)
+        if sc not in (200, 201):
+            return sc, body.decode(errors="replace")
+        exec_id = _json.loads(body)["Id"]
+
+        # Step 2: Start exec — Docker closes connection when exec completes
+        start_payload = _json.dumps({"Detach": False, "Tty": False}).encode()
+        _, raw = _docker_request("POST", f"/exec/{exec_id}/start", start_payload, timeout=300)
+        # Strip Docker stream multiplexing frames (8-byte header per frame)
+        result = b""
+        i = 0
+        while i + 8 <= len(raw):
+            frame_size = int.from_bytes(raw[i + 4:i + 8], "big")
+            result += raw[i + 8:i + 8 + frame_size]
+            i += 8 + frame_size
+        if not result:
+            result = raw
+
+        # Step 3: Get exit code
+        try:
+            _, inspect = _docker_request("GET", f"/exec/{exec_id}/json", timeout=10)
+            exit_code = _json.loads(inspect).get("ExitCode", 0)
+        except Exception:
+            exit_code = 0
+        return exit_code, result.decode(errors="replace")
+
+    return await asyncio.to_thread(_sync)
+
+
+async def _docker_restart(container: str) -> bool:
+    """Restart a container via Docker socket."""
+    def _sync():
+        sc, _ = _docker_request("POST", f"/containers/{container}/restart", timeout=60)
+        return sc in (204, 200)
+    return await asyncio.to_thread(_sync)
+
+
+@app.get("/api/jupyter/version")
+async def jupyter_version():
+    """Return current and latest available JupyterLab version."""
+    try:
+        _, out = await _docker_exec(_JUPYTER_CONTAINER, ["pip", "show", "jupyterlab"])
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Cannot reach Jupyter container: {e}")
+
+    current = next(
+        (ln.split(":", 1)[1].strip() for ln in out.splitlines() if ln.lower().startswith("version")),
+        "unknown",
+    )
+
+    latest = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get("https://pypi.org/pypi/jupyterlab/json")
+            latest = resp.json()["info"]["version"]
+    except Exception:
+        pass
+
+    return {"current": current, "latest": latest, "update_available": current != latest and latest != "unknown"}
+
+
+_jupyter_update_log: list[str] = []
+_jupyter_update_running = False
+
+
+@app.post("/api/jupyter/update")
+async def jupyter_update():
+    """Upgrade JupyterLab inside the running container."""
+    global _jupyter_update_running
+    if _jupyter_update_running:
+        return {"status": "already_running"}
+
+    async def _do_update():
+        global _jupyter_update_running, _jupyter_update_log
+        _jupyter_update_running = True
+        _jupyter_update_log = []
+        try:
+            _jupyter_update_log.append("$ pip install --upgrade jupyterlab")
+            rc, out = await _docker_exec(
+                _JUPYTER_CONTAINER,
+                ["pip", "install", "--upgrade", "jupyterlab"],
+            )
+            _jupyter_update_log.extend(line for line in out.splitlines() if line.strip())
+            if rc != 0:
+                _jupyter_update_log.append(f"ERROR: pip exited {rc}")
+                return
+            _jupyter_update_log.append(f"$ restart {_JUPYTER_CONTAINER}")
+            ok = await _docker_restart(_JUPYTER_CONTAINER)
+            _jupyter_update_log.append("✓ JupyterLab updated and restarted" if ok else "ERROR: restart failed")
+        except Exception as e:
+            _jupyter_update_log.append(f"ERROR: {e}")
+        finally:
+            _jupyter_update_running = False
+
+    asyncio.create_task(_do_update())
+    return {"status": "started"}
+
+
+@app.get("/api/jupyter/update-status")
+def jupyter_update_status():
+    return {"running": _jupyter_update_running, "log": _jupyter_update_log}

@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Zap, Key, Copy, Trash2, Plus, RefreshCw, CheckCircle2, Code2,
-  Globe, Lock, Eye, EyeOff, ExternalLink, BookOpen,
+  Globe, Lock, Eye, EyeOff, ExternalLink, BookOpen, Wifi, WifiOff,
 } from 'lucide-react'
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -22,6 +22,8 @@ interface DeployedModel {
   training_type: string
   engine: string
   created_at: number
+  ray_serve_url: string
+  inference_provider: string
 }
 
 const TT_LABELS: Record<string, string> = {
@@ -137,6 +139,7 @@ function fmtDate(ts: number) {
 
 export default function ApiService() {
   const [models, setModels] = useState<DeployedModel[]>([])
+  const [serveStatus, setServeStatus] = useState<Record<string, boolean | null>>({})
   const [loading, setLoading] = useState(true)
   const [apiKeys, setApiKeys] = useState<ApiKey[]>(loadKeys)
   const [newKeyName, setNewKeyName] = useState('')
@@ -145,6 +148,7 @@ export default function ApiService() {
   const [revealId, setRevealId] = useState<string | null>(null)
   const [selectedModel, setSelectedModel] = useState<DeployedModel | null>(null)
   const [toast, setToast] = useState<string | null>(null)
+  const statusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const showToast = (msg: string) => {
     setToast(msg)
@@ -160,11 +164,38 @@ export default function ApiService() {
         (j: any) => j.status === 'completed' && !j.hidden_in_models
       ) as DeployedModel[]
       setModels(completed)
+      // init status as null (loading) for models with ray provider
+      const initial: Record<string, boolean | null> = {}
+      completed.forEach(m => { if (m.inference_provider === 'ray' && m.ray_serve_url) initial[m.id] = null })
+      setServeStatus(initial)
     } catch { setModels([]) }
     setLoading(false)
   }, [])
 
-  useEffect(() => { fetchModels() }, [fetchModels])
+  const checkServeStatus = useCallback(async (modelList: DeployedModel[]) => {
+    const rayModels = modelList.filter(m => m.inference_provider === 'ray' && m.ray_serve_url)
+    if (rayModels.length === 0) return
+    const results = await Promise.allSettled(
+      rayModels.map(m => fetch(`/api/jobs/${m.id}/ray-status`).then(r => r.json()).then(d => ({ id: m.id, online: d.online as boolean })))
+    )
+    setServeStatus(prev => {
+      const next = { ...prev }
+      results.forEach(r => { if (r.status === 'fulfilled') next[r.value.id] = r.value.online })
+      return next
+    })
+  }, [])
+
+  useEffect(() => {
+    fetchModels()
+  }, [fetchModels])
+
+  // poll status every 30s when models are loaded
+  useEffect(() => {
+    if (models.length === 0) return
+    checkServeStatus(models)
+    statusIntervalRef.current = setInterval(() => checkServeStatus(models), 30_000)
+    return () => { if (statusIntervalRef.current) clearInterval(statusIntervalRef.current) }
+  }, [models, checkServeStatus])
 
   const createKey = () => {
     if (!newKeyName.trim()) return
@@ -360,21 +391,50 @@ export default function ApiService() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
             {models.map(m => {
               const color = TT_COLORS[m.training_type] ?? '#6366f1'
+              const hasRay = m.inference_provider === 'ray' && !!m.ray_serve_url
+              const online = hasRay ? serveStatus[m.id] : undefined // undefined = no ray, null = loading, bool = known
+              const isOnline = online === true
+              const isOffline = hasRay && online === false
+              const isLoadingStatus = hasRay && online === null
+              const clickable = !hasRay || isOnline  // non-ray models always clickable
               return (
                 <button
                   key={m.id}
-                  onClick={() => setSelectedModel(m)}
+                  onClick={() => clickable && setSelectedModel(m)}
                   style={{
-                    background: 'var(--bg-surface)', border: '1px solid var(--border-default)',
-                    borderRadius: 12, padding: '16px 14px', cursor: 'pointer', textAlign: 'left',
-                    transition: 'border-color 0.15s, box-shadow 0.15s',
+                    background: 'var(--bg-surface)', border: `1px solid ${isOffline ? 'var(--border-default)' : 'var(--border-default)'}`,
+                    borderRadius: 12, padding: '16px 14px',
+                    cursor: clickable ? 'pointer' : 'not-allowed',
+                    opacity: isOffline ? 0.55 : 1,
+                    textAlign: 'left',
+                    transition: 'border-color 0.15s, box-shadow 0.15s, opacity 0.15s',
                     display: 'flex', flexDirection: 'column', gap: 10,
                   }}
-                  onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.boxShadow = `0 0 0 3px ${color}18` }}
+                  onMouseEnter={e => { if (clickable) { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.boxShadow = `0 0 0 3px ${color}18` } }}
                   onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.boxShadow = 'none' }}
                 >
-                  <div style={{ width: 38, height: 38, borderRadius: 10, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <Zap size={18} color={color} />
+                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+                    <div style={{ width: 38, height: 38, borderRadius: 10, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <Zap size={18} color={color} />
+                    </div>
+                    {/* Online/Offline badge */}
+                    {hasRay && (
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        fontSize: 10, fontWeight: 600, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
+                        background: isLoadingStatus ? 'var(--bg-elevated)' : isOnline ? '#10b98120' : '#ef444418',
+                        color: isLoadingStatus ? 'var(--text-muted)' : isOnline ? '#10b981' : '#ef4444',
+                      }}>
+                        {isLoadingStatus ? (
+                          <RefreshCw size={9} style={{ animation: 'spin 1s linear infinite' }} />
+                        ) : isOnline ? (
+                          <Wifi size={9} />
+                        ) : (
+                          <WifiOff size={9} />
+                        )}
+                        {isLoadingStatus ? '…' : isOnline ? 'Online' : 'Offline'}
+                      </div>
+                    )}
                   </div>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
