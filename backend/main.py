@@ -3728,6 +3728,17 @@ def save_inference_settings(body: dict):
 
 @app.get("/api/settings/inference/modal-status")
 async def global_modal_status():
+    # The Modal cluster has TWO ways of being "online": (1) the legacy
+    # `global_modal_url` setting (an external per-model endpoint) and
+    # (2) the Modal Ray cluster tracked in _modal_state. The latter
+    # is what the Train popup actually starts; if it's running, the
+    # Playground / Models page should be able to find it.
+    if _modal_state.get("status") == "running" and _modal_state.get("ray_url"):
+        return {
+            "online":   True,
+            "source":   "modal_cluster",
+            "ray_url":  _modal_state["ray_url"],
+        }
     with get_db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key='global_modal_url'").fetchone()
     url = row["value"] if row else ""
@@ -3736,18 +3747,33 @@ async def global_modal_status():
     with get_db() as conn:
         row2 = conn.execute("SELECT value FROM settings WHERE key='global_modal_api_key'").fetchone()
     key = row2["value"] if row2 else ""
-    return await _ping_endpoint(url, key)
+    res = await _ping_endpoint(url, key)
+    res["source"] = "global_setting"
+    return res
 
 
 @app.get("/api/settings/inference/ray-status")
 async def global_ray_status(url: str = ""):
+    # Same dual-source treatment as modal-status. The Modal Ray
+    # cluster can serve BOTH Ray-deployed models (via the Ray
+    # dashboard exposed at _modal_state['ray_url']) and Modal-deployed
+    # ones — so if the Modal cluster is up, both providers should
+    # be considered reachable.
+    if _modal_state.get("status") == "running" and _modal_state.get("ray_url"):
+        return {
+            "online":  True,
+            "source":  "modal_cluster",
+            "ray_url": _modal_state["ray_url"],
+        }
     if not url:
         with get_db() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key='global_ray_serve_url'").fetchone()
         url = (row["value"] if row else "") or ""
     if not url:
-        return {"online": False}
-    return await _ping_endpoint(url, "")
+        return {"online": False, "source": "none"}
+    res = await _ping_endpoint(url, "")
+    res["source"] = "global_setting"
+    return res
 
 
 @app.get("/api/settings/{key}")
