@@ -2814,10 +2814,17 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
             s3.create_bucket(Bucket=bucket)
         s3.put_object(Bucket=bucket, Key=key, Body=export_data)
 
-        # Generate presigned URL using public/VPN-accessible URL
+        # Generate presigned URL using a host the consumer (the Ray worker)
+        # can actually resolve. The S3v4 signature includes the Host header
+        # as a signed component, so the host used here MUST match the host
+        # the worker will hit — otherwise MinIO rejects the request with
+        # SignatureDoesNotMatch. MINIO_PUBLIC_URL is the *internal* docker
+        # service name (http://minio:9000) by default, which the worker
+        # cannot resolve, so we go through _resolve_minio_url_for_ray().
+        ray_minio_url = _resolve_minio_url_for_ray()
         s3_pub = _boto3.client(
             "s3",
-            endpoint_url=MINIO_PUBLIC_URL,
+            endpoint_url=ray_minio_url,
             aws_access_key_id=MINIO_ACCESS_KEY,
             aws_secret_access_key=MINIO_SECRET_KEY,
             config=_BConfig(signature_version="s3v4"),

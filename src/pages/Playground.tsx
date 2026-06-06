@@ -289,36 +289,45 @@ export default function Playground() {
   // Fetch completed models
   useEffect(() => {
     setModelsLoading(true)
-    fetch('/api/jobs?view=models')
-      .then(r => r.json())
-      .then(d => {
-        const ms: Model[] = (d.jobs ?? []).map((j: any) => ({
-          id:            j.id,
-          name:          j.name,
-          training_type: j.training_type,
-          model:         j.model,
-          engine:        j.engine,
-          modal_url:          j.modal_url ?? '',
-          ray_serve_url:      j.ray_serve_url ?? '',
-          inference_provider: j.inference_provider ?? '',
-        }))
-        setModels(ms)
-        if (ms.length > 0) setSelectedModel(ms[0])
-      })
-      .catch(() => {})
-      .finally(() => setModelsLoading(false))
-
-    // Probe global Ray + Modal cluster reachability so the badge reflects
-    // actual state (the DB column inference_provider is sticky — it stays
-    // 'ray' even after the Ray cluster goes down).
-    fetch('/api/settings/inference/ray-status')
-      .then(r => r.ok ? r.json() : { online: false })
-      .then(d => setRayClusterOnline(!!d.online))
-      .catch(() => setRayClusterOnline(false))
-    fetch('/api/settings/inference/modal-status')
-      .then(r => r.ok ? r.json() : { online: false })
-      .then(d => setModalClusterOnline(!!d.online))
-      .catch(() => setModalClusterOnline(false))
+    Promise.all([
+      fetch('/api/jobs?view=models').then(r => r.json()),
+      fetch('/api/settings/inference/ray-status')
+        .then(r => r.ok ? r.json() : { online: false })
+        .catch(() => ({ online: false })),
+      fetch('/api/settings/inference/modal-status')
+        .then(r => r.ok ? r.json() : { online: false })
+        .catch(() => ({ online: false })),
+    ]).then(([d, rayStatus, modalStatus]) => {
+      const ms: Model[] = (d.jobs ?? []).map((j: any) => ({
+        id:            j.id,
+        name:          j.name,
+        training_type: j.training_type,
+        model:         j.model,
+        engine:        j.engine,
+        modal_url:          j.modal_url ?? '',
+        ray_serve_url:      j.ray_serve_url ?? '',
+        inference_provider: j.inference_provider ?? '',
+      }))
+      setModels(ms)
+      setRayClusterOnline(!!rayStatus.online)
+      setModalClusterOnline(!!modalStatus.online)
+      // Default-select from the *filtered* visible list, not the raw models.
+      // Otherwise the closed button shows a model that the dropdown hides.
+      const providerOnline = (m: typeof ms[number]): boolean => {
+        if (m.inference_provider === 'ray')   return !!rayStatus.online
+        if (m.inference_provider === 'modal') return !!modalStatus.online
+        return false
+      }
+      const typeOk = playMode === 'text'
+        ? (m: typeof ms[number]) => m.training_type === 'llm-text'
+        : playMode === 'vl'
+        ? (m: typeof ms[number]) => m.training_type === 'vlm-finetune'
+        : (m: typeof ms[number]) => m.training_type !== 'llm-text' && m.training_type !== 'vlm-finetune'
+      const first = ms.find(m => typeOk(m) && providerOnline(m))
+      setSelectedModel(first ?? null)
+    })
+    .catch(() => {})
+    .finally(() => setModelsLoading(false))
   }, [])
 
   const isLlmModel = (m: Model) => m.training_type === 'llm-text'
