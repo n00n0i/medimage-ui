@@ -3754,17 +3754,34 @@ async def global_modal_status():
 
 @app.get("/api/settings/inference/ray-status")
 async def global_ray_status(url: str = ""):
-    # Same dual-source treatment as modal-status. The Modal Ray
-    # cluster can serve BOTH Ray-deployed models (via the Ray
-    # dashboard exposed at _modal_state['ray_url']) and Modal-deployed
-    # ones — so if the Modal cluster is up, both providers should
-    # be considered reachable.
+    # Source of truth, in priority order:
+    #   1. Modal Ray cluster is up (_modal_state) — the Train popup's
+    #      Start Cluster flow lives here.
+    #   2. The on-prem RAY_URL dashboard's /api/cluster_status responds
+    #      successfully. This catches the case where the user has a
+    #      working on-prem Ray cluster (like the user here: model
+    #      7bc8f748 is deployed on http://100.68.53.118:8000) but
+    #      never set the `global_ray_serve_url` setting.
+    #   3. The legacy `global_ray_serve_url` setting.
     if _modal_state.get("status") == "running" and _modal_state.get("ray_url"):
         return {
             "online":  True,
             "source":  "modal_cluster",
             "ray_url": _modal_state["ray_url"],
         }
+    # Try the on-prem Ray dashboard directly
+    try:
+        r = httpx.get(f"{RAY_URL}/api/cluster_status", timeout=4)
+        if r.is_success:
+            data = r.json() or {}
+            if data.get("result") is True:
+                return {
+                    "online":  True,
+                    "source":  "ray_dashboard",
+                    "ray_url": RAY_URL,
+                }
+    except Exception:
+        pass
     if not url:
         with get_db() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key='global_ray_serve_url'").fetchone()
