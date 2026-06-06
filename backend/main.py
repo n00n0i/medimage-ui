@@ -89,6 +89,7 @@ def init_db():
             ("inference_provider", "TEXT DEFAULT ''"),
             ("cluster",          "TEXT DEFAULT 'ray'"),
             ("pipeline_step",    "TEXT DEFAULT ''"),
+            ("updated_at",       "TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {defval}")
@@ -594,13 +595,29 @@ def modal_credentials_verify():
 
 @app.get("/api/modal/deployments")
 def modal_deployments_list():
-    """List all models currently deployed via Modal."""
+    """List all models currently deployed via Modal, enriched with live spec
+    from the in-memory deploy state (gpu_type, num_workers, status, logs)."""
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, model_name, modal_url, inference_provider FROM jobs "
-            "WHERE inference_provider='modal' AND modal_url != '' ORDER BY created_at DESC"
+            "SELECT id, model_name, modal_url, inference_provider, training_type, "
+            "       engine, updated_at "
+            "FROM jobs "
+            "WHERE inference_provider='modal' AND modal_url != '' "
+            "ORDER BY updated_at DESC"
         ).fetchall()
-    return {"deployments": [dict(r) for r in rows]}
+    out = []
+    for r in rows:
+        d = dict(r)
+        state = _modal_deploy_states.get(d["id"], {})
+        d["status"]      = state.get("status") or "running"
+        d["gpu_type"]    = state.get("gpu_type") or "T4"
+        d["num_workers"] = int(state.get("num_workers") or 1)
+        d["deployed_at"] = d.pop("updated_at", None)
+        d["memory_mb"]          = 16384   # matches @app.cls(... memory=16384) in _modal_model_script
+        d["scaledown_window_s"] = 300     # matches scaledown_window=300
+        d["min_containers"]     = 1
+        out.append(d)
+    return {"deployments": out}
 
 
 class ChangePasswordRequest(BaseModel):
@@ -4436,7 +4453,8 @@ def _run_modal_model_deploy(job_id: str, token_id: str, token_secret: str, gpu_t
             state["logs"].append(f"[modal] Deployed at {url}")
             with get_db() as conn:
                 conn.execute(
-                    "UPDATE jobs SET modal_url=?, inference_provider='modal' WHERE id=?",
+                    "UPDATE jobs SET modal_url=?, inference_provider='modal', "
+                    "       updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (url, job_id),
                 )
                 conn.commit()
@@ -4487,7 +4505,10 @@ def model_deploy_modal(job_id: str, body: dict):
     state = _get_modal_deploy_state(job_id)
     if state["status"] == "deploying":
         raise HTTPException(409, "Deploy already in progress")
-    state.update(status="deploying", url=None, logs=["Starting Modal deploy…"])
+    gpu_type    = body.get("gpu_type", "T4")
+    num_workers = int(body.get("num_workers", 1) or 1)
+    state.update(status="deploying", url=None, gpu_type=gpu_type, num_workers=num_workers,
+                 logs=["Starting Modal deploy…"])
     minio_url = MINIO_URL  # internal Docker URL — download happens on API server (not Modal cloud)
     minio_access = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
     minio_secret = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
@@ -4511,7 +4532,7 @@ def model_deploy_modal(job_id: str, body: dict):
         target=_run_modal_model_deploy,
         args=(
             job_id, token_id, token_secret,
-            body.get("gpu_type", "T4"),
+            gpu_type,
             row["training_type"] or "", row["engine"] or "", row["model_name"] or "",
             num_classes, class_names,
             minio_url, minio_access, minio_secret,

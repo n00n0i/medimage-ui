@@ -12,6 +12,15 @@ interface ModalDeployment {
   model_name: string
   modal_url: string
   inference_provider: string
+  training_type?: string
+  engine?: string
+  deployed_at?: string
+  status?: string
+  gpu_type?: string
+  num_workers?: number
+  memory_mb?: number
+  scaledown_window_s?: number
+  min_containers?: number
 }
 
 type VerifyStatus = 'idle' | 'checking' | 'ok' | 'fail'
@@ -313,40 +322,91 @@ export default function ModalConfig() {
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {deployments.map(dep => (
+            {deployments.map(dep => {
+              const gpu      = (dep.gpu_type ?? 'T4').toUpperCase()
+              const workers  = dep.num_workers ?? 1
+              const memMb    = dep.memory_mb ?? 16384
+              const idleSec  = dep.scaledown_window_s ?? 300
+              const deployed = dep.deployed_at ? new Date(dep.deployed_at.replace(' ', 'T') + (dep.deployed_at.includes('T') ? '' : 'Z')) : null
+              const isUp     = (dep.status ?? 'running') === 'running'
+              return (
               <div key={dep.id} style={{
-                padding: '10px 14px', borderRadius: 8,
+                padding: '12px 14px', borderRadius: 8,
                 background: 'var(--bg-base)', border: '1px solid var(--border-subtle)',
-                display: 'flex', alignItems: 'center', gap: 12,
+                display: 'flex', flexDirection: 'column', gap: 10,
               }}>
-                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 6px #22c55e', flexShrink: 0 }} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>
-                    {dep.model_name || dep.id}
+                {/* Header row: status dot + name + actions */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{
+                    width: 8, height: 8, borderRadius: '50%',
+                    background: isUp ? '#22c55e' : '#f59e0b',
+                    boxShadow: isUp ? '0 0 6px #22c55e' : '0 0 6px #f59e0b',
+                    flexShrink: 0,
+                  }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+                        {dep.model_name || dep.id}
+                      </span>
+                      {dep.training_type && (
+                        <span style={{
+                          fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4,
+                          background: 'var(--bg-elevated)', color: 'var(--text-muted)',
+                          textTransform: 'uppercase', letterSpacing: '0.04em',
+                        }}>
+                          {dep.training_type}
+                        </span>
+                      )}
+                    </div>
+                    <code style={{ fontSize: 11, color: '#8b5cf6', wordBreak: 'break-all' }}>{dep.modal_url}</code>
                   </div>
-                  <code style={{ fontSize: 11, color: '#8b5cf6', wordBreak: 'break-all' }}>{dep.modal_url}</code>
+                  <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                    <a
+                      href={dep.modal_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ display: 'flex', alignItems: 'center', padding: '4px 8px', borderRadius: 6, fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-elevated)', border: '1px solid var(--border)', textDecoration: 'none', gap: 4 }}
+                    >
+                      <ExternalLink size={11} /> Open
+                    </a>
+                    <button
+                      className="btn btn-sm"
+                      style={{ display: 'flex', alignItems: 'center', gap: 4, background: '#ef444415', color: '#ef4444', border: '1px solid #ef444430', fontSize: 11 }}
+                      onClick={() => handleStopModel(dep.id)}
+                      disabled={stopping[dep.id]}
+                    >
+                      {stopping[dep.id] ? <Loader size={11} className="animate-spin" /> : <StopCircle size={11} />}
+                      Stop
+                    </button>
+                  </div>
                 </div>
-                <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-                  <a
-                    href={dep.modal_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ display: 'flex', alignItems: 'center', padding: '4px 8px', borderRadius: 6, fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-elevated)', border: '1px solid var(--border)', textDecoration: 'none', gap: 4 }}
-                  >
-                    <ExternalLink size={11} /> Open
-                  </a>
-                  <button
-                    className="btn btn-sm"
-                    style={{ display: 'flex', alignItems: 'center', gap: 4, background: '#ef444415', color: '#ef4444', border: '1px solid #ef444430', fontSize: 11 }}
-                    onClick={() => handleStopModel(dep.id)}
-                    disabled={stopping[dep.id]}
-                  >
-                    {stopping[dep.id] ? <Loader size={11} className="animate-spin" /> : <StopCircle size={11} />}
-                    Stop
-                  </button>
+
+                {/* Spec grid */}
+                <div style={{
+                  display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))',
+                  gap: 8, paddingTop: 8, borderTop: '1px solid var(--border-subtle)',
+                }}>
+                  {([
+                    { label: 'GPU',        value: gpu === 'CPU' ? 'CPU only' : gpu },
+                    { label: 'Workers',    value: workers.toString() },
+                    { label: 'Memory',     value: memMb >= 1024 ? `${(memMb / 1024).toFixed(0)} GB` : `${memMb} MB` },
+                    { label: 'Idle shut',  value: idleSec >= 60 ? `${Math.round(idleSec / 60)} min` : `${idleSec} s` },
+                    { label: 'Status',     value: isUp ? 'Running' : (dep.status ?? 'unknown'), color: isUp ? 'var(--success)' : 'var(--warning)' },
+                    { label: 'Deployed',   value: deployed ? deployed.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—' },
+                  ] as Array<{ label: string; value: string; color?: string }>).map(s => (
+                    <div key={s.label}>
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>
+                        {s.label}
+                      </div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: s.color ?? 'var(--text-primary)', fontVariantNumeric: 'tabular-nums' }}>
+                        {s.value}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-            ))}
+              )
+            })}
           </div>
         )}
       </div>
