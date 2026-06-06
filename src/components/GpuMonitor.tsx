@@ -5,7 +5,9 @@ import { Cpu, MemoryStick, Thermometer, Zap } from 'lucide-react'
 interface GpuSnapshot {
   ts: number
   gpus: Array<{
-    index: number
+    index: number                // globally unique: <nodeIdx>:<gpuIdx>
+    nodeIndex: number            // which node this GPU is on
+    nodeHost: string             // IP/hostname of the node
     name: string
     utilGpu: number    // 0-100
     memUsedMiB: number
@@ -15,6 +17,7 @@ interface GpuSnapshot {
   }>
   ramUsedGb: number
   ramTotalGb: number
+  nodesTotal: number
 }
 
 // ── Sparkline (SVG, no deps) ───────────────────────────────────────────────────
@@ -62,9 +65,10 @@ function GpuCard({
   utilHistory: number[]
   memHistory: number[]
 }) {
-  const memPct = (gpu.memUsedMiB / gpu.memTotalMiB) * 100
+  const memPct = gpu.memTotalMiB > 0 ? (gpu.memUsedMiB / gpu.memTotalMiB) * 100 : 0
   const memUsedGb = (gpu.memUsedMiB / 1024).toFixed(1)
   const memTotalGb = (gpu.memTotalMiB / 1024).toFixed(0)
+  const utilColor = gpu.utilGpu > 80 ? 'var(--danger)' : gpu.utilGpu > 50 ? 'var(--warning)' : 'var(--success)'
 
   return (
     <div style={{
@@ -74,19 +78,21 @@ function GpuCard({
       padding: '14px 16px',
       minWidth: 0,
     }}>
-      {/* GPU name + temp + power */}
+      {/* GPU name + node host + temp + power */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <div>
-          <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 2 }}>GPU {gpu.index}</p>
-          <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 180 }}>
-            {gpu.name}
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <p style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 1, fontFamily: 'var(--font-mono)' }}>
+            node {gpu.nodeIndex} · {gpu.nodeHost || '?'}
+          </p>
+          <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            GPU {gpu.index} · {gpu.name}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexShrink: 0 }}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: 'var(--text-muted)' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: 'var(--text-muted)' }} title="Temperature">
             <Thermometer size={11} /> {gpu.tempC}°C
           </span>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: 'var(--text-muted)' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: 'var(--text-muted)' }} title="Power draw">
             <Zap size={11} /> {gpu.powerW}W
           </span>
         </div>
@@ -98,12 +104,12 @@ function GpuCard({
           <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>
             <Cpu size={11} /> SM Utilization
           </span>
-          <span style={{ fontSize: 18, fontWeight: 700, fontFamily: 'var(--font-mono)', color: gpu.utilGpu > 80 ? 'var(--danger)' : gpu.utilGpu > 50 ? 'var(--warning)' : 'var(--success)' }}>
+          <span style={{ fontSize: 18, fontWeight: 700, fontFamily: 'var(--font-mono)', color: utilColor }}>
             {gpu.utilGpu}%
           </span>
         </div>
         <div style={{ position: 'relative', height: 48 }}>
-          <Sparkline data={utilHistory} color={gpu.utilGpu > 80 ? '#ef4444' : gpu.utilGpu > 50 ? '#f59e0b' : '#10b981'} maxVal={100} height={48} width={280} />
+          <Sparkline data={utilHistory} color={utilColor === 'var(--danger)' ? '#ef4444' : utilColor === 'var(--warning)' ? '#f59e0b' : '#10b981'} maxVal={100} height={48} width={280} />
         </div>
       </div>
 
@@ -113,23 +119,31 @@ function GpuCard({
           <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>
             <MemoryStick size={11} /> VRAM
           </span>
-          <span style={{ fontSize: 13, fontWeight: 600, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
-            {memUsedGb} / {memTotalGb} GB
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>({memPct.toFixed(0)}%)</span>
-          </span>
+          {gpu.memTotalMiB > 0 ? (
+            <span style={{ fontSize: 13, fontWeight: 600, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+              {memUsedGb} / {memTotalGb} GB
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>({memPct.toFixed(0)}%)</span>
+            </span>
+          ) : (
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic' }}>no metrics</span>
+          )}
         </div>
-        <div style={{ position: 'relative', height: 36 }}>
-          <Sparkline data={memHistory} color="#6366f1" maxVal={gpu.memTotalMiB} height={36} width={280} />
-        </div>
-        {/* VRAM bar */}
-        <div style={{ height: 4, borderRadius: 2, background: 'var(--bg-elevated)', marginTop: 6, overflow: 'hidden' }}>
-          <div style={{
-            height: '100%', borderRadius: 2,
-            width: `${memPct}%`,
-            background: memPct > 85 ? 'var(--danger)' : memPct > 60 ? 'var(--warning)' : '#6366f1',
-            transition: 'width 0.5s ease',
-          }} />
-        </div>
+        {gpu.memTotalMiB > 0 && (
+          <>
+            <div style={{ position: 'relative', height: 36 }}>
+              <Sparkline data={memHistory} color="#6366f1" maxVal={gpu.memTotalMiB} height={36} width={280} />
+            </div>
+            {/* VRAM bar */}
+            <div style={{ height: 4, borderRadius: 2, background: 'var(--bg-elevated)', marginTop: 6, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', borderRadius: 2,
+                width: `${memPct}%`,
+                background: memPct > 85 ? 'var(--danger)' : memPct > 60 ? 'var(--warning)' : '#6366f1',
+                transition: 'width 0.5s ease',
+              }} />
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
@@ -178,22 +192,42 @@ export default function GpuMonitor({ active }: { active: boolean }) {
       const nodes: any[] = data?.data?.summary ?? []
       if (!nodes.length) { setError(true); return }
 
-      const node = nodes[0]
-      const gpus: GpuSnapshot['gpus'] = (node.gpus ?? []).map((g: any) => ({
-        index:      g.index,
-        name:       g.name,
-        utilGpu:    g.utilizationGpu,
-        memUsedMiB: g.memoryUsed,
-        memTotalMiB: g.memoryTotal,
-        tempC:      g.temperatureC,
-        powerW:     Math.round(g.powerMw / 1000),
-      }))
+      // Flatten GPUs across ALL nodes (head + every worker). Use globally
+      // unique keys (nodeIdx:gpuIdx) so history is per-GPU. Previously
+      // this only looked at nodes[0] which gave you the head node's
+      // idle GPUs and missed all the training activity on workers.
+      const gpus: GpuSnapshot['gpus'] = []
+      let ramUsedTotal = 0
+      let ramTotal = 0
+      nodes.forEach((node: any, nIdx: number) => {
+        const raylet = node.raylet || {}
+        const nodeHost = raylet.hostname || raylet.nodeManagerAddress || node.ip || '?'
+        for (const g of (node.gpus ?? [])) {
+          gpus.push({
+            index:       nIdx * 100 + (g.index ?? 0),  // unique per node
+            nodeIndex:   nIdx,
+            nodeHost,
+            name:        g.name ?? 'GPU',
+            utilGpu:     Math.round(g.utilizationGpu ?? 0),
+            memUsedMiB:  g.memoryUsed  ?? 0,
+            memTotalMiB: g.memoryTotal ?? 0,
+            tempC:       Math.round(g.temperatureC ?? 0),
+            powerW:      Math.round((g.powerMw ?? 0) / 1000),
+          })
+        }
+        // mem[0] = total, mem[1] = available (Ray's convention).
+        if (Array.isArray(node.mem) && node.mem.length >= 2) {
+          ramUsedTotal += Math.max(0, (node.mem[0] ?? 0) - (node.mem[1] ?? 0))
+          ramTotal    += (node.mem[0] ?? 0)
+        }
+      })
 
-      const mem = node.mem
-      const ramUsedGb  = (mem[0] - mem[1]) / 1024 ** 3
-      const ramTotalGb = mem[0] / 1024 ** 3
+      const ramUsedGb  = ramUsedTotal / 1024 ** 3
+      const ramTotalGb = ramTotal     / 1024 ** 3
 
-      const snap: GpuSnapshot = { ts: Date.now(), gpus, ramUsedGb, ramTotalGb }
+      const snap: GpuSnapshot = {
+        ts: Date.now(), gpus, ramUsedGb, ramTotalGb, nodesTotal: nodes.length,
+      }
       setLatest(snap)
       setError(false)
 
@@ -247,7 +281,7 @@ export default function GpuMonitor({ active }: { active: boolean }) {
           Live GPU / Memory &mdash; Ray Cluster
         </span>
         <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 'auto' }}>
-          อัพเดตทุก 2s &middot; {latest.gpus.length} GPU
+          อัพเดตทุก 2s &middot; {latest.nodesTotal} node{latest.nodesTotal === 1 ? '' : 's'} &middot; {latest.gpus.length} GPU
         </span>
       </div>
 
