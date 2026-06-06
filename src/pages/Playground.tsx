@@ -328,11 +328,13 @@ export default function Playground() {
   // Only show models whose inference provider is actually reachable. The
   // DB column `inference_provider` is sticky — it can say 'ray' even after
   // the Ray cluster goes down, or 'modal' without a running cluster — so we
-  // gate visibility on the live cluster-status probes.
+  // gate visibility on the live cluster-status probes. Sim / no-provider
+  // models are also hidden: there's nothing to call, and showing them
+  // alongside real providers confuses the dropdown.
   const providerOnline = (m: Model): boolean => {
     if (m.inference_provider === 'ray')   return rayClusterOnline   === true
     if (m.inference_provider === 'modal') return modalClusterOnline === true
-    return true  // Sim / no provider — doesn't depend on a cluster
+    return false  // no provider assigned — not deployable
   }
 
   const visibleModels = (playMode === 'text'
