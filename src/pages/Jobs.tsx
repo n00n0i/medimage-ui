@@ -196,7 +196,15 @@ export default function Jobs() {
     setRetrying(prev => new Set([...prev, jobId]))
     try {
       const res = await fetch(`/api/jobs/${jobId}/retry`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) {
+        // Surface the API's preflight error message in full — it tells the
+        // user which env var to set on the medimage-api container.
+        let body: any = null
+        try { body = await res.json() } catch { body = { detail: await res.text() } }
+        const detail = (body && (body.detail || body.error)) || `HTTP ${res.status}`
+        alert(`Cannot retry ${jobId}:\n\n${detail}`)
+        return
+      }
       await fetchJobs(true)
     } finally {
       setRetrying(prev => { const s = new Set(prev); s.delete(jobId); return s })

@@ -3577,6 +3577,25 @@ def retry_job(job_id: str):
     old["model_name"] = _normalize_model_name(old.get("model_name", ""))
     _check_zero_shot(old.get("model_name", ""), old.get("engine", ""))
 
+    # Preflight: confirm the Ray cluster can actually reach MinIO at the
+    # host the API will sign the dataset URL against. If not, fail fast
+    # with a clear actionable error instead of letting the user wait 5
+    # minutes for a training run that dies at the first HTTP GET.
+    _ray_minio_url = _resolve_minio_url_for_ray()
+    _hp = _parse_host_port(_ray_minio_url)
+    if not _ping_host_port(_hp[0], _hp[1], timeout=2.0):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"MinIO at {_ray_minio_url} is not reachable from this API "
+                f"container. The Ray worker will fail to download the "
+                f"dataset (Connection refused). "
+                f"Fix: set MINIO_HOST_IP=<ip-of-the-host-running-docker-compose> "
+                f"on the medimage-api container, or MINIO_PUBLIC_URL=http://that-host:9000, "
+                f"then restart the API. See /api/diag/minio for details."
+            ),
+        )
+
     # Strip any legacy [Retry-N] prefix from the name (idempotent cleanup)
     clean_name = _re.sub(r'^(\[Retry-?\d*\]\s*)+', '', old["name"]).strip() or old["name"]
 
