@@ -916,7 +916,7 @@ export default function TrainModel() {
               <button
                 onClick={() => {
                   if (clusterStatus && !clusterStatus.modal.available) {
-                    showToast('Modal cluster is not running — start it in Modal Cluster page first', 'error')
+                    showToast('Modal cluster is not running — start it in Modal Config page first', 'error')
                     return
                   }
                   set('cluster', 'modal')
@@ -932,12 +932,12 @@ export default function TrainModel() {
               >
                 <Cloud size={20} color={config.cluster === 'modal' ? '#8b5cf6' : 'var(--text-muted)'} style={{ flexShrink: 0 }} />
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>Modal Cluster (Cloud GPU)</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>Modal Config (Cloud GPU)</div>
                   <div style={{ fontSize: 11, marginTop: 2 }}>
                     {clusterStatus
                       ? (clusterStatus.modal.available
                           ? <span style={{ color: 'var(--success)' }}>● Running</span>
-                          : <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — start in Modal Cluster page</span>)
+                          : <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — start in Modal Config page</span>)
                       : <span style={{ color: 'var(--text-muted)' }}>Checking...</span>}
                   </div>
                 </div>

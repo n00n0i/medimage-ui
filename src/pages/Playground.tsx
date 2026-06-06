@@ -354,15 +354,17 @@ export default function Playground() {
 
   // Redraw canvas when result or threshold changes
   useEffect(() => {
-    if (!result || !canvasRef.current || !imgRef.current) return
-    const img = imgRef.current
-    const draw = () => {
-      if (result.type === 'detection') drawDetections(canvasRef.current!, img, result.detections, threshold)
-      if (result.type === 'segmentation') drawSegmentation(canvasRef.current!, img, result.masks, threshold)
+    if (!result || !canvasRef.current || !imageUrl) return
+    if (result.type !== 'detection' && result.type !== 'segmentation') return
+    const canvas = canvasRef.current
+    const img = new Image()
+    img.onload = () => {
+      if (imgRef.current) imgRef.current.src = img.src
+      if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
+      if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
     }
-    if (img.complete) draw()
-    else img.onload = draw
-  }, [result, threshold])
+    img.src = imageUrl
+  }, [result, threshold, imageUrl])
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('image/')) return

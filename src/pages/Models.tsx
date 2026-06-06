@@ -160,7 +160,7 @@ export default function Models() {
   const [models, setModels] = useState<Model[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [filter, setFilter] = useState<'all' | 'classification' | 'detection' | 'segmentation'>('all')
+  const [filter, setFilter] = useState<'all' | 'classification' | 'detection' | 'segmentation' | 'llm-text' | 'vlm-finetune' | 'self-supervised'>('all')
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
   // Log modal
@@ -354,11 +354,19 @@ export default function Models() {
       )}
 
       {/* Filter tabs */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 24 }}>
-        {(['all', 'classification', 'detection', 'segmentation'] as const).map(f => (
+      <div style={{ display: 'flex', gap: 8, marginBottom: 24, flexWrap: 'wrap' }}>
+        {([
+          { value: 'all',             label: 'All' },
+          { value: 'classification',  label: 'Classification' },
+          { value: 'detection',       label: 'Detection' },
+          { value: 'segmentation',    label: 'Segmentation' },
+          { value: 'llm-text',        label: 'LLM' },
+          { value: 'vlm-finetune',    label: 'VLM' },
+          { value: 'self-supervised', label: 'Self-Supervised' },
+        ] as const).map(f => (
           <button
-            key={f}
-            onClick={() => setFilter(f)}
+            key={f.value}
+            onClick={() => setFilter(f.value)}
             style={{
               padding: '5px 14px',
               borderRadius: 20,
@@ -367,12 +375,12 @@ export default function Models() {
               border: '1px solid',
               cursor: 'pointer',
               transition: 'all .15s',
-              borderColor: filter === f ? 'var(--primary)' : 'var(--border-default)',
-              background: filter === f ? 'var(--primary)' : 'var(--bg-surface)',
-              color: filter === f ? '#fff' : 'var(--text-secondary)',
+              borderColor: filter === f.value ? 'var(--primary)' : 'var(--border-default)',
+              background: filter === f.value ? 'var(--primary)' : 'var(--bg-surface)',
+              color: filter === f.value ? '#fff' : 'var(--text-secondary)',
             }}
           >
-            {f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
+            {f.label}
           </button>
         ))}
       </div>
@@ -442,10 +450,12 @@ export default function Models() {
 
                 {/* Info */}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>
-                      {m.name}
-                    </span>
+                  {/* Row 1: Name */}
+                  <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                    {m.name}
+                  </span>
+                  {/* Row 2: Badges */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', marginBottom: 4 }}>
                     <span style={{
                       padding: '2px 8px', borderRadius: 12, fontSize: 10, fontWeight: 600,
                       background: typeColor + '20', color: typeColor, textTransform: 'uppercase', letterSpacing: '0.05em',
@@ -461,14 +471,10 @@ export default function Models() {
                       </span>
                     )}
                     {m.training_type === 'llm-text' && (
-                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#8b5cf620', color: '#8b5cf6' }}>
-                        LLM
-                      </span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#8b5cf620', color: '#8b5cf6' }}>LLM</span>
                     )}
                     {m.training_type === 'vlm-finetune' && (
-                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#3b82f620', color: '#3b82f6' }}>
-                        VLM
-                      </span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 10, background: '#3b82f620', color: '#3b82f6' }}>VLM</span>
                     )}
                     <DomainBadge model={m.model} />
                     {m.modal_url && m.inference_provider === 'modal' && (
@@ -482,7 +488,8 @@ export default function Models() {
                       </span>
                     )}
                   </div>
-                  <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
+                  {/* Row 3: Description */}
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
                     {m.model} &middot; {m.engine} &middot; {m.dataset} &middot; {m.epochs} epochs
                   </p>
                 </div>
@@ -734,20 +741,12 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
         initialModalUrl={detail.modal_url ?? ''}
         initialModalKey={detail.modal_api_key ?? ''}
         initialRayUrl={detail.ray_serve_url ?? ''}
-        s3Path={detail.s3_weights_path ?? ''}
       />
     </div>
   )
 }
 
 // ─── Shared sub-components ──────────────────────────────────────────────────
-
-function StatusBadge({ online, checking }: { online: boolean | null; checking: boolean }) {
-  if (checking) return <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}><Loader size={10} className="animate-spin" /> Checking…</span>
-  if (online === true)  return <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><Wifi size={10} /> Online</span>
-  if (online === false) return <span style={{ fontSize: 11, fontWeight: 600, color: '#ef4444', display: 'flex', alignItems: 'center', gap: 4 }}><WifiOff size={10} /> Offline</span>
-  return null
-}
 
 function RayServeTab({ rayUrl, setRayUrl, onAutoSave, modelId }: {
   rayUrl: string
@@ -915,45 +914,51 @@ function RayServeTab({ rayUrl, setRayUrl, onAutoSave, modelId }: {
   )
 }
 
-// ─── Modal Deploy Tab ─────────────────────────────────────────────────────────
+// ─── Modal Deploy Tab (per-model) ────────────────────────────────────────────
 
-function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, checking }: {
-  modalUrl: string
-  setModalUrl: (v: string) => void
-  modalKey: string
-  setModalKey: (v: string) => void
-  online: boolean | null
-  checking: boolean
+function ModalDeployTab({ modelId, initialUrl, initialKey, onDeployed, onStopped }: {
+  modelId: string
+  initialUrl: string
+  initialKey: string
+  onDeployed: (url: string) => void
+  onStopped: () => void
 }) {
-  const [tokenId, setTokenId]         = useState(() => {
-    try { const s = JSON.parse(localStorage.getItem('ray_modal_config') || '{}') as Record<string, string>; return s.tokenId || '' } catch { return '' }
-  })
-  const [tokenSecret, setTokenSecret] = useState(() => {
-    try { const s = JSON.parse(localStorage.getItem('ray_modal_config') || '{}') as Record<string, string>; return s.tokenSecret || '' } catch { return '' }
-  })
-  const [gpuType, setGpuType]         = useState('T4')
-  const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'running' | 'error'>('idle')
-  const [deployLogs, setDeployLogs]   = useState<string[]>([])
-  const [showLogs, setShowLogs]       = useState(false)
-  const [showSecret, setShowSecret]   = useState(false)
-  const [showApiKey, setShowApiKey]   = useState(false)
+  const [gpuType, setGpuType]           = useState('T4')
+  const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'running' | 'stopping' | 'error'>('idle')
+  const [deployLogs, setDeployLogs]     = useState<string[]>([])
+  const [showLogs, setShowLogs]         = useState(false)
+  const [modalUrl, setModalUrl]         = useState(initialUrl)
+  const [modalKey, setModalKey]         = useState(initialKey)
+  const [showApiKey, setShowApiKey]     = useState(false)
+  const [online, setOnline]             = useState<boolean | null>(null)
+  const [checking, setChecking]         = useState(false)
+  const [saving, setSaving]             = useState(false)
+  const [saved, setSaved]               = useState(false)
+  // Saved-credentials state
+  const [credConfigured, setCredConfigured] = useState<boolean | null>(null)
+  const [credTokenId, setCredTokenId]       = useState('')
 
-  // Persist tokens whenever they change
-  useEffect(() => {
-    try {
-      const prev = JSON.parse(localStorage.getItem('ray_modal_config') || '{}')
-      localStorage.setItem('ray_modal_config', JSON.stringify({ ...prev, tokenId, tokenSecret }))
-    } catch { /* ignore */ }
-  }, [tokenId, tokenSecret])
+  const inp: React.CSSProperties = {
+    width: '100%', boxSizing: 'border-box', padding: '7px 10px', fontSize: 12,
+    background: 'var(--bg-card)', border: '1px solid var(--border-subtle)',
+    borderRadius: 7, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)',
+  }
 
-  // Sync deploy state on mount
+  // Load saved credentials status + deploy status
   useEffect(() => {
-    fetch('/api/modal/inference/status').then(r => r.ok ? r.json() : null).then(d => {
-      if (!d) return
-      setDeployStatus(d.status)
-      setDeployLogs(d.logs || [])
-      if (d.status === 'running' && d.url && !modalUrl) setModalUrl(d.url)
-    }).catch(() => {})
+    fetch('/api/modal/credentials')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d) { setCredConfigured(d.configured); setCredTokenId(d.token_id || '') }
+      }).catch(() => {})
+    fetch(`/api/jobs/${modelId}/deploy-modal/status`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d) return
+        setDeployStatus(d.status)
+        setDeployLogs(d.logs || [])
+        if (d.url) { setModalUrl(d.url); onDeployed(d.url) }
+      }).catch(() => {})
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll while deploying
@@ -961,30 +966,40 @@ function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, 
     if (deployStatus !== 'deploying') return
     const id = setInterval(async () => {
       try {
-        const r = await fetch('/api/modal/inference/status')
+        const r = await fetch(`/api/jobs/${modelId}/deploy-modal/status`)
         const d = r.ok ? await r.json() : null
         if (!d) return
         setDeployStatus(d.status)
         setDeployLogs(d.logs || [])
         if (d.status !== 'deploying') {
           clearInterval(id)
-          if (d.status === 'running' && d.url) setModalUrl(d.url)
+          if (d.status === 'running' && d.url) { setModalUrl(d.url); onDeployed(d.url); checkHealth(d.url) }
         }
       } catch { /* ignore */ }
-    }, 3000)
+    }, 4000)
     return () => clearInterval(id)
   }, [deployStatus]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  async function checkHealth(url?: string) {
+    const target = url || modalUrl; if (!target) return
+    setChecking(true)
+    try {
+      const r = await fetch(`/api/jobs/${modelId}/modal-status`)
+      const d = r.ok ? await r.json() : { online: false }
+      setOnline(d.online)
+    } catch { setOnline(false) } finally { setChecking(false) }
+  }
+
   async function deploy() {
-    if (!tokenId || !tokenSecret) return
     setDeployStatus('deploying')
-    setDeployLogs(['กำลัง deploy บน Modal.com… (ใช้เวลา 1–3 นาที)'])
+    setDeployLogs(['กำลัง deploy บน Modal.com… (ใช้เวลา 2–5 นาที)'])
     setShowLogs(true)
     try {
-      const r = await fetch('/api/modal/inference/deploy', {
+      // Send only gpu_type — backend uses saved credentials from DB
+      const r = await fetch(`/api/jobs/${modelId}/deploy-modal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token_id: tokenId, token_secret: tokenSecret, gpu_type: gpuType }),
+        body: JSON.stringify({ gpu_type: gpuType }),
       })
       if (!r.ok) {
         const e = await r.json()
@@ -997,56 +1012,76 @@ function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, 
     }
   }
 
-  const inp: React.CSSProperties = {
-    width: '100%', boxSizing: 'border-box', padding: '7px 10px', fontSize: 12,
-    background: 'var(--bg-card)', border: '1px solid var(--border-subtle)',
-    borderRadius: 7, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)',
+  async function stop() {
+    if (!confirm('หยุด Modal app สำหรับ model นี้?')) return
+    setDeployStatus('stopping')
+    try {
+      await fetch(`/api/jobs/${modelId}/deploy-modal/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      setModalUrl(''); setOnline(null); setDeployLogs([])
+      onStopped()
+    } finally { setDeployStatus('idle') }
+  }
+
+  async function saveKey() {
+    setSaving(true)
+    try {
+      await fetch(`/api/jobs/${modelId}/deployment`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modal_url: modalUrl, modal_api_key: modalKey, inference_provider: 'modal' }),
+      })
+      setSaved(true); setTimeout(() => setSaved(false), 2000)
+    } finally { setSaving(false) }
+  }
+
+  if (credConfigured == null) return null
+
+  // Not configured yet
+  if (!credConfigured) {
+    return (
+      <div style={{ padding: '16px', borderRadius: 8, background: '#8b5cf610', border: '1px solid #8b5cf630', textAlign: 'center' }}>
+        <Cloud size={20} color="#8b5cf6" style={{ marginBottom: 8 }} />
+        <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 12 }}>
+          ยังไม่ได้ตั้งค่า Modal credentials
+        </div>
+        <a href="/modal-cluster" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 16px', borderRadius: 8, background: '#8b5cf6', color: '#fff', textDecoration: 'none', fontSize: 12, fontWeight: 600 }}>
+          <Cloud size={12} /> ไปตั้งค่าที่ Modal Config
+        </a>
+      </div>
+    )
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {/* Credential info */}
+      {credConfigured && credTokenId && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 6, background: '#22c55e10', border: '1px solid #22c55e30' }}>
+          <CheckCircle2 size={12} color="#22c55e" />
+          <span style={{ fontSize: 11, color: '#22c55e' }}>Modal credentials: <code style={{ fontFamily: 'var(--font-mono)' }}>{credTokenId}</code></span>
+          <a href="/modal-cluster" style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)', textDecoration: 'none' }}>เปลี่ยน</a>
+        </div>
+      )}
+
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
-          Deploy inference app บน <strong style={{ color: '#8b5cf6' }}>Modal.com</strong> GPU
+          Deploy model นี้บน <strong style={{ color: '#8b5cf6' }}>Modal.com</strong> — weights ดึงจาก MinIO อัตโนมัติ
         </p>
-        <StatusBadge online={online} checking={checking} />
+        {online !== null && (
+          <span style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, color: online ? '#22c55e' : '#ef4444' }}>
+            {online ? <Wifi size={11} /> : <WifiOff size={11} />} {online ? 'Online' : 'Offline'}
+          </span>
+        )}
+        {checking && <Loader size={11} className="animate-spin" style={{ color: 'var(--text-muted)' }} />}
       </div>
 
-      {/* Deployed URL display */}
+      {/* Running URL */}
       {modalUrl && (
         <div style={{ padding: '7px 10px', borderRadius: 7, background: '#8b5cf615', border: '1px solid #8b5cf630', display: 'flex', alignItems: 'center', gap: 8 }}>
           <Cloud size={12} color="#8b5cf6" style={{ flexShrink: 0 }} />
           <code style={{ fontSize: 11, flex: 1, color: '#8b5cf6', wordBreak: 'break-all' }}>{modalUrl}</code>
           <a href={modalUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-muted)', display: 'flex' }}><ExternalLink size={12} /></a>
-          <button onClick={() => setModalUrl('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex' }}><X size={12} /></button>
         </div>
       )}
-
-      {/* Token ID */}
-      <div>
-        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Modal Token ID</label>
-        <input type="text" value={tokenId} onChange={e => setTokenId(e.target.value)}
-          placeholder="ak-xxxxxxxxxxxxxxxx"
-          style={inp}
-        />
-      </div>
-
-      {/* Token Secret */}
-      <div>
-        <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>Modal Token Secret</label>
-        <div style={{ position: 'relative' }}>
-          <input type={showSecret ? 'text' : 'password'} value={tokenSecret} onChange={e => setTokenSecret(e.target.value)}
-            placeholder="as-xxxxxxxxxxxxxxxx"
-            style={{ ...inp, paddingRight: 32 }}
-          />
-          <button onClick={() => setShowSecret(v => !v)} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex' }}>
-            {showSecret ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
-        </div>
-        <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
-          ดู token ได้ที่ <a href="https://modal.com/settings" target="_blank" rel="noopener noreferrer" style={{ color: '#8b5cf6' }}>modal.com/settings</a> — Token ID เก็บไว้ใน localStorage แล้ว
-        </p>
-      </div>
 
       {/* GPU type */}
       <div>
@@ -1059,47 +1094,64 @@ function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, 
         </select>
       </div>
 
-      {/* Deploy button + status */}
+      {/* Action buttons */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <button
           className="btn btn-sm"
           style={{ display: 'flex', alignItems: 'center', gap: 5, background: '#8b5cf6', color: '#fff', border: 'none' }}
           onClick={deploy}
-          disabled={deployStatus === 'deploying' || !tokenId || !tokenSecret}
+          disabled={deployStatus === 'deploying' || !credConfigured}
         >
           {deployStatus === 'deploying' ? <Loader size={11} className="animate-spin" /> : <Cloud size={11} />}
-          {deployStatus === 'running' ? 'Redeploy' : deployStatus === 'deploying' ? 'Deploying…' : 'Deploy Inference App'}
+          {deployStatus === 'running' ? 'Redeploy' : deployStatus === 'deploying' ? 'Deploying…' : 'Deploy to Modal'}
         </button>
+        {deployStatus === 'running' && (
+          <>
+            <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={() => checkHealth()}>
+              {checking ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={11} />} Check
+            </button>
+            <button className="btn btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4, background: '#ef444415', color: '#ef4444', border: '1px solid #ef444430' }} onClick={stop} disabled={(deployStatus as string) === 'stopping'}>
+              <StopCircle size={11} /> Stop
+            </button>
+          </>
+        )}
         {deployLogs.length > 0 && (
           <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={() => setShowLogs(v => !v)}>
             <Terminal size={11} /> Logs
           </button>
         )}
-        {deployStatus === 'running' && <span style={{ fontSize: 11, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={11} /> Deployed</span>}
+        {deployStatus === 'running' && <span style={{ fontSize: 11, color: '#22c55e', display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={11} /> Running</span>}
         {deployStatus === 'error'   && <span style={{ fontSize: 11, color: '#ef4444' }}>Deploy failed</span>}
       </div>
 
       {showLogs && deployLogs.length > 0 && (
-        <pre style={{
-          margin: 0, padding: '8px 10px', fontSize: 10, lineHeight: 1.5, borderRadius: 7,
-          background: 'var(--bg-base)', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
-          maxHeight: 160, overflowY: 'auto', border: '1px solid var(--border-subtle)',
-        }}>{deployLogs.join('\n')}</pre>
+        <div style={{ position: 'relative' }}>
+          <pre style={{
+            margin: 0, padding: '8px 10px', fontSize: 10, lineHeight: 1.5, borderRadius: 7,
+            background: 'var(--bg-base)', color: deployStatus === 'error' ? '#ef4444' : 'var(--text-secondary)',
+            fontFamily: 'var(--font-mono)', maxHeight: 180, overflowY: 'auto',
+            border: `1px solid ${deployStatus === 'error' ? '#ef444440' : 'var(--border-subtle)'}`,
+          }}>{deployLogs.join('\n')}</pre>
+          <CopyLogButton text={deployLogs.join('\n')} />
+        </div>
       )}
 
-      {/* API key for already-deployed endpoint */}
+      {/* API Key */}
       {modalUrl && (
         <div>
           <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: 4 }}>API Key (ถ้ามี)</label>
           <div style={{ position: 'relative' }}>
             <input type={showApiKey ? 'text' : 'password'} value={modalKey} onChange={e => setModalKey(e.target.value)}
-              placeholder="Bearer token (เว้นว่างถ้าไม่มี)"
-              style={{ ...inp, paddingRight: 32 }}
+              placeholder="Bearer token (เว้นว่างถ้าไม่มี)" style={{ ...inp, paddingRight: 32 }}
             />
             <button onClick={() => setShowApiKey(v => !v)} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex' }}>
               {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
             </button>
           </div>
+          <button className="btn btn-primary btn-sm" style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 5 }} onClick={saveKey} disabled={saving}>
+            {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
+            {saved ? 'Saved!' : 'Save Key'}
+          </button>
         </div>
       )}
     </div>
@@ -1111,8 +1163,6 @@ function ModalDeployTab({ modalUrl, setModalUrl, modalKey, setModalKey, online, 
 function GlobalEndpointConfig() {
   type Tab = 'modal' | 'ray'
   const [tab, setTab]           = useState<Tab>('ray')
-  const [modalUrl, setModalUrl] = useState('')
-  const [modalKey, setModalKey] = useState('')
   const [rayUrl, setRayUrl]     = useState('')
   const [saving, setSaving]     = useState(false)
   const [saved, setSaved]       = useState(false)
@@ -1120,14 +1170,16 @@ function GlobalEndpointConfig() {
   const [modalOnline, setModalOnline] = useState<boolean | null>(null)
   const [rayOnline, setRayOnline]     = useState<boolean | null>(null)
   const [checking, setChecking]       = useState(false)
+  const [modalCreds, setModalCreds]   = useState<{ configured: boolean; token_id?: string; updated_at?: string } | null>(null)
 
   useEffect(() => {
     fetch('/api/settings/inference').then(r => r.ok ? r.json() : null).then(d => {
       if (!d) return
       if (d.provider) setTab(d.provider as Tab)
-      if (d.modal_url) setModalUrl(d.modal_url)
-      if (d.modal_api_key) setModalKey(d.modal_api_key)
       if (d.ray_serve_url) setRayUrl(d.ray_serve_url)
+    }).catch(() => {})
+    fetch('/api/modal/credentials').then(r => r.ok ? r.json() : null).then(d => {
+      if (d) setModalCreds(d)
     }).catch(() => {})
   }, [])
 
@@ -1159,14 +1211,14 @@ function GlobalEndpointConfig() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: tab,
-          modal_url: modalUrl,
-          modal_api_key: modalKey,
+          modal_url: '',
+          modal_api_key: '',
           ray_serve_url: rayUrl,
         }),
       })
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
-      if (tab === 'modal' && modalUrl) checkStatus()
+      if (tab === 'modal') checkStatus()
     } finally {
       setSaving(false)
     }
@@ -1238,12 +1290,20 @@ function GlobalEndpointConfig() {
           </div>
 
           {tab === 'modal' && (
-            <div style={{ marginBottom: 14 }}>
-              <ModalDeployTab
-                modalUrl={modalUrl} setModalUrl={setModalUrl}
-                modalKey={modalKey} setModalKey={setModalKey}
-                online={modalOnline} checking={checking && tab === 'modal'}
-              />
+            <div style={{ marginBottom: 14, padding: '10px 12px', borderRadius: 8, background: 'var(--bg-base)', border: '1px solid var(--border-subtle)' }}>
+              {modalCreds?.configured ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: '#22c55e20', color: '#22c55e' }}>✓ Configured</span>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{modalCreds.token_id}</span>
+                  {modalCreds.updated_at && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 'auto' }}>{new Date(modalCreds.updated_at).toLocaleDateString()}</span>}
+                </div>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: '#ef444420', color: '#ef4444' }}>Not configured</span>
+                  <a href="/modal-cluster" style={{ fontSize: 12, color: '#8b5cf6' }}>ตั้งค่าที่ Modal Config →</a>
+                </div>
+              )}
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8, marginBottom: 0 }}>ใช้ credentials จาก Modal Config — แต่ละ model ใช้ endpoint ของตัวเองที่ deploy ไว้</p>
             </div>
           )}
 
@@ -1257,7 +1317,7 @@ function GlobalEndpointConfig() {
                   await fetch('/api/settings/inference', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ provider: 'ray', modal_url: modalUrl, modal_api_key: modalKey, ray_serve_url: url }),
+                    body: JSON.stringify({ provider: 'ray', modal_url: '', modal_api_key: '', ray_serve_url: url }),
                   })
                   setSaved(true); setTimeout(() => setSaved(false), 2000)
                 }}
@@ -1270,7 +1330,7 @@ function GlobalEndpointConfig() {
               {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
               {saved ? 'Saved!' : 'Save & Apply to All'}
             </button>
-            {(modalUrl || rayUrl) && (
+            {(modalCreds?.configured || rayUrl) && (
               <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={checkStatus} disabled={checking}>
                 {checking ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={11} />} Check Status
               </button>
@@ -1288,68 +1348,19 @@ function GlobalEndpointConfig() {
 
 // ─── Deploy Section (Modal.com + Ray Serve endpoint config) ──────────────────
 
-function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl, initialModalKey, initialRayUrl, s3Path }: {
+function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl, initialModalKey, initialRayUrl }: {
   modelId: string
   trainingType: string
   initialProvider: string
   initialModalUrl: string
   initialModalKey: string
   initialRayUrl: string
-  s3Path: string
 }) {
   type Tab = 'modal' | 'ray'
   const [tab, setTab]         = useState<Tab>((initialProvider as Tab) || 'ray')
   const [modalUrl, setModalUrl]   = useState(initialModalUrl)
   const [modalKey, setModalKey]   = useState(initialModalKey)
   const [rayUrl, setRayUrl]       = useState(initialRayUrl)
-  const [saving, setSaving]       = useState(false)
-  const [saved, setSaved]         = useState(false)
-  const [modalOnline, setModalOnline] = useState<boolean | null>(null)
-  const [checkingModal, setCheckingModal] = useState(false)
-
-  useEffect(() => {
-    if (initialModalUrl) checkStatus()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  async function checkStatus() {
-    setCheckingModal(true)
-    try {
-      const r = await fetch(`/api/jobs/${modelId}/modal-status`)
-      const d = r.ok ? await r.json() : { online: false }
-      setModalOnline(d.online)
-    } catch {
-      setModalOnline(false)
-    } finally {
-      setCheckingModal(false)
-    }
-  }
-
-  async function save() {
-    setSaving(true)
-    try {
-      await fetch(`/api/jobs/${modelId}/deployment`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          modal_url: modalUrl,
-          modal_api_key: modalKey,
-          ray_serve_url: rayUrl,
-          inference_provider: tab,
-        }),
-      })
-      setSaved(true)
-      setTimeout(() => setSaved(false), 2000)
-      if (tab === 'modal' && modalUrl) checkStatus()
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function clearAll() {
-    await fetch(`/api/jobs/${modelId}/deployment`, { method: 'DELETE' })
-    setModalUrl(''); setModalKey(''); setRayUrl(''); setTab('ray')
-    setModalOnline(null)
-  }
 
   const TABS: { id: Tab; label: string; color: string }[] = [
     { id: 'modal',    label: 'Modal',     color: '#8b5cf6' },
@@ -1382,20 +1393,16 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
       </div>
 
       <div style={{ padding: '14px 16px' }}>
-        {/* S3 weights path (display only, shown for all tabs) */}
-        {s3Path && (
-          <div style={{ marginBottom: 14, padding: '8px 10px', borderRadius: 7, background: '#0ea5e910', border: '1px solid #0ea5e930' }}>
-            <p style={{ fontSize: 10, color: '#0ea5e9', fontWeight: 600, marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>S3 / MinIO Weights</p>
-            <code style={{ fontSize: 11, color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{s3Path}</code>
-          </div>
-        )}
+
 
         {/* Modal tab */}
         {tab === 'modal' && (
           <ModalDeployTab
-            modalUrl={modalUrl} setModalUrl={setModalUrl}
-            modalKey={modalKey} setModalKey={setModalKey}
-            online={modalOnline} checking={checkingModal}
+            modelId={modelId}
+            initialUrl={modalUrl}
+            initialKey={modalKey}
+            onDeployed={(url) => setModalUrl(url)}
+            onStopped={() => { setModalUrl(''); setModalKey('') }}
           />
         )}
 
@@ -1412,36 +1419,11 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
                 body: JSON.stringify({ modal_url: modalUrl, modal_api_key: modalKey, ray_serve_url: url, inference_provider: 'ray' }),
               })
               setTab('ray')
-              setSaved(true); setTimeout(() => setSaved(false), 2000)
             }}
           />
         )}
 
-        {/* Buttons */}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 14 }}>
-          {tab === 'modal' && (
-            <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={save} disabled={saving}>
-              {saving ? <Loader size={11} className="animate-spin" /> : <Save size={11} />}
-              {saved ? 'Saved!' : 'Save & Activate'}
-            </button>
-          )}
-          {tab === 'modal' && modalUrl && (
-            <>
-              <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5 }} onClick={checkStatus} disabled={checkingModal}>
-                {checkingModal ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={11} />} Check
-              </button>
-              <a href={modalUrl} target="_blank" rel="noopener noreferrer" className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5, textDecoration: 'none' }}>
-                <ExternalLink size={11} /> Open
-              </a>
-            </>
-          )}
-          {tab === 'modal' && rayUrl && null}
-          {(modalUrl || modalKey || rayUrl) && (
-            <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--danger)' }} onClick={clearAll}>
-              <X size={11} /> Clear All
-            </button>
-          )}
-        </div>
+
       </div>
     </div>
   )

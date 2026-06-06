@@ -121,6 +121,14 @@ def init_db():
                 created_at  INTEGER NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS modal_credentials (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                token_id    TEXT NOT NULL,
+                token_secret TEXT NOT NULL,
+                updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
 
 
@@ -505,6 +513,94 @@ async def profile_delete_totp(cred_id: str, request: Request):
         conn.commit()
     if result.rowcount == 0:
         raise HTTPException(404, "Credential not found")
+
+
+# ─── Modal Credentials (global, saved in SQLite) ──────────────────────────────
+
+def _load_modal_creds() -> dict | None:
+    """Return {token_id, token_secret} from DB, or None if not set."""
+    with get_db() as conn:
+        row = conn.execute("SELECT token_id, token_secret FROM modal_credentials WHERE id=1").fetchone()
+    if row:
+        return {"token_id": row["token_id"], "token_secret": row["token_secret"]}
+    return None
+
+
+@app.get("/api/modal/credentials")
+def modal_credentials_get():
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT token_id, updated_at FROM modal_credentials WHERE id=1"
+        ).fetchone()
+    if not row:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "token_id": row["token_id"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.post("/api/modal/credentials")
+async def modal_credentials_save(body: dict):
+    token_id = (body.get("token_id") or "").strip()
+    token_secret = (body.get("token_secret") or "").strip()
+    if not token_id or not token_secret:
+        raise HTTPException(400, "token_id and token_secret required")
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO modal_credentials (id, token_id, token_secret, updated_at)
+               VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(id) DO UPDATE SET
+                 token_id=excluded.token_id,
+                 token_secret=excluded.token_secret,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (token_id, token_secret),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/modal/credentials")
+def modal_credentials_delete():
+    with get_db() as conn:
+        conn.execute("DELETE FROM modal_credentials WHERE id=1")
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/modal/verify")
+def modal_credentials_verify():
+    """Test saved Modal credentials by running `modal token inspect`."""
+    creds = _load_modal_creds()
+    if not creds:
+        raise HTTPException(400, "No Modal credentials saved")
+    env = os.environ.copy()
+    env["MODAL_TOKEN_ID"] = creds["token_id"]
+    env["MODAL_TOKEN_SECRET"] = creds["token_secret"]
+    try:
+        proc = subprocess.run(
+            ["python3", "-m", "modal", "profile", "current"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        ok = proc.returncode == 0
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if not ok and not output:
+            output = "Could not connect — check credentials"
+        return {"ok": ok, "output": output[:400]}
+    except Exception as exc:
+        return {"ok": False, "output": str(exc)[:400]}
+
+
+@app.get("/api/modal/deployments")
+def modal_deployments_list():
+    """List all models currently deployed via Modal."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, model_name, modal_url, inference_provider FROM jobs "
+            "WHERE inference_provider='modal' AND modal_url != '' ORDER BY created_at DESC"
+        ).fetchall()
+    return {"deployments": [dict(r) for r in rows]}
 
 
 class ChangePasswordRequest(BaseModel):
@@ -3199,10 +3295,19 @@ def patch_deployment(job_id: str, req: DeploymentRequest):
 
 async def _ping_endpoint(url: str, api_key: str) -> dict:
     """Ping a /health endpoint and return {online, status_code?, error?}"""
-    health_url = url.rstrip("/") + "/health"
+    # Modal per-model URLs end with the function name
+    # Health endpoint is either the stored URL itself (if it ends with 'health')
+    # or we swap 'inference' -> 'health'
+    if "modal.run" in url:
+        if url.rstrip("/").endswith("-health.modal.run") or "-health" in url.split("modal.run")[0].split("--")[-1]:
+            health_url = url.rstrip("/")
+        else:
+            health_url = url.replace("inference", "health").rstrip("/")
+    else:
+        health_url = url.rstrip("/") + "/health"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(health_url, headers=headers)
         return {"online": resp.status_code < 500, "status_code": resp.status_code}
     except Exception as e:
@@ -3876,109 +3981,624 @@ async def modal_nodes_ep():
         raise HTTPException(status_code=502, detail=f"Cannot reach Modal Ray Dashboard: {e}")
 
 
-# ─── Modal Inference Deploy ────────────────────────────────────────────────────
+# ─── Modal Inference Deploy (per-model) ───────────────────────────────────────
 
-_modal_infer_state: dict = {
-    "status": "idle",   # idle | deploying | running | error
-    "url": None,
-    "logs": [],
-}
+# Per-model deploy state (same pattern as Ray)
+_modal_deploy_states: dict[str, dict] = {}
+
+def _get_modal_deploy_state(job_id: str) -> dict:
+    if job_id not in _modal_deploy_states:
+        _modal_deploy_states[job_id] = {"status": "idle", "url": None, "logs": []}
+    return _modal_deploy_states[job_id]
 
 
-def _modal_infer_script(gpu_type: str = "T4") -> str:
+def _modal_model_script(
+    job_id: str, training_type: str, engine: str, model_name: str,
+    num_classes: int, class_names: list, gpu_type: str,
+    minio_url: str, minio_access: str, minio_secret: str,
+    weights_bucket: str, weights_key: str,
+    volume_name: str = None,
+) -> str:
     gpu_spec = f'gpu="{gpu_type}"' if gpu_type != "cpu" else "gpu=None"
+    app_name = f"medimage-{job_id}"
+    # Build pip list based on engine / training type
+    pip_pkgs = ["fastapi", "uvicorn", "python-multipart", "pillow", "boto3", "numpy<2.0"]
+    if training_type in ("detection", "segmentation") and engine == "Ultralytics":
+        pip_pkgs += ["ultralytics"]
+    elif engine == "MONAI":
+        pip_pkgs += ["torch", "torchvision", "monai"]
+    elif engine == "HuggingFace":
+        pip_pkgs += ["torch", "torchvision", "transformers", "accelerate"]
+    elif engine == "Segmentation Models PyTorch":
+        pip_pkgs += ["torch", "torchvision", "segmentation-models-pytorch"]
+    elif training_type in ("llm-text", "vlm-finetune"):
+        pip_pkgs += ["torch", "transformers", "accelerate", "peft"]
+    else:
+        pip_pkgs += ["torch", "torchvision", "timm"]
+    pip_str = repr(pip_pkgs)
+    cls_json = json.dumps(class_names)
+
+    # Volume mount or _bake_weights (run_function)
+    if volume_name:
+        vol_line = f"vol = modal.Volume.from_name({repr(volume_name)})"
+        # single braces — this is a plain string, NOT an f-string
+        volumes_spec = ', volumes={"/weights": vol}'
+        run_bake = ""
+    else:
+        vol_line = ""
+        volumes_spec = ""
+        run_bake = "\n            .run_function(_bake_weights)"
+
     return textwrap.dedent(f"""\
-        import modal
-        app = modal.App("medimage-inference")
+        import modal, os, io, zipfile, json, time
+        from pathlib import Path
+        from fastapi import Request
+
+        TRAINING_TYPE  = {repr(training_type)}
+        ENGINE         = {repr(engine)}
+        MODEL_NAME     = {repr(model_name)}
+        MODEL_ID       = {repr(job_id)}
+        MINIO_URL      = {repr(minio_url)}
+        MINIO_ACCESS   = {repr(minio_access)}
+        MINIO_SECRET   = {repr(minio_secret)}
+        WEIGHTS_BUCKET = {repr(weights_bucket)}
+        WEIGHTS_KEY    = {repr(weights_key)}
+        NUM_CLASSES    = {num_classes}
+        CLASS_NAMES    = {cls_json}
+
+        app = modal.App({repr(app_name)})
+        {vol_line}
+
+        WEIGHTS_DIR = "/weights"
+
+        def _bake_weights():
+            # Download weights from MinIO into the image at build time.
+            # Values are inlined at script generation time (not read from globals).
+            import boto3, zipfile, os
+            from botocore.config import Config
+            from pathlib import Path
+            _minio_url    = {repr(minio_url)}
+            _minio_access = {repr(minio_access)}
+            _minio_secret = {repr(minio_secret)}
+            _bucket       = {repr(weights_bucket)}
+            _key          = {repr(weights_key)}
+            if not _key:
+                return
+            os.makedirs(WEIGHTS_DIR, exist_ok=True)
+            s3 = boto3.client("s3", endpoint_url=_minio_url,
+                              aws_access_key_id=_minio_access, aws_secret_access_key=_minio_secret,
+                              region_name="us-east-1", config=Config(s3={{"addressing_style": "path"}}))
+            raw = Path(WEIGHTS_DIR) / "raw_weights"
+            try:
+                s3.download_file(_bucket, _key, str(raw))
+                print(f"[modal-build] Downloaded weights: {{_key}} ({{raw.stat().st_size}} bytes)")
+            except Exception as e:
+                print(f"[modal-build] Could not download weights: {{e}}")
+                return
+            with open(raw, "rb") as f:
+                magic = f.read(4)
+            if magic[:2] == b"PK":
+                out = Path(WEIGHTS_DIR) / "extracted"
+                out.mkdir(exist_ok=True)
+                with zipfile.ZipFile(raw) as z:
+                    z.extractall(out)
+                raw.unlink()
+                print(f"[modal-build] Extracted zip to {{out}}")
+            else:
+                raw.rename(Path(WEIGHTS_DIR) / "model.pt")
+                print(f"[modal-build] Saved model.pt")
+
         image = (
             modal.Image.debian_slim(python_version="3.11")
-            .pip_install("fastapi", "uvicorn", "python-multipart", "pillow")
+            .apt_install("libgl1-mesa-glx", "libglib2.0-0")
+            .pip_install(*{pip_str}){run_bake}
         )
-        @app.function(image=image, {gpu_spec}, timeout=300, keep_warm=1)
-        @modal.asgi_app()
-        def serve():
-            from fastapi import FastAPI, File, Form, UploadFile
-            from typing import Optional
-            web = FastAPI()
 
-            @web.post("/inference")
-            async def infer(
-                training_type: str = Form(...),
-                model_id: str = Form(""),
-                conf_threshold: float = Form(0.5),
-                image: Optional[UploadFile] = File(None),
-                prompt: str = Form(""),
-                system_prompt: str = Form(""),
-            ):
-                # TODO: load your model and run actual inference
-                if training_type in ("llm-text", "vlm-finetune"):
-                    return {{"type": training_type, "response": f"Echo: {{prompt[:80]}}", "tokens": 0, "simulated": False}}
-                return {{"type": training_type, "predictions": [], "simulated": False}}
+        def _download_weights():
+            import zipfile
+            from pathlib import Path
+            if not WEIGHTS_KEY:
+                return None
+            extracted = Path(WEIGHTS_DIR) / "extracted"
+            if extracted.exists():
+                return extracted
+            pt = Path(WEIGHTS_DIR) / "model.pt"
+            if pt.exists():
+                with open(pt, "rb") as _f:
+                    _magic = _f.read(4)
+                if _magic[:2] == b"PK":
+                    extracted.mkdir(exist_ok=True)
+                    with zipfile.ZipFile(pt) as _z:
+                        _z.extractall(extracted)
+                    return extracted
+                return pt
+            return None
 
-            @web.get("/health")
-            async def health():
-                return {{"status": "ok"}}
+        _model = None
+        _tokenizer = None
+        _hf_processor = None
+        _hf_id2label = None
+        _smp_engine = False
 
-            return web
+        def _load(wp):
+            global _model, _tokenizer, _hf_processor, _hf_id2label, _smp_engine
+            tt, eng = TRAINING_TYPE, ENGINE
+            labels = CLASS_NAMES or [f"class_{{i}}" for i in range(NUM_CLASSES)]
+            if eng == "HuggingFace" and tt in ("detection", "classification", "segmentation"):
+                import torch
+                from transformers import AutoImageProcessor
+                id2label = {{i: n for i, n in enumerate(labels)}} if labels else {{}}
+                num_cls = NUM_CLASSES
+                _hf_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+                if wp is not None:
+                    pt_path = wp if (hasattr(wp, "is_file") and wp.is_file()) else (wp / "model.pt" if hasattr(wp, "__truediv__") else wp)
+                    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+                    id2label = ckpt.get("id2label", {{int(k): v for k, v in ckpt.get("config", {{}}).get("id2label", {{}}).items()}}) or id2label
+                    num_cls = len(id2label) or NUM_CLASSES
+                _hf_id2label = id2label
+                label2id = {{v: k for k, v in id2label.items()}}
+                if tt == "detection":
+                    from transformers import AutoModelForObjectDetection
+                    m = AutoModelForObjectDetection.from_pretrained(MODEL_NAME, num_labels=num_cls, id2label=id2label, label2id=label2id, ignore_mismatched_sizes=True)
+                elif tt == "classification":
+                    from transformers import AutoModelForImageClassification
+                    m = AutoModelForImageClassification.from_pretrained(MODEL_NAME, num_labels=num_cls, id2label=id2label, label2id=label2id, ignore_mismatched_sizes=True)
+                else:
+                    from transformers import AutoModelForSemanticSegmentation
+                    m = AutoModelForSemanticSegmentation.from_pretrained(MODEL_NAME, num_labels=num_cls, ignore_mismatched_sizes=True)
+                if wp is not None:
+                    m.load_state_dict(ckpt["model_state_dict"], strict=False)
+                _model = m.eval()
+                return
+            if tt in ("detection", "segmentation") and eng == "Ultralytics":
+                from ultralytics import YOLO
+                _model = YOLO(str(wp) if wp is not None else (MODEL_NAME or "yolov8n.pt"))
+            elif tt == "classification" and eng != "MONAI":
+                import torch, timm
+                arch = MODEL_NAME.replace("-", "_")
+                if wp is None:
+                    _model = timm.create_model(arch, pretrained=True, num_classes=NUM_CLASSES).eval()
+                else:
+                    ckpt = torch.load(str(wp), map_location="cpu", weights_only=False)
+                    if isinstance(ckpt, torch.nn.Module):
+                        _model = ckpt.eval(); return
+                    state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    m = timm.create_model(arch, pretrained=False, num_classes=NUM_CLASSES)
+                    m.load_state_dict(state, strict=False)
+                    _model = m.eval()
+            elif tt == "segmentation" and eng == "Segmentation Models PyTorch":
+                import torch, segmentation_models_pytorch as smp
+                if wp is None:
+                    _model = smp.Unet(encoder_name="resnet34", in_channels=3, classes=NUM_CLASSES).eval()
+                    _smp_engine = True
+                else:
+                    ckpt_path = wp if wp.is_file() else (wp / "model.pt")
+                    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+                    arch = ckpt.get("arch", "unet")
+                    enc  = ckpt.get("encoder", "resnet34")
+                    nc   = ckpt.get("num_classes", NUM_CLASSES)
+                    m = getattr(smp, arch.capitalize())(encoder_name=enc, in_channels=3, classes=nc)
+                    m.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+                    _model = m.eval(); _smp_engine = True
+            elif eng == "MONAI" and tt == "classification":
+                import torch
+                from monai.networks.nets import DenseNet121
+                in_ch, n_cls = 1, NUM_CLASSES
+                if wp is not None:
+                    pt_path = wp if (hasattr(wp, "is_file") and wp.is_file()) else (wp / "model.pt" if hasattr(wp, "__truediv__") else wp)
+                    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+                    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    for k, v in state.items():
+                        if "conv" in k and len(v.shape) == 4: in_ch = v.shape[1]; break
+                    for k, v in state.items():
+                        if "out" in k and len(v.shape) == 2: n_cls = v.shape[0]
+                    m = DenseNet121(spatial_dims=2, in_channels=in_ch, out_channels=n_cls)
+                    m.load_state_dict(state, strict=False)
+                    _model = m.eval()
+                else:
+                    _model = DenseNet121(spatial_dims=2, in_channels=in_ch, out_channels=NUM_CLASSES).eval()
+            elif eng == "MONAI" and tt == "segmentation":
+                import torch
+                from monai.networks.nets import UNet
+                in_ch = 1
+                if wp is not None:
+                    pt_path = wp if (hasattr(wp, "is_file") and wp.is_file()) else (wp / "model.pt" if hasattr(wp, "__truediv__") else wp)
+                    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+                    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    for k, v in state.items():
+                        if "conv" in k and len(v.shape) == 4: in_ch = v.shape[1]; break
+                    m = UNet(spatial_dims=2, in_channels=in_ch, out_channels=NUM_CLASSES, channels=(16,32,64,128,256), strides=(2,2,2,2))
+                    m.load_state_dict(state, strict=False)
+                    _model = m.eval()
+                else:
+                    _model = UNet(spatial_dims=2, in_channels=in_ch, out_channels=NUM_CLASSES, channels=(16,32,64,128,256), strides=(2,2,2,2)).eval()
+            elif tt in ("llm-text", "vlm-finetune"):
+                import torch
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+                from peft import PeftModel
+                _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                _model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if wp is not None:
+                    _model = PeftModel.from_pretrained(_model, str(wp))
+            else:
+                import torch
+                if wp is not None:
+                    pt = wp if (wp.is_file() if hasattr(wp, "is_file") else True) else next(wp.glob("*.pt"), None)
+                    if pt:
+                        _model = torch.load(str(pt), map_location="cpu", weights_only=False)
+
+        @app.cls(image=image, {gpu_spec}, timeout=600, min_containers=1, scaledown_window=300{volumes_spec})
+        class ModelService:
+            @modal.enter()
+            def startup(self):
+                global _model
+                print(f"[modal] Loading model {{MODEL_ID}} ({{TRAINING_TYPE}}/{{ENGINE}})…")
+                wp = _download_weights()
+                _load(wp)
+                print(f"[modal] Model loaded: {{_model is not None}}")
+
+            @modal.fastapi_endpoint(method="GET")
+            def health(self):
+                return {{"status": "ok", "model_id": MODEL_ID, "model_loaded": _model is not None}}
+
+            @modal.fastapi_endpoint(method="POST")
+            async def inference(self, request: Request):
+                import io as _io
+                body = await request.form()
+                tt = TRAINING_TYPE
+                conf = float(body.get("conf_threshold", 0.5))
+                prompt = str(body.get("prompt", ""))
+                system_prompt = str(body.get("system_prompt", ""))
+                image_bytes = None
+                if "image" in body:
+                    _img_file = body["image"]
+                    image_bytes = await _img_file.read()
+
+                if _model is None:
+                    return {{"error": "Model not loaded"}}
+                labels = CLASS_NAMES or [f"class_{{i}}" for i in range(NUM_CLASSES)]
+                try:
+                    if _hf_processor is not None:
+                        from PIL import Image as _Img
+                        import torch
+                        img = _Img.open(_io.BytesIO(image_bytes)).convert("RGB")
+                        inputs = _hf_processor(images=img, return_tensors="pt")
+                        with torch.no_grad():
+                            outputs = _model(**inputs)
+                        if tt == "detection":
+                            target_sizes = torch.tensor([img.size[::-1]])
+                            res = _hf_processor.post_process_object_detection(outputs, threshold=conf, target_sizes=target_sizes)[0]
+                            dets = [{{"class_name": (_hf_id2label or {{}}).get(label.item(), f"class_{{label.item()}}"), "confidence": round(float(score), 4), "bbox": [x1, y1, x2-x1, y2-y1]}} for score, label, (x1,y1,x2,y2) in zip(res["scores"], res["labels"], res["boxes"].tolist())]
+                            return {{"type": "detection", "detections": dets}}
+                        elif tt == "classification":
+                            probs = torch.softmax(outputs.logits, dim=-1)[0].tolist()
+                            preds = sorted([{{"label": (_hf_id2label or {{}}).get(i, f"class_{{i}}"), "confidence": p}} for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
+                            return {{"type": "classification", "predictions": preds[:5], "top_label": preds[0]["label"]}}
+                        elif tt == "segmentation":
+                            import torch.nn.functional as F
+                            logits = outputs.logits
+                            up = F.interpolate(logits, size=img.size[::-1], mode="bilinear", align_corners=False)
+                            mask = up.argmax(dim=1)[0]
+                            total_px = mask.numel()
+                            id2l = _hf_id2label or {{}}
+                            segs = [{{"class_name": id2l.get(ci, f"class_{{ci}}"), "class_id": ci, "pixel_count": int((mask==ci).sum()), "coverage": round(int((mask==ci).sum())/total_px, 4)}} for ci in mask.unique().tolist()]
+                            return {{"type": "segmentation", "segments": sorted(segs, key=lambda x: -x["pixel_count"])}}
+                    if tt in ("detection", "segmentation") and hasattr(_model, "predict"):
+                        from PIL import Image as _Img
+                        img = _Img.open(_io.BytesIO(image_bytes)).convert("RGB")
+                        results = _model.predict(img, conf=conf, verbose=False)
+                        if tt == "detection":
+                            dets = []
+                            for r in results:
+                                iw, ih = img.size
+                                for box in r.boxes:
+                                    ci = int(box.cls[0])
+                                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                    dets.append({{"class_name": labels[ci] if ci < len(labels) else f"class_{{ci}}", "confidence": float(box.conf[0]), "bbox": [x1/iw, y1/ih, x2/iw, y2/ih]}})
+                            return {{"type": "detection", "detections": dets}}
+                        else:
+                            masks = []
+                            for r in results:
+                                if r.masks is None: continue
+                                for i, _ in enumerate(r.masks):
+                                    ci = int(r.boxes.cls[i])
+                                    masks.append({{"class_name": labels[ci] if ci < len(labels) else f"class_{{ci}}", "confidence": float(r.boxes.conf[i])}})
+                            return {{"type": "segmentation", "masks": masks}}
+                    if tt == "segmentation" and _smp_engine:
+                        import torch, torchvision.transforms as T
+                        from PIL import Image as _Img
+                        img = _Img.open(_io.BytesIO(image_bytes)).convert("RGB")
+                        tfm = T.Compose([T.Resize((256,256)), T.ToTensor(), T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
+                        with torch.no_grad():
+                            logits = _model(tfm(img).unsqueeze(0))
+                        mask = logits.argmax(dim=1)[0]
+                        total_px = mask.numel()
+                        segs = [{{"class_name": labels[ci] if ci < len(labels) else f"class_{{ci}}", "class_id": ci, "pixel_count": int((mask==ci).sum()), "coverage": round(int((mask==ci).sum())/total_px, 4)}} for ci in mask.unique().tolist()]
+                        return {{"type": "segmentation", "segments": sorted(segs, key=lambda x: -x["pixel_count"])}}
+                    if tt == "classification":
+                        import torch, torchvision.transforms as T
+                        from PIL import Image as _Img
+                        img = _Img.open(_io.BytesIO(image_bytes))
+                        if ENGINE == "MONAI":
+                            import numpy as np
+                            in_ch = 1
+                            for p in _model.parameters():
+                                if len(p.shape) == 4: in_ch = p.shape[1]; break
+                            img_arr = np.array(img.convert("L") if in_ch == 1 else img.convert("RGB"), dtype=np.float32)
+                            img_t = torch.tensor(img_arr).unsqueeze(0).unsqueeze(0) if in_ch == 1 else torch.tensor(img_arr.transpose(2,0,1)).unsqueeze(0)
+                            img_t = torch.nn.functional.interpolate(img_t, size=(224,224), mode="bilinear", align_corners=False)
+                            img_t = (img_t - img_t.min()) / (img_t.max() - img_t.min() + 1e-8)
+                            with torch.no_grad():
+                                probs = torch.softmax(_model(img_t), dim=1)[0].tolist()
+                        else:
+                            tfm = T.Compose([T.Resize((224,224)), T.ToTensor(), T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
+                            with torch.no_grad():
+                                probs = torch.softmax(_model(tfm(img.convert("RGB")).unsqueeze(0)), dim=1)[0].tolist()
+                        preds = sorted([{{"label": labels[i] if i < len(labels) else f"class_{{i}}", "confidence": p}} for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
+                        return {{"type": "classification", "predictions": preds, "top_label": preds[0]["label"]}}
+                    if tt in ("llm-text", "vlm-finetune"):
+                        import torch
+                        full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
+                        inputs = _tokenizer(full_prompt, return_tensors="pt").to(_model.device)
+                        t0 = time.time()
+                        with torch.no_grad():
+                            out = _model.generate(**inputs, max_new_tokens=512, do_sample=False)
+                        resp = _tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                        return {{"type": tt, "response": resp, "tokens_generated": out.shape[1]-inputs.input_ids.shape[1], "inference_time_ms": int((time.time()-t0)*1000)}}
+                    return {{"error": f"No inference handler for engine={{ENGINE}}, type={{tt}}"}}
+                except Exception as exc:
+                    return {{"error": str(exc)}}
     """)
 
 
-def _run_modal_infer_deploy(token_id: str, token_secret: str, gpu_type: str) -> None:
+def _run_modal_model_deploy(job_id: str, token_id: str, token_secret: str, gpu_type: str,
+                             training_type: str, engine: str, model_name: str,
+                             num_classes: int, class_names: list,
+                             minio_url: str, minio_access: str, minio_secret: str,
+                             weights_bucket: str, weights_key: str) -> None:
+    state = _get_modal_deploy_state(job_id)
     env = os.environ.copy()
     env["MODAL_TOKEN_ID"] = token_id
     env["MODAL_TOKEN_SECRET"] = token_secret
-    script_path = "/tmp/medimage_modal_infer.py"
+
+    # Download weights from MinIO (API server is in Docker network → can reach internal MinIO)
+    # then push to Modal Volume so Modal cloud can access them
+    volume_name = None
+    if weights_key:
+        state["logs"].append("[modal] Downloading weights from MinIO…")
+        try:
+            import boto3 as _boto3, tempfile as _tempfile
+            from botocore.config import Config as _BotoConfig
+            _s3 = _boto3.client(
+                "s3", endpoint_url=minio_url,
+                aws_access_key_id=minio_access, aws_secret_access_key=minio_secret,
+                region_name="us-east-1", config=_BotoConfig(s3={"addressing_style": "path"}),
+            )
+            _suffix = ".zip" if weights_key.endswith(".zip") else ".pt"
+            with _tempfile.NamedTemporaryFile(suffix=_suffix, delete=False) as _tmp:
+                _s3.download_fileobj(weights_bucket, weights_key, _tmp)
+                _local_weights = _tmp.name
+            _sz = os.path.getsize(_local_weights)
+            state["logs"].append(f"[modal] Downloaded {_sz} bytes — pushing to Modal Volume…")
+            volume_name = f"medimage-{job_id}"
+            subprocess.run(
+                ["python3", "-m", "modal", "volume", "create", volume_name],
+                env=env, capture_output=True, text=True,
+            )
+            _proc_vol = subprocess.run(
+                ["python3", "-m", "modal", "volume", "put", "--force",
+                 volume_name, _local_weights, "/model.pt"],
+                env=env, capture_output=True, text=True, timeout=300,
+            )
+            os.unlink(_local_weights)
+            if _proc_vol.returncode == 0:
+                state["logs"].append(f"[modal] Weights pushed to Modal Volume '{volume_name}'")
+            else:
+                _err = (_proc_vol.stderr or _proc_vol.stdout or "")[:300]
+                state["logs"].append(f"[modal] Volume push failed: {_err} — falling back to runtime download")
+                volume_name = None
+        except Exception as _e:
+            state["logs"].append(f"[modal] Weight download failed: {_e} — falling back to runtime download")
+            volume_name = None
+
+    script_path = f"/tmp/medimage_modal_{job_id}.py"
+    script = _modal_model_script(
+        job_id=job_id, training_type=training_type, engine=engine,
+        model_name=model_name, num_classes=num_classes, class_names=class_names,
+        gpu_type=gpu_type, minio_url=minio_url, minio_access=minio_access,
+        minio_secret=minio_secret, weights_bucket=weights_bucket, weights_key=weights_key,
+        volume_name=volume_name,
+    )
     with open(script_path, "w") as f:
-        f.write(_modal_infer_script(gpu_type))
+        f.write(script)
+    state["logs"].append(f"[modal] Script written, running modal deploy…")
     try:
         proc = subprocess.run(
             ["python3", "-m", "modal", "deploy", script_path],
-            env=env, capture_output=True, text=True, timeout=300,
+            env=env, capture_output=True, text=True, timeout=360,
         )
         output = (proc.stdout or "") + (proc.stderr or "")
+        # Join lines that are continuations (Modal wraps long URLs across lines with │ prefix)
+        # Also join lines split with spaces/newlines inside URL blocks
+        joined_output = _re.sub(r'\n\s*[│|]\s*', '', output)
+        joined_output = _re.sub(r'\s*\n\s{4,}', '', joined_output)  # join indented continuations
         logs = [l for l in output.splitlines() if l.strip()]
-        _modal_infer_state["logs"] = logs[-30:]
-        m = _re.search(r'https://[^\s]+\.modal\.run[^\s]*', output)
-        if m:
-            url = m.group(0).rstrip('/.,;')
-            _modal_infer_state["url"] = url
-            _modal_infer_state["status"] = "running"
+        state["logs"] = logs[-40:]
+        # Try to find inference endpoint URL (prefer /inference over /health)
+        urls = _re.findall(r'https://[^\s│|<>]+\.modal\.run', joined_output)
+        urls = [u.rstrip('/.,;)>') for u in urls]
+        # Store inference URL as primary (for calling the model), fall back to health URL
+        infer_url = next((u for u in urls if 'inference' in u), None)
+        health_url = next((u for u in urls if 'health' in u), None)
+        url = infer_url or health_url or (urls[0] if urls else None)
+        if url:
+            state.update(status="running", url=url)
+            state["logs"].append(f"[modal] Deployed at {url}")
             with get_db() as conn:
-                conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("global_modal_url", url))
+                conn.execute(
+                    "UPDATE jobs SET modal_url=?, inference_provider='modal' WHERE id=?",
+                    (url, job_id),
+                )
                 conn.commit()
+            # Background warmup — hit the health endpoint so Modal spins up the container
+            # and loads the model before the first user request
+            _warmup_url = health_url or url.replace("inference", "health")
+            def _warmup(wu: str) -> None:
+                import time as _time, requests as _req
+                _time.sleep(5)  # let deploy settle
+                try:
+                    r = _req.get(wu, timeout=300, allow_redirects=True, verify=False)
+                    state["logs"].append(f"[modal] Warmup complete (HTTP {r.status_code}) — container is ready")
+                except Exception as _we:
+                    state["logs"].append(f"[modal] Warmup ping: {_we}")
+            threading.Thread(target=_warmup, args=(_warmup_url,), daemon=True).start()
+        elif proc.returncode == 0:
+            state.update(status="error")
+            state["logs"].append("[modal] Deploy succeeded but could not parse URL from output")
         else:
-            _modal_infer_state["status"] = "error"
-            _modal_infer_state["logs"].append("Could not parse deployment URL from output")
+            state.update(status="error")
+            state["logs"].append(f"[modal] Deploy failed (exit {proc.returncode})")
     except subprocess.TimeoutExpired:
-        _modal_infer_state["status"] = "error"
-        _modal_infer_state["logs"].append("Deploy timed out after 5 minutes")
+        state.update(status="error")
+        state["logs"].append("[modal] Deploy timed out after 6 minutes")
     except Exception as exc:
-        _modal_infer_state["status"] = "error"
-        _modal_infer_state["logs"].append(str(exc))
+        state.update(status="error")
+        state["logs"].append(f"[modal] Exception: {exc}")
 
 
-@app.post("/api/modal/inference/deploy")
-def modal_infer_deploy(body: dict):
-    if not body.get("token_id") or not body.get("token_secret"):
-        raise HTTPException(status_code=400, detail="token_id and token_secret required")
-    if _modal_infer_state["status"] == "deploying":
-        raise HTTPException(status_code=409, detail="Deploy already in progress")
-    _modal_infer_state.update(status="deploying", url=None, logs=["Deploying to Modal.com…"])
+@app.post("/api/jobs/{job_id}/deploy-modal")
+def model_deploy_modal(job_id: str, body: dict):
+    """Deploy a model to Modal.com as a per-model web endpoint."""
+    # Use body creds if provided, else fall back to saved DB credentials
+    token_id = (body.get("token_id") or "").strip()
+    token_secret = (body.get("token_secret") or "").strip()
+    if not token_id or not token_secret:
+        saved = _load_modal_creds()
+        if saved:
+            token_id = saved["token_id"]
+            token_secret = saved["token_secret"]
+    if not token_id or not token_secret:
+        raise HTTPException(400, "No Modal credentials — save them in Modal Configuration first")
+    # Look up job for metadata
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Model not found")
+    state = _get_modal_deploy_state(job_id)
+    if state["status"] == "deploying":
+        raise HTTPException(409, "Deploy already in progress")
+    state.update(status="deploying", url=None, logs=["Starting Modal deploy…"])
+    minio_url = MINIO_URL  # internal Docker URL — download happens on API server (not Modal cloud)
+    minio_access = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+    minio_secret = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+    s3_path = (row["s3_weights_path"] or "").strip()
+    # Handle both "bucket/key" and "s3://bucket/key" formats
+    if s3_path.startswith("s3://"):
+        s3_path_stripped = s3_path[5:]  # remove "s3://"
+    else:
+        s3_path_stripped = s3_path
+    weights_bucket = s3_path_stripped.split("/")[0] if "/" in s3_path_stripped else "medimage-weights"
+    weights_key    = s3_path_stripped.split("/", 1)[1] if "/" in s3_path_stripped else s3_path_stripped
+    # Parse class names from DB job notes if present
+    try:
+        notes = json.loads(row["notes"] or "{}")
+        class_names = notes.get("class_names", [])
+        num_classes = notes.get("num_classes", 2)
+    except Exception:
+        class_names = []
+        num_classes = 2
     threading.Thread(
-        target=_run_modal_infer_deploy,
-        args=(body["token_id"], body["token_secret"], body.get("gpu_type", "T4")),
+        target=_run_modal_model_deploy,
+        args=(
+            job_id, token_id, token_secret,
+            body.get("gpu_type", "T4"),
+            row["training_type"] or "", row["engine"] or "", row["model_name"] or "",
+            num_classes, class_names,
+            minio_url, minio_access, minio_secret,
+            weights_bucket, weights_key,
+        ),
         daemon=True,
     ).start()
     return {"status": "deploying"}
 
 
+@app.get("/api/jobs/{job_id}/deploy-modal/status")
+def model_deploy_modal_status(job_id: str):
+    state = _get_modal_deploy_state(job_id)
+    # Sync from DB if running
+    if state["status"] == "idle":
+        with get_db() as conn:
+            row = conn.execute("SELECT modal_url, inference_provider FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row and row["modal_url"] and row["inference_provider"] == "modal":
+            state.update(status="running", url=row["modal_url"])
+    return {"status": state["status"], "url": state.get("url"), "logs": state["logs"][-30:]}
+
+
+@app.post("/api/jobs/{job_id}/deploy-modal/stop")
+def model_deploy_modal_stop(job_id: str, body: dict = {}):
+    """Stop the Modal app for this model."""
+    app_name = f"medimage-{job_id}"
+    logs = []
+    token_id = (body.get("token_id") or "").strip()
+    token_secret = (body.get("token_secret") or "").strip()
+    if not token_id or not token_secret:
+        saved = _load_modal_creds()
+        if saved:
+            token_id = saved["token_id"]
+            token_secret = saved["token_secret"]
+    if token_id and token_secret:
+        env = os.environ.copy()
+        env["MODAL_TOKEN_ID"] = token_id
+        env["MODAL_TOKEN_SECRET"] = token_secret
+        try:
+            # Find the deployed app ID by listing apps and matching description
+            list_proc = subprocess.run(
+                ["python3", "-m", "modal", "app", "list"],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            app_id = None
+            for line in list_proc.stdout.splitlines():
+                # Lines look like: │ ap-XXXX │ medimage-c21fc0f1… │ deployed │ ...
+                if "deployed" in line and app_name[:20] in line:
+                    parts = [p.strip() for p in line.split("│") if p.strip()]
+                    if parts and parts[0].startswith("ap-"):
+                        app_id = parts[0]
+                        break
+            identifier = app_id or app_name
+            logs.append(f"[modal stop] Stopping {identifier}…")
+            proc = subprocess.run(
+                ["python3", "-m", "modal", "app", "stop", "-y", identifier],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            logs += [l for l in output.splitlines() if l.strip()][-10:]
+            logs.append(f"[modal stop] exit code {proc.returncode}")
+        except Exception as exc:
+            logs.append(f"[modal stop] {exc}")
+    else:
+        logs.append("[modal stop] No token provided — skipping modal app stop")
+    # Clear DB
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE jobs SET modal_url='', inference_provider='' WHERE id=?",
+            (job_id,),
+        )
+        conn.commit()
+    state = _get_modal_deploy_state(job_id)
+    state.update(status="idle", url=None, logs=logs)
+    return {"ok": True, "logs": logs}
+
+
+# Legacy: keep old global endpoint for backward compat (used by RayCluster page modal tab)
+_modal_infer_state: dict = {"status": "idle", "url": None, "logs": []}
+
+@app.post("/api/modal/inference/deploy")
+def modal_infer_deploy(body: dict):
+    raise HTTPException(400, "Use /api/jobs/{job_id}/deploy-modal for per-model deployment")
+
 @app.get("/api/modal/inference/status")
 def modal_infer_status_ep():
-    return {
-        "status": _modal_infer_state["status"],
-        "url": _modal_infer_state["url"],
-        "logs": _modal_infer_state["logs"][-20:],
-    }
+    return {"status": _modal_infer_state["status"], "url": _modal_infer_state["url"], "logs": []}
 
 
 # ─── Ray Serve Inference Deploy ───────────────────────────────────────────────
@@ -5099,6 +5719,46 @@ def _poll_ray_job(ray_dashboard_url: str, job_id: str, serve_url: str) -> None:
     _ray_serve_state.update(status="error", logs=["Timeout waiting for job (10 min)"])
 
 
+@app.post("/api/ray/clear-dead")
+async def ray_clear_dead_nodes(request: Request):
+    """Drain dead nodes from Ray cluster via the dashboard API."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    import requests as _req
+    try:
+        r = _req.get(f"{RAY_URL}/nodes?view=summary", timeout=5)
+        nodes = r.json().get("data", {}).get("summary", [])
+    except Exception as e:
+        raise HTTPException(502, f"Cannot reach Ray dashboard: {e}")
+
+    dead = [n for n in nodes if n.get("raylet", {}).get("state") == "DEAD"]
+    if not dead:
+        return {"cleared": 0, "message": "No dead nodes found"}
+
+    cleared, errors = 0, []
+    seen = set()
+    for node in dead:
+        node_id = (node.get("raylet") or {}).get("nodeId") or node.get("ip")
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        try:
+            dr = _req.post(
+                f"{RAY_URL}/api/node_manager/drain_node",
+                json={"node_id": node_id, "reason": 1, "reason_message": "manual cleanup"},
+                timeout=5,
+            )
+            if dr.ok:
+                cleared += 1
+            else:
+                errors.append(f"{node_id}: {dr.status_code}")
+        except Exception as e:
+            errors.append(f"{node_id}: {e}")
+
+    return {"cleared": cleared, "total_dead": len(seen), "errors": errors}
+
+
 @app.post("/api/ray-serve/deploy")
 async def ray_infer_deploy(body: dict):
     ray_dashboard_url = (body.get("ray_dashboard_url") or "").rstrip("/")
@@ -5691,7 +6351,12 @@ async def run_inference(
         return _result
 
     async def _route_external(base_url: str, api_key: str) -> dict:
-        endpoint = base_url.rstrip("/") + "/inference"
+        # Modal fastapi_endpoint URLs are the endpoint itself (no path needed)
+        # Ray Serve / other URLs need /inference appended
+        if "modal.run" in base_url:
+            endpoint = base_url.rstrip("/")
+        else:
+            endpoint = base_url.rstrip("/") + "/inference"
         headers_ext: dict = {}
         if api_key:
             headers_ext["Authorization"] = f"Bearer {api_key}"
@@ -5702,7 +6367,7 @@ async def run_inference(
             if image:
                 img_bytes = await image.read()
                 payload["image"] = base64.b64encode(img_bytes).decode()
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=570.0, follow_redirects=True) as client:
                 r = await client.post(endpoint, json=payload, headers=headers_ext)
         else:
             if not image:
@@ -5710,10 +6375,13 @@ async def run_inference(
             img_bytes = await image.read()
             files = {"image": (image.filename or "image.jpg", img_bytes, "image/jpeg")}
             data = {"model_id": model_id, "conf_threshold": str(conf_threshold), "training_type": training_type}
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=570.0, follow_redirects=True) as client:
                 r = await client.post(endpoint, headers=headers_ext, data=data, files=files)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if isinstance(data, dict):
+            data["inference_time_ms"] = round((time.time() - t_start) * 1000)
+        return data
 
     if provider == "modal" and job.get("modal_url"):
         try:

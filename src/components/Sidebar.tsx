@@ -16,7 +16,7 @@ const allNavItems = [
   { to: '/playground',   label: 'Playground',   icon: FlaskConical,     adminOnly: false },
   { to: '/api-service',  label: 'API Service',  icon: Zap,              adminOnly: false },
   { to: '/ray-cluster',    label: 'Ray Cluster',    icon: Server,           adminOnly: false },
-  { to: '/modal-cluster',  label: 'Modal Cluster',  icon: Cloud,            adminOnly: false },
+  { to: '/modal-cluster',  label: 'Modal',           icon: Cloud,            adminOnly: false },
   { to: '/notebook',     label: 'Notebook',     icon: BookOpen,         adminOnly: false },
   { to: '/status',       label: 'Status',       icon: Activity,         adminOnly: false },
   { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  adminOnly: false },

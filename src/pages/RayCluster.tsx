@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal } from 'lucide-react'
+import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal, Loader } from 'lucide-react'
 
 const DEFAULT_RAY_URL = 'http://100.68.53.118:8265'
 const STORAGE_KEY     = 'ray_head_url'
@@ -562,6 +562,7 @@ export default function RayCluster() {
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+  const [clearingDead, setClearingDead] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const historyRef = useRef<MetricPoint[]>([])
   const [history, setHistory] = useState<MetricPoint[]>([])
@@ -623,6 +624,14 @@ export default function RayCluster() {
     return () => clearInterval(id)
   }, [fetchData, rayUrl])
 
+  async function clearDeadNodes() {
+    setClearingDead(true)
+    try {
+      await fetch('/api/ray/clear-dead', { method: 'POST' })
+      await fetchData(true)
+    } finally { setClearingDead(false) }
+  }
+
   const handleSaveUrl = (url: string) => {
     setRayUrl(url)
     setShowSettings(false)
@@ -635,7 +644,7 @@ export default function RayCluster() {
   const gpuTotal = usage['GPU']?.[1] ?? 0
   const memTotal = usage['memory']?.[1] ?? 0
   const memUsed  = usage['memory']?.[0] ?? 0
-  const aliveNodes = nodes.filter(n => n.raylet?.state === 'ALIVE').length
+  const aliveNodes = nodes.filter(n => n.raylet?.state === 'ALIVE' && (n.ip || n.hostname)).length
   const isConnected = !error && result !== null
   const pythonVersion = extractPythonVersion(nodes)
 
@@ -832,26 +841,45 @@ export default function RayCluster() {
           {/* Node list */}
           {nodes.length > 0 && (
             <div className="card">
-              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 14 }}>
-                <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>
                   Nodes{' '}
-                  <span style={{ color: 'var(--text-muted)', fontWeight: 400, fontSize: 12 }}>({nodes.length})</span>
+                  <span style={{ color: 'var(--text-muted)', fontWeight: 400, fontSize: 12 }}>({aliveNodes} alive{nodes.length - aliveNodes > 0 ? ` · ${nodes.length - aliveNodes} dead` : ''})</span>
                 </h3>
-                {aliveNodes === 1 && (
-                  <span style={{
-                    fontSize: 11,
-                    padding: '2px 10px', borderRadius: 20,
-                    background: 'color-mix(in oklch, var(--warning) 10%, transparent)',
-                    border: '1px solid color-mix(in oklch, var(--warning) 25%, transparent)',
-                    color: 'var(--warning)',
-                  }}>
-                    Head only · no workers connected
-                  </span>
-                )}
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {nodes.some(n => n.raylet?.state !== 'ALIVE') && (
+                    <button
+                      className="btn btn-sm"
+                      style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, background: '#ef444415', color: '#ef4444', border: '1px solid #ef444430' }}
+                      onClick={clearDeadNodes}
+                      disabled={clearingDead}
+                    >
+                      {clearingDead ? <Loader size={11} className="animate-spin" /> : <X size={11} />}
+                      Clear Dead
+                    </button>
+                  )}
+                  {aliveNodes < 2 && (
+                    <span style={{
+                      fontSize: 11,
+                      padding: '2px 10px', borderRadius: 20,
+                      background: 'color-mix(in oklch, var(--warning) 10%, transparent)',
+                      border: '1px solid color-mix(in oklch, var(--warning) 25%, transparent)',
+                      color: 'var(--warning)',
+                    }}>
+                      Head only · no workers connected
+                    </span>
+                  )}
+                </div>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {nodes.map((node) => {
-                  const alive = node.raylet?.state === 'ALIVE'
+                {nodes
+                  .filter(n => n.raylet?.state === 'ALIVE' && (n.ip || n.hostname))
+                  .filter((n, i, arr) => {
+                    const key = n.raylet?.nodeId || n.ip
+                    return !key || arr.findIndex(x => (x.raylet?.nodeId || x.ip) === key) === i
+                  })
+                  .map((node) => {
+                  const alive = true
                   const gpuCount = node.gpus?.length ?? 0
                   const head = isHead(node)
                   return (
@@ -882,10 +910,10 @@ export default function RayCluster() {
                           {head ? 'HEAD' : 'WORKER'}
                         </span>
                         <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
-                          {node.hostname}
+                          {node.hostname ?? <span style={{ color: 'var(--text-muted)' }}>unknown</span>}
                         </span>
                         <span style={{ fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                          {node.ip}
+                          {node.ip ?? (node.raylet?.nodeId ? node.raylet.nodeId.slice(0, 8) : '—')}
                         </span>
                         <div style={{ marginLeft: 'auto', display: 'flex', gap: 14, fontSize: 12, color: 'var(--text-muted)' }}>
                           {node.raylet && (
