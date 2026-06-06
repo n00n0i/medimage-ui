@@ -289,6 +289,22 @@ export default function Models() {
   }
 
   const deleteSelected = async () => {
+    // Block the bulk action if ANY selected model is currently deployed.
+    // The user has to undeploy first.
+    const deployedSelected = filtered.filter(m =>
+      selected.has(m.id) && (
+        (m.inference_provider === 'ray'   && !!m.ray_serve_url) ||
+        (m.inference_provider === 'modal' && !!m.modal_url)
+      )
+    )
+    if (deployedSelected.length > 0) {
+      alert(
+        `Cannot delete — ${deployedSelected.length} of the selected models are currently deployed:\n\n` +
+        deployedSelected.map(m => `  • ${m.id} (${m.inference_provider})`).join('\n') +
+        `\n\nUndeploy them first (Deploy tab → Stop / Undeploy).`
+      )
+      return
+    }
     if (!confirm(`ลบ ${selected.size} model ที่เลือก?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
     setDeletingBulk(true)
     await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}?from_view=models`, { method: 'DELETE' })))
@@ -713,25 +729,47 @@ function ModelExpanded({ modelId, onLog, onEdit, onDelete, onRetrain }: {
       )}
 
       {/* Actions */}
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onRetrain}>
-          <RotateCcw size={13} /> Re-train
-        </button>
-        {detail.s3_weights_path && (
-          <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--primary)', borderColor: 'var(--primary)' }} onClick={downloadWeights}>
-            <Download size={13} /> Download Weights
-          </button>
-        )}
-        <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onLog}>
-          <Terminal size={13} /> View Log
-        </button>
-        <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onEdit}>
-          <Pencil size={13} /> Edit
-        </button>
-        <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={onDelete}>
-          <Trash2 size={13} /> Delete
-        </button>
-      </div>
+      {(() => {
+        // A model is "deployed" when it has a live endpoint that the
+        // platform is routing traffic to. Deleting it would 503 any
+        // in-flight callers, so we block the Delete button and require
+        // the user to undeploy first (Deploy tab → Stop / Undeploy).
+        const isDeployed =
+          (detail.inference_provider === 'ray'   && !!detail.ray_serve_url) ||
+          (detail.inference_provider === 'modal' && !!detail.modal_url)
+        return (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className="btn btn-primary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onRetrain}>
+              <RotateCcw size={13} /> Re-train
+            </button>
+            {detail.s3_weights_path && (
+              <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--primary)', borderColor: 'var(--primary)' }} onClick={downloadWeights}>
+                <Download size={13} /> Download Weights
+              </button>
+            )}
+            <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onLog}>
+              <Terminal size={13} /> View Log
+            </button>
+            <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={onEdit}>
+              <Pencil size={13} /> Edit
+            </button>
+            {isDeployed ? (
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', cursor: 'not-allowed' }}
+                disabled
+                title="Model is currently deployed — undeploy first (Deploy tab → Stop / Undeploy)"
+              >
+                <Trash2 size={13} /> Delete
+              </button>
+            ) : (
+              <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={onDelete}>
+                <Trash2 size={13} /> Delete
+              </button>
+            )}
+          </div>
+        )
+      })()}
 
       {/* Deployment section — all model types */}
       <DeploySection

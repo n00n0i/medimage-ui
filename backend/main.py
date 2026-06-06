@@ -3581,9 +3581,26 @@ def clear_deployment(job_id: str):
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, from_view: str = "jobs"):
     with get_db() as conn:
-        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        row = conn.execute(
+            "SELECT status, inference_provider, ray_serve_url, modal_url FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
+        # Safety net: refuse to delete (even hide-from-list) a model that
+        # is currently deployed. The user must explicitly clear the
+        # deployment via the Models → Deploy → Undeploy flow first.
+        provider = (row["inference_provider"] or "").strip()
+        if provider == "ray"   and (row["ray_serve_url"] or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail="Model is deployed on Ray Serve — undeploy first (Deploy tab → Undeploy).",
+            )
+        if provider == "modal" and (row["modal_url"] or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail="Model is deployed on Modal — undeploy first (Deploy tab → Stop).",
+            )
         if from_view == "models":
             conn.execute("UPDATE jobs SET hidden_in_models = 1 WHERE id = ?", (job_id,))
         else:
