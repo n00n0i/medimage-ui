@@ -313,9 +313,12 @@ export default function Playground() {
       setModalClusterOnline(!!modalStatus.online)
       // Default-select from the *filtered* visible list, not the raw models.
       // Otherwise the closed button shows a model that the dropdown hides.
+      // Same URL-required check as the render-time filter below.
       const providerOnline = (m: typeof ms[number]): boolean => {
-        if (m.inference_provider === 'ray')   return !!rayStatus.online
-        if (m.inference_provider === 'modal') return !!modalStatus.online
+        if (m.inference_provider === 'ray')
+          return !!rayStatus.online && !!m.ray_serve_url
+        if (m.inference_provider === 'modal')
+          return !!modalStatus.online && !!m.modal_url
         return false
       }
       const typeOk = playMode === 'text'
@@ -340,9 +343,17 @@ export default function Playground() {
   // gate visibility on the live cluster-status probes. Sim / no-provider
   // models are also hidden: there's nothing to call, and showing them
   // alongside real providers confuses the dropdown.
+  //
+  // Additionally require the model's own URL to be non-empty: a model
+  // with inference_provider='ray' but no ray_serve_url has the flag
+  // set but the actor was never deployed (or was torn down). Show it
+  // in the dropdown and inference will silently fail with a confusing
+  // network error.
   const providerOnline = (m: Model): boolean => {
-    if (m.inference_provider === 'ray')   return rayClusterOnline   === true
-    if (m.inference_provider === 'modal') return modalClusterOnline === true
+    if (m.inference_provider === 'ray')
+      return rayClusterOnline === true && !!m.ray_serve_url
+    if (m.inference_provider === 'modal')
+      return modalClusterOnline === true && !!m.modal_url
     return false  // no provider assigned — not deployable
   }
 
