@@ -85,6 +85,9 @@ services:
       - LS_PASSWORD=admin
       - LS_TOKEN=medimage-ls-token-2026
       - MINIO_URL=http://minio:9000
+      # Host IP the Ray/Modal cluster can reach on port 9000. Required
+      # when the cluster is on a different host than docker-compose.
+      - MINIO_HOST_IP=100.68.3.42
       - DB_PATH=/data/jobs.db
       # Keycloak realm `h-forge` runs under /kc (KC_HTTP_RELATIVE_PATH=/kc)
       - KEYCLOAK_JWKS_URL=http://medimage-keycloak-1:8080/kc/realms/h-forge/protocol/openid-connect/certs
