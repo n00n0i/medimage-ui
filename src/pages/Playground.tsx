@@ -813,26 +813,25 @@ export default function Playground() {
 
                 {/* Image or Canvas */}
                 <div style={{ width: '100%', position: 'relative' }}>
-                  {result?.type === 'classification' || !result ? (
-                    <img
-                      ref={imgRef}
-                      src={imageUrl!}
-                      alt="uploaded"
+                  {/* Always render img element to prevent recreation */}
+                  <img
+                    ref={imgRef}
+                    src={imageUrl!}
+                    alt="uploaded"
+                    style={{
+                      width: '100%',
+                      display: (result?.type === 'detection' || result?.type === 'segmentation') ? 'none' : 'block',
+                      maxHeight: 520,
+                      objectFit: 'contain',
+                      background: '#000'
+                    }}
+                  />
+                  {/* Canvas for detection/segmentation */}
+                  {(result?.type === 'detection' || result?.type === 'segmentation') && (
+                    <canvas
+                      ref={canvasRef}
                       style={{ width: '100%', display: 'block', maxHeight: 520, objectFit: 'contain', background: '#000' }}
                     />
-                  ) : (
-                    <>
-                      <img
-                        ref={imgRef}
-                        src={imageUrl!}
-                        alt="uploaded"
-                        style={{ display: 'none' }}
-                      />
-                      <canvas
-                        ref={canvasRef}
-                        style={{ width: '100%', display: 'block', maxHeight: 520, objectFit: 'contain', background: '#000' }}
-                      />
-                    </>
                   )}
 
                   {running && (
