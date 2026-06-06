@@ -40,6 +40,7 @@ export default function ModalConfig() {
   const [clusterStatus, setClusterStatus] = useState<{
     status: string; ray_url: string | null
     gpu_type?: string; num_workers?: number
+    logs?: string[]
   } | null>(null)
   const [starting, setStarting]           = useState(false)
   const [stoppingCluster, setStoppingCluster] = useState(false)
@@ -452,6 +453,27 @@ export default function ModalConfig() {
               </button>
             </div>
           </div>
+
+          {/* Live logs from the API — most recent at the bottom. Surfaces
+              what `modal app stop` / `modal container stop` are doing
+              so the user isn't left wondering why Stop takes 30s. */}
+          {clusterStatus?.logs && clusterStatus.logs.length > 0 && (
+            <div style={{ marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--border-subtle)' }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>
+                Logs (last 20)
+              </div>
+              <div style={{
+                fontFamily: 'var(--font-mono)', fontSize: 10, lineHeight: 1.45,
+                background: '#0a0a0a', color: '#a3e635', borderRadius: 6,
+                padding: '8px 10px', maxHeight: 200, overflowY: 'auto',
+                border: '1px solid #1f1f1f',
+              }}>
+                {clusterStatus.logs.slice(-20).map((l, i) => (
+                  <div key={i} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{l}</div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

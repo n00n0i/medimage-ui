@@ -253,7 +253,9 @@ export default function TrainModel() {
   const [showAllModels, setShowAllModels] = useState(false)
   const [clusterStatus, setClusterStatus] = useState<{
     ray:   { available: boolean; url: string; info: string }
-    modal: { available: boolean; status: string; ray_url: string | null; creds_saved?: boolean }
+    modal: { available: boolean; status: string; ray_url: string | null; creds_saved?: boolean; gpu_type?: string; num_workers?: number }
+    minio_for_ray?:            string
+    minio_for_ray_reachable?:  boolean
   } | null>(null)
 
   // Fetch cluster availability when on step 3
@@ -274,7 +276,7 @@ export default function TrainModel() {
   const [modalStarting, setModalStarting]       = useState(false)
   const [modalStartError, setModalStartError]   = useState('')
   const [modalClusterLive, setModalClusterLive] = useState<{
-    status: string; ray_url: string | null; gpu_type?: string; num_workers?: number
+    status: string; ray_url: string | null; gpu_type?: string; num_workers?: number; logs?: string[]
   } | null>(null)
   const modalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -640,6 +642,26 @@ export default function TrainModel() {
                 background: '#ef444410', border: '1px solid #ef444430', color: '#ef4444', marginBottom: 12,
                 whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto',
               }}>{modalStartError}</div>
+            )}
+
+            {/* Live logs from the API — most recent at the bottom. Useful
+                when Start/Stop hangs so the user can see what's happening. */}
+            {modalClusterLive?.logs && modalClusterLive.logs.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>
+                  Logs
+                </div>
+                <div style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 10, lineHeight: 1.45,
+                  background: '#0a0a0a', color: '#a3e635', borderRadius: 6,
+                  padding: '8px 10px', maxHeight: 160, overflowY: 'auto',
+                  border: '1px solid #1f1f1f',
+                }}>
+                  {modalClusterLive.logs.slice(-20).map((l, i) => (
+                    <div key={i} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{l}</div>
+                  ))}
+                </div>
+              </div>
             )}
 
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -1397,12 +1419,39 @@ export default function TrainModel() {
             </div>
           )}
 
+          {/* MinIO reachability warning — shown when the Ray worker can't
+              reach the host the API will sign the dataset URL against. */}
+          {clusterStatus && clusterStatus.minio_for_ray_reachable === false && (
+            <div className="card mb-4" style={{ background: '#ef444408', border: '1px solid #ef444430', padding: '12px 14px' }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#ef4444', marginTop: 6, flexShrink: 0 }} />
+                <div style={{ flex: 1, fontSize: 12, lineHeight: 1.5 }}>
+                  <div style={{ fontWeight: 700, color: '#ef4444', marginBottom: 4 }}>
+                    ⚠ Ray worker can't reach MinIO
+                  </div>
+                  <div style={{ color: 'var(--text-secondary)' }}>
+                    The API will sign the dataset URL against{' '}
+                    <code style={{ background: 'var(--bg-base)', padding: '1px 5px', borderRadius: 3, color: '#ef4444' }}>{clusterStatus.minio_for_ray}</code>{' '}
+                    but the host is unreachable from the Ray cluster.
+                    Training will fail with <code style={{ background: 'var(--bg-base)', padding: '1px 5px', borderRadius: 3 }}>Connection refused</code>.
+                  </div>
+                  <div style={{ marginTop: 6, color: 'var(--text-muted)' }}>
+                    Fix: on the <code style={{ background: 'var(--bg-base)', padding: '1px 5px', borderRadius: 3 }}>medimage-api</code> container, set{' '}
+                    <code style={{ background: 'var(--bg-base)', padding: '1px 5px', borderRadius: 3, color: '#8b5cf6' }}>MINIO_HOST_IP=&lt;host-running-docker-compose&gt;</code>{' '}
+                    (or <code style={{ background: 'var(--bg-base)', padding: '1px 5px', borderRadius: 3, color: '#8b5cf6' }}>MINIO_PUBLIC_URL=http://that-host:9000</code>),
+                    then restart the API.
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="flex justify-between">
             <button className="btn btn-secondary" onClick={prevStep} disabled={launching}>← Back</button>
             <button
               className="btn btn-primary flex items-center gap-2"
               onClick={handleLaunch}
-              disabled={launching || !config.engine}
+              disabled={launching || !config.engine || (clusterStatus?.minio_for_ray_reachable === false)}
             >
               {launching ? (
                 <>

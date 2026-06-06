@@ -749,6 +749,13 @@ def _ping_host_port(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def _parse_host_port(url: str) -> tuple[str, int]:
+    """Parse http(s)://host:port/url and return (host, port)."""
+    from urllib.parse import urlparse as _urlparse
+    p = _urlparse(url)
+    return (p.hostname or "?", p.port or 0)
+
+
 def _diagnose_minio_for_ray() -> str:
     """
     Check the candidate MinIO host(s) from the worker's point of view and
@@ -3198,6 +3205,9 @@ def get_train_cluster_status():
             "num_workers": _modal_state.get("num_workers", 0),
         },
         "minio_for_ray":   _resolve_minio_url_for_ray(),
+        "minio_for_ray_reachable": _ping_host_port(
+            *_parse_host_port(_resolve_minio_url_for_ray())
+        ),
     }
 
 
@@ -3784,8 +3794,11 @@ def _modal_script(req: ModalStartRequest) -> str:
                          "python-multipart", "pillow")
         )
 
-        # Head node — always 1 container, exposes Ray Dashboard.
-        @app.function(image=ray_image, {gpu_spec}, timeout=86400, memory=16384, min_containers=1)
+        # Head node — min_containers=0 so 'modal app stop' actually tears
+        # the box down. With min_containers=1 Modal would respawn a
+        # replacement head as soon as the current one dies, leaving the
+        # user staring at "stopped" while a new container is starting.
+        @app.function(image=ray_image, {gpu_spec}, timeout=86400, memory=16384, min_containers=0)
         @modal.web_server(8265, startup_timeout=300)
         def ray_head():
             head_ip = socket.gethostbyname(socket.gethostname())
@@ -3799,7 +3812,7 @@ def _modal_script(req: ModalStartRequest) -> str:
 
         # Worker node — connects to head via the shared Dict.
         # Spawned separately via `modal run --detach` for each worker.
-        @app.function(image=ray_image, {gpu_spec}, timeout=86400, memory=16384)
+        @app.function(image=ray_image, {gpu_spec}, timeout=86400, memory=16384, min_containers=0)
         def ray_worker():
             for _ in range(60):
                 ip = head_ip_store.get("ip", "")
@@ -3951,74 +3964,62 @@ def modal_stop():
         env["MODAL_TOKEN_ID"] = token_id
         env["MODAL_TOKEN_SECRET"] = token_secret
 
-        # Step 1: send `modal app stop` to drain the app gracefully.
+        # Step 1: send `modal app stop`. With min_containers=0 in the
+        # script, the running container drains within ~20s.
+        _modal_state["logs"].append("→ modal app stop medimage-ray")
         try:
             r = subprocess.run(
                 ["python3", "-m", "modal", "app", "stop", "medimage-ray"],
                 env=env, timeout=120, capture_output=True, text=True,
             )
-            if r.returncode != 0:
-                out = (r.stdout + r.stderr)[-400:].strip()
-                _modal_state["logs"].append(f"`modal app stop` returned exit {r.returncode}: {out}")
-                # Don't return early — still try container stop below.
+            tail = (r.stdout + r.stderr).strip()
+            if r.returncode == 0:
+                _modal_state["logs"].append("✓ stop command accepted (exit 0)")
+                if tail:
+                    _modal_state["logs"].append(f"  output: {tail[-300:]}")
             else:
-                _modal_state["logs"].append("`modal app stop` accepted. Polling container status...")
+                _modal_state["logs"].append(f"⚠ stop exited {r.returncode}: {tail[-300:]}")
         except subprocess.TimeoutExpired:
-            _modal_state["logs"].append("`modal app stop` timed out after 120s — falling through to container stop.")
+            _modal_state["logs"].append("⚠ stop timed out after 120s")
         except Exception as exc:
-            _modal_state["logs"].append(f"`modal app stop` error: {exc}")
+            _modal_state["logs"].append(f"⚠ stop error: {exc}")
 
-        # Step 2: forcibly stop any still-running containers. This is what
-        # actually tears down the box on modal.com (the `app stop` is async
-        # and can leave the container up for a few minutes).
+        # Step 2: poll `modal app list` for the app to actually disappear
+        # from the running list. With min_containers=0 this is ~20s.
         import time as _time
-        deadline = _time.time() + 120  # poll up to 2 min
-        last_seen_running = None
+        _modal_state["logs"].append("→ polling `modal app list` for medimage-ray to disappear…")
+        deadline = _time.time() + 90
         while _time.time() < deadline:
             try:
                 cl = subprocess.run(
-                    ["python3", "-m", "modal", "container", "list"],
+                    ["python3", "-m", "modal", "app", "list"],
                     env=env, timeout=15, capture_output=True, text=True,
                 )
                 out = (cl.stdout or "") + (cl.stderr or "")
-                running_ids = []
+                still_listed = False
+                state = ""
                 for line in out.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 2 and "medimage-ray" in line:
-                        cid = parts[0]
-                        # skip header row & non-id tokens
-                        if cid and cid[0].lower() in "abcdefghijklmnopqrstuvwxyz":
-                            running_ids.append(cid)
-                if not running_ids:
-                    _modal_state["logs"].append(
-                        "✓ Confirmed: no medimage-ray containers running on Modal."
-                    )
+                    if "medimage-ray" in line.lower():
+                        still_listed = True
+                        # Try to capture a state word
+                        for kw in ("deployed", "running", "active", "initialized", "stopping", "stopped"):
+                            if kw in line.lower():
+                                state = kw
+                                break
+                if not still_listed:
+                    _modal_state["logs"].append("✓ medimage-ray no longer in `app list` — cluster is down")
                     _modal_state.update(status="idle", proc=None, ray_url=None, num_workers=0, gpu_type="T4")
                     return
-                last_seen_running = running_ids
-                _modal_state["logs"].append(
-                    f"Still {len(running_ids)} container(s) running, sending stop… "
-                    f"(e.g. {running_ids[0][:12]}…)"
-                )
-                # Try to stop each running container. Best-effort: errors are
-                # captured in the log, the poll loop will keep trying.
-                for cid in running_ids:
-                    try:
-                        subprocess.run(
-                            ["python3", "-m", "modal", "container", "stop", cid],
-                            env=env, timeout=20, capture_output=True, text=True,
-                        )
-                    except Exception as e:
-                        _modal_state["logs"].append(f"  stop {cid[:12]}… failed: {e}")
+                _modal_state["logs"].append(f"  still listed (state: {state or '?'}) — waiting…")
             except Exception as e:
-                _modal_state["logs"].append(f"poll error: {e}")
-            _time.sleep(8)
+                _modal_state["logs"].append(f"  poll error: {e}")
+            _time.sleep(6)
 
-        # Timed out — surface this honestly so the user knows.
         _modal_state["logs"].append(
-            "⚠ Timed out after 2 min waiting for containers to stop. "
-            "They may still be draining on modal.com — check the dashboard."
+            "⚠ Timed out after 90s waiting for the app to drop from the list. "
+            "It may still be draining on modal.com — refresh the page and check /apps."
         )
+        # Still flip to idle so the user isn't permanently stuck in "stopping"
         _modal_state.update(status="idle", proc=None, ray_url=None, num_workers=0, gpu_type="T4")
 
     threading.Thread(target=_do_stop, daemon=True).start()
