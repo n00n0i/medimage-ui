@@ -354,16 +354,25 @@ export default function Playground() {
 
   // Redraw canvas when result or threshold changes
   useEffect(() => {
-    if (!result || !canvasRef.current || !imageUrl) return
+    if (!result || !canvasRef.current || !imageUrl || !imgRef.current) return
     if (result.type !== 'detection' && result.type !== 'segmentation') return
+
     const canvas = canvasRef.current
-    const img = new Image()
-    img.onload = () => {
-      if (imgRef.current) imgRef.current.src = img.src
+    const img = imgRef.current
+
+    // If image already loaded, draw immediately
+    if (img.complete && img.naturalWidth > 0) {
       if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
       if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
+    } else {
+      // Otherwise wait for image to load
+      const handleLoad = () => {
+        if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
+        if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
+      }
+      img.addEventListener('load', handleLoad)
+      return () => img.removeEventListener('load', handleLoad)
     }
-    img.src = imageUrl
   }, [result, threshold, imageUrl])
 
   const handleFile = useCallback((file: File) => {
@@ -818,11 +827,6 @@ export default function Playground() {
                         src={imageUrl!}
                         alt="uploaded"
                         style={{ display: 'none' }}
-                        onLoad={() => {
-                          if (!canvasRef.current || !imgRef.current) return
-                          if (result.type === 'detection') drawDetections(canvasRef.current, imgRef.current, result.detections, threshold)
-                          if (result.type === 'segmentation') drawSegmentation(canvasRef.current, imgRef.current, result.masks, threshold)
-                        }}
                       />
                       <canvas
                         ref={canvasRef}
