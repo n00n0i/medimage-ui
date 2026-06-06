@@ -104,7 +104,10 @@ The backend reads several env vars that **must match the rest of the stack** or 
 | `LS_TOKEN` | LS API token (for direct REST calls) | `''` | Used by dataset sync |
 | `KEYCLOAK_JWKS_URL` | Keycloak JWKS endpoint for JWT verification | `http://medimage-keycloak-1:8080/realms/h-forge/protocol/openid-connect/certs` | **MUST include `/kc`** prefix when Keycloak runs with `KC_HTTP_RELATIVE_PATH=/kc` (the default in this compose) — the correct value is `http://medimage-keycloak-1:8080/kc/realms/h-forge/protocol/openid-connect/certs` |
 | `KEYCLOAK_ENABLED` | Toggle JWT auth | `true` | Set `false` to bypass auth for single-user/internal use |
-| `MINIO_URL` | MinIO S3 endpoint | `http://minio:9000` | |
+| `MINIO_URL` | MinIO S3 endpoint (API server → MinIO) | `http://minio:9000` | Internal Docker hostname — used by the API server only |
+| `MINIO_PUBLIC_URL` | MinIO S3 endpoint reachable from **outside** the Docker network (Ray workers, browsers) | `MINIO_URL` | See [MinIO URL for remote Ray workers](#minio-url-for-remote-ray-workers) below |
+| `MINIO_HOST_IP` | Explicit IP/host the Ray cluster should use to reach MinIO on port 9000 | _empty_ | Optional override. If unset, the host is derived from `RAY_URL` |
+| `RAY_URL` | Ray Dashboard URL | `http://100.68.53.118:8265` | Used as the host fallback for `MINIO_HOST_IP` when the Ray cluster is on the same machine as MinIO |
 | `DB_PATH` | SQLite DB path | `/data/jobs.db` | Persisted via `api-data` volume |
 
 > ⚠️ **Critical gotcha:** `LS_PASSWORD` must match the password that the LS user `admin@medimage.local` was *originally* created with. Changing the env var on an already-initialized LS container has **no effect** — LS only reads it on first start. If you change it, the API's `/api/ls-goto/{id}` will silently fail to log the user in and redirect them to the LS login page. See the [Troubleshooting](#troubleshooting) section.
@@ -122,6 +125,33 @@ npm run dev
 ```
 
 The application will be available at `http://localhost:5177`
+
+### MinIO URL for remote Ray workers
+
+The MinIO service runs inside the `medimage` Docker network. Its docker-compose
+service name `minio` is **not resolvable from Ray workers** that run on a
+different host. Training and model-deploy jobs must therefore be told the
+*external* address of MinIO.
+
+The API resolves this via `_resolve_minio_url_for_ray()` in `backend/main.py`,
+with this precedence:
+
+1. `MINIO_PUBLIC_URL` — if it does **not** contain the docker service name
+   `minio` (i.e. it already points at a real external host), it is used as-is.
+2. `MINIO_HOST_IP` — explicit IP/host override. **Set this** when the Ray
+   cluster is on a different host than docker-compose.
+3. Host parsed from `RAY_URL`, port 9000 — works when Ray and MinIO are on
+   the same machine (the common case in this stack).
+4. `host.docker.internal` — last-ditch fallback.
+
+Example for a split setup (MinIO on `10.0.0.5`, Ray on `10.0.0.6`):
+```env
+MINIO_HOST_IP=10.0.0.5
+RAY_URL=http://10.0.0.6:8265
+```
+
+If the Ray cluster is on the same host as MinIO, **no extra env var is
+needed** — the host is derived from `RAY_URL` automatically.
 
 ### Build
 
@@ -259,6 +289,15 @@ If you don't want auth at all, set `KEYCLOAK_ENABLED=false`.
 
 **Cause:** The `<img>` element's `display: 'block' → 'none'` toggle (when result type changes) re-decodes the image, briefly setting `naturalWidth=0`. The useEffect then waits for a `load` event that already fired.
 **Fix:** Already fixed in `src/pages/Playground.tsx` — image is pre-loaded into a separate `Image()` ref, decoupled from the visible `<img>`.
+
+### Training job fails with `Failed to resolve 'minio'` / `Name or service not known`
+
+**Cause:** A Ray worker tried to download the dataset from
+`http://minio:9000/...`. The docker-compose service name `minio` only resolves
+inside the `medimage` network, not on a remote Ray cluster.
+**Fix:** Set `MINIO_HOST_IP` (or a fully-qualified `MINIO_PUBLIC_URL`) in
+`medimage-api` env so the worker reaches MinIO by external IP. See
+[MinIO URL for remote Ray workers](#minio-url-for-remote-ray-workers).
 
 ### Jobs/Models show "Failed to load" but Playground inference works
 

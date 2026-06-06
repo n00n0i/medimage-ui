@@ -700,6 +700,43 @@ MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", MINIO_URL)
 LS_PUBLIC_URL = os.getenv("LS_PUBLIC_URL", LS_API_URL)
 # On-prem Ray cluster URL
 RAY_URL = os.getenv("RAY_URL", "http://100.68.53.118:8265")
+# Explicit host IP the Ray cluster should use to reach MinIO. Overrides
+# auto-detection from RAY_URL. Required when the Ray cluster is on a different
+# host than docker-compose and MINIO_PUBLIC_URL still points at the docker
+# service name (e.g. "http://minio:9000").
+MINIO_HOST_IP = os.getenv("MINIO_HOST_IP", "").strip()
+
+
+def _resolve_minio_url_for_ray() -> str:
+    """
+    MinIO URL a Ray worker (running outside the docker network) should use.
+    Resolution order:
+      1. MINIO_PUBLIC_URL — if it does NOT contain the docker service name "minio"
+         (i.e. it already points at a real external host).
+      2. MINIO_HOST_IP    — explicit override.
+      3. Host parsed from RAY_URL with port 9000 (assumes MinIO is on the same
+         host as the Ray cluster, which is the common case).
+      4. "host.docker.internal" — last-ditch fallback for the API host.
+    """
+    public = (MINIO_PUBLIC_URL or "").strip()
+    if "://" in public:
+        try:
+            from urllib.parse import urlparse as _urlparse
+            host_part = _urlparse(public).hostname or ""
+        except Exception:
+            host_part = ""
+        if host_part and "minio" not in host_part:
+            return public
+    host = MINIO_HOST_IP
+    if not host:
+        try:
+            from urllib.parse import urlparse as _urlparse
+            host = _urlparse(RAY_URL).hostname or ""
+        except Exception:
+            host = ""
+    if not host:
+        host = "host.docker.internal"
+    return f"http://{host}:9000"
 
 # ─── Real Training Helpers ────────────────────────────────────────────────────
 
@@ -2869,7 +2906,7 @@ def _run_on_ray_cluster(job: dict) -> None:
         "DATASET_URL":     dataset_url,
         "WEIGHTS_BUCKET":  weights_bucket,
         "WEIGHTS_KEY":     weights_key,
-        "MINIO_URL":       MINIO_PUBLIC_URL,
+        "MINIO_URL":       _resolve_minio_url_for_ray(),
         "MINIO_ACCESS_KEY": MINIO_ACCESS_KEY,
         "MINIO_SECRET_KEY": MINIO_SECRET_KEY,
         "LS_PUBLIC_URL":   LS_PUBLIC_URL,
@@ -3399,7 +3436,8 @@ def delete_job(job_id: str, from_view: str = "jobs"):
 
 @app.post("/api/jobs/{job_id}/retry")
 def retry_job(job_id: str):
-    """Clone a failed job and resubmit it with a fresh ID."""
+    """Reset a failed job to queued and resubmit it in place (same job_id)."""
+    import re as _re
     with get_db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not row:
@@ -3408,52 +3446,31 @@ def retry_job(job_id: str):
     old["model_name"] = _normalize_model_name(old.get("model_name", ""))
     _check_zero_shot(old.get("model_name", ""), old.get("engine", ""))
 
-    new_id = str(uuid.uuid4())[:8]
-    # Compute retry count from existing name
-    import re as _re
-    base_name = _re.sub(r'^(\[Retry-?\d*\]\s*)+', '', old['name']).strip()
-    existing = []
-    with get_db() as conn:
-        existing = conn.execute(
-            "SELECT name FROM jobs WHERE name LIKE ?",
-            (f"%{base_name}%",)
-        ).fetchall()
-    retry_nums = []
-    for row in existing:
-        m = _re.search(r'\[Retry-(\d+)\]', row['name'])
-        if m:
-            retry_nums.append(int(m.group(1)))
-    next_num = max(retry_nums, default=1) + 1 if retry_nums else 2
-    new_name = f"[Retry-{next_num}] {base_name}"
+    # Strip any legacy [Retry-N] prefix from the name (idempotent cleanup)
+    clean_name = _re.sub(r'^(\[Retry-?\d*\]\s*)+', '', old["name"]).strip() or old["name"]
+
     with get_db() as conn:
         conn.execute(
-            """INSERT INTO jobs
-               (id, name, project_id, dataset, training_type, model_name, engine,
-                epochs, batch_size, learning_rate, optimizer, imgsz, notes,
-                lora_rank, quantization, max_seq_len, chat_template, grad_accum, text_dataset,
-                cluster, status, progress, log, pipeline_step, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'','',?)""",
-            (
-                new_id,
-                new_name,
-                old["project_id"], old["dataset"],
-                old["training_type"], old["model_name"], old["engine"],
-                old["epochs"], old["batch_size"], old["learning_rate"],
-                old["optimizer"], old["imgsz"], old.get("notes", ""),
-                old.get("lora_rank", 16), old.get("quantization", "4bit"),
-                old.get("max_seq_len", 2048), old.get("chat_template", "alpaca"),
-                old.get("grad_accum", 4), old.get("text_dataset", ""),
-                old.get("cluster", "ray"),
-                time.time(),
-            ),
+            """UPDATE jobs SET
+                name = ?,
+                status = 'queued',
+                progress = 0,
+                log = '',
+                pipeline_step = '',
+                error = NULL,
+                started_at = NULL,
+                finished_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?""",
+            (clean_name, job_id),
         )
         conn.commit()
 
     with get_db() as conn:
-        new_row = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (new_id,)).fetchone())
+        row = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
-    threading.Thread(target=run_training, args=(new_row,), daemon=True).start()
-    return {"job_id": new_id}
+    threading.Thread(target=run_training, args=(row,), daemon=True).start()
+    return {"job_id": job_id}
 
 
 # ─── Import pretrained model ─────────────────────────────────────────────────
@@ -5875,15 +5892,7 @@ async def deploy_model_to_ray(job_id: str, body: dict = {}):
     serve_url = f"{base_serve}/model/{job_id}"
 
     # MinIO URL reachable from Ray workers (use public IP, not Docker service name)
-    minio_url_for_ray = MINIO_PUBLIC_URL
-    if "minio" in minio_url_for_ray and "://" in minio_url_for_ray:
-        # Docker service name not reachable from Ray — use backend host IP
-        import socket
-        try:
-            host_ip = socket.gethostbyname("host.docker.internal")
-        except Exception:
-            host_ip = "100.68.3.42"
-        minio_url_for_ray = f"http://{host_ip}:9000"
+    minio_url_for_ray = _resolve_minio_url_for_ray()
 
     import base64 as _b64
 
