@@ -325,11 +325,22 @@ export default function Playground() {
   const isVlmModel = (m: Model) => m.training_type === 'vlm-finetune'
   const isImageModel = (m: Model) => !isLlmModel(m) && !isVlmModel(m)
 
-  const visibleModels = playMode === 'text'
+  // Only show models whose inference provider is actually reachable. The
+  // DB column `inference_provider` is sticky — it can say 'ray' even after
+  // the Ray cluster goes down, or 'modal' without a running cluster — so we
+  // gate visibility on the live cluster-status probes.
+  const providerOnline = (m: Model): boolean => {
+    if (m.inference_provider === 'ray')   return rayClusterOnline   === true
+    if (m.inference_provider === 'modal') return modalClusterOnline === true
+    return true  // Sim / no provider — doesn't depend on a cluster
+  }
+
+  const visibleModels = (playMode === 'text'
     ? models.filter(isLlmModel)
     : playMode === 'vl'
     ? models.filter(isVlmModel)
     : models.filter(isImageModel)
+  ).filter(providerOnline)
 
   const runTextInference = async () => {
     if (!selectedModel || !userPrompt.trim()) return
@@ -578,6 +589,23 @@ export default function Playground() {
               )}
               <ChevronDown size={14} style={{ color: 'var(--text-muted)', flexShrink: 0, marginLeft: 'auto' }} />
             </button>
+
+            {modelOpen && visibleModels.length === 0 && (
+              <div style={{
+                position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0,
+                background: 'var(--bg-elevated)', border: '1px solid var(--border-default)',
+                borderRadius: 8, zIndex: 50, boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+                padding: '14px 16px', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5,
+              }}>
+                {models.length === 0
+                  ? <>No completed models yet — train one first.</>
+                  : <>Models are hidden because their inference provider is offline.<br />
+                      <span style={{ fontSize: 11 }}>
+                        • Ray-deployed models need the on-prem Ray cluster reachable<br />
+                        • Modal-deployed models need the Modal Ray cluster running
+                      </span></>}
+              </div>
+            )}
 
             {modelOpen && visibleModels.length > 0 && (
               <div style={{

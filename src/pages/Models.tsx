@@ -1362,10 +1362,24 @@ function DeploySection({ modelId, trainingType, initialProvider, initialModalUrl
   const [modalKey, setModalKey]   = useState(initialModalKey)
   const [rayUrl, setRayUrl]       = useState(initialRayUrl)
 
-  const TABS: { id: Tab; label: string; color: string }[] = [
-    { id: 'modal',    label: 'Modal',     color: '#8b5cf6' },
-    { id: 'ray',      label: 'Ray Serve', color: '#f59e0b' },
+  // Only show tabs for providers this model is actually deployed to. If a
+  // model has no Modal URL and no Ray URL, expose both tabs so the user can
+  // still pick where to deploy.
+  const hasModal = !!initialModalUrl
+  const hasRay   = !!initialRayUrl
+  const TABS: { id: Tab; label: string; color: string }[] = hasModal || hasRay ? [
+    ...(hasModal ? [{ id: 'modal' as Tab, label: 'Modal',     color: '#8b5cf6' }] : []),
+    ...(hasRay   ? [{ id: 'ray'   as Tab, label: 'Ray Serve', color: '#f59e0b' }] : []),
+  ] : [
+    { id: 'modal', label: 'Modal',     color: '#8b5cf6' },
+    { id: 'ray',   label: 'Ray Serve', color: '#f59e0b' },
   ]
+
+  // If the stored provider no longer matches any visible tab (e.g. user
+  // cleared the URL), fall back to the first available tab.
+  useEffect(() => {
+    if (!TABS.some(t => t.id === tab)) setTab(TABS[0].id)
+  }, [tab, TABS])
 
   const _isLLM = trainingType === 'llm-text' || trainingType === 'vlm-finetune'; void _isLLM
 
