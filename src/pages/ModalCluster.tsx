@@ -301,6 +301,67 @@ export default function ModalConfig() {
         </div>
       )}
 
+      {/* Modal Cluster Status — prominent top-level card summarising the running cluster */}
+      {deployments.length > 0 && (() => {
+        const first = deployments[0]
+        const gpu    = (first.gpu_type ?? 'T4').toUpperCase()
+        const memMb  = first.memory_mb ?? 16384
+        const workers= first.num_workers ?? 1
+        const idleSec= first.scaledown_window_s ?? 300
+        const isUp   = (first.status ?? 'running') === 'running'
+        return (
+          <div className="card" style={{ marginBottom: 20, borderColor: isUp ? '#22c55e40' : 'var(--border)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{
+                  width: 10, height: 10, borderRadius: '50%',
+                  background: isUp ? '#22c55e' : '#f59e0b',
+                  boxShadow: isUp ? '0 0 8px #22c55e' : '0 0 8px #f59e0b',
+                }} />
+                <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
+                  Modal Cluster Status
+                </h3>
+                <span style={{
+                  fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 5,
+                  background: isUp ? '#22c55e20' : '#f59e0b20',
+                  color:      isUp ? '#22c55e'   : '#f59e0b',
+                  textTransform: 'uppercase', letterSpacing: '0.06em',
+                }}>{isUp ? 'Online' : (first.status ?? 'unknown')}</span>
+              </div>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                {deployments.length} active deployment{deployments.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+
+            <div style={{
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+              gap: 14, paddingTop: 14, borderTop: '1px solid var(--border-subtle)',
+            }}>
+              {([
+                { label: 'Primary model',  value: first.model_name || first.id,                                       sub: first.training_type ? `${first.training_type} · ${first.engine ?? '?'}` : null },
+                { label: 'GPU',            value: gpu === 'CPU' ? 'CPU only' : gpu,                                   sub: `${workers} worker${workers !== 1 ? 's' : ''}` },
+                { label: 'Memory / container', value: memMb >= 1024 ? `${(memMb / 1024).toFixed(0)} GB` : `${memMb} MB`, sub: `min ${first.min_containers ?? 1} container` },
+                { label: 'Idle shut',      value: idleSec >= 60 ? `${Math.round(idleSec / 60)} min` : `${idleSec} s`,  sub: 'scaledown window' },
+                { label: 'Endpoint',       value: first.modal_url.replace(/^https?:\/\//, '').slice(0, 32) + '…',    sub: <a href={first.modal_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary-hover)', textDecoration: 'none' }}>open ↗</a> },
+                { label: 'Deployed at',    value: first.deployed_at ? new Date(first.deployed_at.replace(' ', 'T') + 'Z').toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—', sub: 'last refresh ✓' },
+              ] as Array<{ label: string; value: string; sub: React.ReactNode }>).map(s => (
+                <div key={s.label}>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>
+                    {s.label}
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums', wordBreak: 'break-all' }}>
+                    {s.value}
+                  </div>
+                  {s.sub != null && (
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{s.sub}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Active Deployments */}
       <div className="card">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
