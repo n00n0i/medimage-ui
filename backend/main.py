@@ -3511,7 +3511,20 @@ async def get_modal_status(job_id: str):
 
 @app.get("/api/jobs/{job_id}/ray-status")
 async def get_ray_status(job_id: str):
-    """Check if the Ray Serve deployment for this job is RUNNING via Ray Client."""
+    """Check if the model is reachable on the Ray cluster.
+
+    Two deployment mechanisms exist:
+      1. Ray Serve app named `medimage-{job_id}` (the in-script _run_modal
+         path uses this for direct model serving).
+      2. Ray detached actor named `model-{job_id}` (the modal-model-deploy
+         path uses this; the actor is created with lifetime="detached"
+         so it survives the driver job exiting).
+
+    The actor is what the user actually sees in the Ray dashboard
+    ('Model actor "model-7bc8f748" is running on Ray cluster!'),
+    so it's the source of truth for "is this model reachable?". We
+    also check the Ray Serve app as a fallback.
+    """
     with get_db() as conn:
         row = conn.execute("SELECT ray_serve_url, inference_provider FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not row or not row["ray_serve_url"]:
@@ -3524,14 +3537,31 @@ async def get_ray_status(job_id: str):
         _addr = f"ray://{_host}:10001"
         if not _ray.is_initialized():
             _ray.init(address=_addr, ignore_reinit_error=True, log_to_driver=False)
+
+        # 1) Detached Ray actor (model-{job_id}) — preferred, since
+        #    that's what the modal-model-deploy path creates and what
+        #    the user sees in the Ray dashboard.
+        _actor_name = f"model-{job_id}"
+        try:
+            _actor = _ray.get_actor(_actor_name, namespace="default")
+            # get_actor() raises if the actor doesn't exist OR is DEAD.
+            # Successful return ⇒ the actor handle is alive, and since
+            # detached actors are only cleaned up on explicit kill, an
+            # existing handle means inference is reachable.
+            return {"online": True, "status": "actor_alive", "kind": "ray_actor", "name": _actor_name}
+        except Exception:
+            pass
+
+        # 2) Ray Serve app (medimage-{job_id}) — fallback.
         _status = _serve.status()
         _app_name = f"medimage-{job_id}"
         _info = _status.applications.get(_app_name)
-        if _info is None:
-            return {"online": False, "status": "not_deployed"}
-        _s = str(_info.status)
-        _online = "RUNNING" in _s or "HEALTHY" in _s
-        return {"online": _online, "status": _s}
+        if _info is not None:
+            _s = str(_info.status)
+            _online = "RUNNING" in _s or "HEALTHY" in _s
+            return {"online": _online, "status": _s, "kind": "ray_serve", "name": _app_name}
+
+        return {"online": False, "status": "not_deployed"}
     except Exception as e:
         return {"online": False, "status": "error", "error": str(e)}
 
