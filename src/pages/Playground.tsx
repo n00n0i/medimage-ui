@@ -318,7 +318,7 @@ export default function Playground() {
         if (m.inference_provider === 'ray')
           return !!rayStatus.online && !!m.ray_serve_url
         if (m.inference_provider === 'modal')
-          return !!modalStatus.online && !!m.modal_url
+          return !!m.modal_url   // Modal Web Function — independent of Modal Ray cluster
         return false
       }
       const typeOk = playMode === 'text'
@@ -349,11 +349,18 @@ export default function Playground() {
   // set but the actor was never deployed (or was torn down). Show it
   // in the dropdown and inference will silently fail with a confusing
   // network error.
+  //
+  // For Ray-deployed models the Ray cluster must also be online —
+  // the Serve actor lives on the cluster. For Modal-deployed models
+  // we don't gate on the Modal Ray cluster state: the model's Web
+  // Function is its own Modal app, independent of the Ray cluster
+  // (which is the *training* cluster). As long as modal_url is set
+  // and Modal.com is reachable (always true), the model works.
   const providerOnline = (m: Model): boolean => {
     if (m.inference_provider === 'ray')
       return rayClusterOnline === true && !!m.ray_serve_url
     if (m.inference_provider === 'modal')
-      return modalClusterOnline === true && !!m.modal_url
+      return !!m.modal_url
     return false  // no provider assigned — not deployable
   }
 
