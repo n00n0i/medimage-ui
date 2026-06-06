@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle } from 'lucide-react'
+import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle, X, Loader2, StopCircle } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
 type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
@@ -265,6 +265,71 @@ export default function TrainModel() {
       .catch(() => {})
   }, [step])
 
+  // ── Modal Start-Cluster popup (shown when the user picks Modal but the
+  //    cluster isn't running yet).  Lets them start inline rather than
+  //    bouncing to the Modal Config page.
+  const [modalStartOpen, setModalStartOpen]     = useState(false)
+  const [modalGpu, setModalGpu]                 = useState('T4')
+  const [modalWorkers, setModalWorkers]         = useState(1)
+  const [modalStarting, setModalStarting]       = useState(false)
+  const [modalStartError, setModalStartError]   = useState('')
+  const [modalClusterLive, setModalClusterLive] = useState<{ status: string; ray_url: string | null } | null>(null)
+  const modalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Poll /api/modal/status while the popup is open so the user sees when
+  // the cluster flips to 'running' (Modal cold-start is 1–3 min).
+  useEffect(() => {
+    if (!modalStartOpen) {
+      if (modalPollRef.current) { clearInterval(modalPollRef.current); modalPollRef.current = null }
+      setModalClusterLive(null)
+      return
+    }
+    const tick = async () => {
+      try {
+        const r = await fetch('/api/modal/status')
+        if (r.ok) setModalClusterLive(await r.json())
+      } catch { /* ignore */ }
+    }
+    tick()
+    modalPollRef.current = setInterval(tick, 4000)
+    return () => { if (modalPollRef.current) clearInterval(modalPollRef.current) }
+  }, [modalStartOpen])
+
+  // If the cluster becomes running while the popup is open, auto-close it
+  // and select Modal.
+  useEffect(() => {
+    if (modalClusterLive?.status === 'running') {
+      setModalStartOpen(false)
+      set('cluster', 'modal')
+      setClusterStatus(s => s ? { ...s, modal: { ...s.modal, available: true, status: 'running' } } : s)
+    }
+  }, [modalClusterLive?.status])
+
+  async function startModalFromPopup() {
+    setModalStarting(true)
+    setModalStartError('')
+    try {
+      const r = await fetch('/api/modal/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gpu_type: modalGpu, num_workers: modalWorkers }),
+      })
+      if (!r.ok) {
+        const t = await r.text()
+        setModalStartError(t)
+      }
+    } catch (e) {
+      setModalStartError((e as Error).message)
+    } finally { setModalStarting(false) }
+  }
+
+  async function stopModalFromPopup() {
+    setModalStarting(true)
+    try {
+      await fetch('/api/modal/stop', { method: 'POST' })
+    } finally { setModalStarting(false) }
+  }
+
   // Reset showAllModels when training type changes
   useEffect(() => { setShowAllModels(false) }, [config.trainingType])
 
@@ -463,6 +528,141 @@ export default function TrainModel() {
       {toast && (
         <div className={`toast ${toast.type === 'error' ? 'toast-error' : 'toast-success'} mb-4`}>
           {toast.msg}
+        </div>
+      )}
+
+      {/* ── Modal Start-Cluster popup ──────────────────────────────────────── */}
+      {modalStartOpen && (
+        <div
+          onClick={() => setModalStartOpen(false)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 100,
+            background: 'rgba(0,0,0,0.55)', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', padding: 16,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: 'var(--bg-card)', borderRadius: 14, padding: 24,
+              width: '100%', maxWidth: 460,
+              border: '1px solid rgba(139,92,246,0.35)',
+              boxShadow: '0 20px 50px rgba(0,0,0,0.45)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+              <Cloud size={18} color="#8b5cf6" />
+              <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--text-primary)' }}>
+                Start Modal Ray Cluster
+              </h2>
+              <button
+                onClick={() => setModalStartOpen(false)}
+                style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 4 }}
+                aria-label="Close"
+              ><X size={16} /></button>
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
+              ใช้ credentials ที่บันทึกไว้ — ไม่ต้องกรอก secret ใหม่
+            </p>
+
+            {modalClusterLive && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 12px', borderRadius: 8,
+                background: 'var(--bg-base)', border: '1px solid var(--border-subtle)',
+                marginBottom: 14, fontSize: 12,
+              }}>
+                <span style={{
+                  width: 8, height: 8, borderRadius: '50%',
+                  background: modalClusterLive.status === 'running' ? '#22c55e' :
+                               modalClusterLive.status === 'error'    ? '#ef4444' : '#f59e0b',
+                  boxShadow: `0 0 6px ${modalClusterLive.status === 'running' ? '#22c55e' : '#f59e0b'}`,
+                  flexShrink: 0,
+                }} />
+                <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                  Status: {modalClusterLive.status}
+                </span>
+                {modalClusterLive.status === 'deploying' && (
+                  <span style={{ color: 'var(--text-muted)' }}>— Modal cold-start ใช้เวลา 1–3 นาที</span>
+                )}
+                {modalClusterLive.ray_url && (
+                  <code style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', color: '#8b5cf6', fontSize: 11 }}>
+                    {modalClusterLive.ray_url}
+                  </code>
+                )}
+              </div>
+            )}
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>GPU</span>
+                <select
+                  value={modalGpu}
+                  onChange={e => setModalGpu(e.target.value)}
+                  disabled={modalClusterLive?.status === 'running' || modalClusterLive?.status === 'deploying'}
+                  style={{ padding: '8px 10px', fontSize: 13, background: 'var(--bg-base)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 8 }}
+                >
+                  <option value="T4">T4</option>
+                  <option value="L4">L4</option>
+                  <option value="A10G">A10G</option>
+                  <option value="L40S">L40S</option>
+                  <option value="A100">A100 (40GB)</option>
+                  <option value="A100-80GB">A100 (80GB)</option>
+                  <option value="H100">H100</option>
+                  <option value="cpu">CPU only</option>
+                </select>
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Workers</span>
+                <select
+                  value={modalWorkers}
+                  onChange={e => setModalWorkers(parseInt(e.target.value))}
+                  disabled={modalClusterLive?.status === 'running' || modalClusterLive?.status === 'deploying'}
+                  style={{ padding: '8px 10px', fontSize: 13, background: 'var(--bg-base)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 8 }}
+                >
+                  {[1, 2, 4, 8].map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </label>
+            </div>
+
+            {modalStartError && (
+              <div style={{
+                padding: '8px 12px', borderRadius: 8, fontSize: 11, fontFamily: 'var(--font-mono)',
+                background: '#ef444410', border: '1px solid #ef444430', color: '#ef4444', marginBottom: 12,
+                whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto',
+              }}>{modalStartError}</div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setModalStartOpen(false)}
+                style={{ padding: '8px 16px', fontSize: 12, fontWeight: 600, background: 'transparent', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 8, cursor: 'pointer' }}
+              >Close</button>
+              {modalClusterLive?.status === 'running' ? (
+                <button
+                  onClick={stopModalFromPopup}
+                  disabled={modalStarting}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontSize: 12, fontWeight: 600, background: '#ef444415', color: '#ef4444', border: '1px solid #ef444430', borderRadius: 8, cursor: 'pointer' }}
+                >
+                  {modalStarting ? <Loader2 size={12} className="animate-spin" /> : <StopCircle size={12} />}
+                  Stop Cluster
+                </button>
+              ) : modalClusterLive?.status === 'deploying' ? (
+                <button disabled style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontSize: 12, fontWeight: 600, background: 'var(--bg-elevated)', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 8, cursor: 'not-allowed' }}>
+                  <Loader2 size={12} className="animate-spin" /> Starting…
+                </button>
+              ) : (
+                <button
+                  onClick={startModalFromPopup}
+                  disabled={modalStarting}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontSize: 12, fontWeight: 600, background: '#8b5cf6', color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer', opacity: modalStarting ? 0.6 : 1 }}
+                >
+                  {modalStarting ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+                  Start {modalWorkers}× {modalGpu}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -915,11 +1115,15 @@ export default function TrainModel() {
               {/* Modal Cluster */}
               <button
                 onClick={() => {
-                  if (clusterStatus && !clusterStatus.modal.available) {
-                    const msg = clusterStatus.modal.creds_saved
-                      ? 'Modal cluster not running — click "Start Cluster" on the Modal Config page first'
-                      : 'Modal cluster not running — set credentials and click "Start Cluster" on the Modal Config page first'
-                    showToast(msg, 'error')
+                  if (!clusterStatus) return  // still loading
+                  if (!clusterStatus.modal.creds_saved) {
+                    // No creds yet — can't do anything here, just direct them.
+                    showToast('Set Modal token & secret on the Modal Config page first', 'error')
+                    return
+                  }
+                  if (!clusterStatus.modal.available) {
+                    // Creds saved, cluster not running — open the inline start popup.
+                    setModalStartOpen(true)
                     return
                   }
                   set('cluster', 'modal')
@@ -941,7 +1145,7 @@ export default function TrainModel() {
                       ? (clusterStatus.modal.available
                           ? <span style={{ color: 'var(--success)' }}>● Running — ready for training</span>
                           : clusterStatus.modal.creds_saved
-                            ? <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — go to <a href="/modal-cluster" onClick={e => e.stopPropagation()} style={{ color: 'var(--primary-hover)' }}>Modal Config</a> → Start Cluster</span>
+                            ? <span style={{ color: 'var(--warning)' }}>● {clusterStatus.modal.status} — click to start cluster</span>
                             : <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — set token & secret in <a href="/modal-cluster" onClick={e => e.stopPropagation()} style={{ color: 'var(--primary-hover)' }}>Modal Config</a></span>)
                       : <span style={{ color: 'var(--text-muted)' }}>Checking...</span>}
                   </div>

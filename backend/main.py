@@ -3650,10 +3650,14 @@ _modal_state: dict = {
 
 
 class ModalStartRequest(BaseModel):
-    token_id: str
-    token_secret: str
-    gpu_type: str = "T4"
-    num_workers: int = 1
+    # token_id / token_secret are optional in the request: the endpoint will
+    # fall back to whatever is saved in the DB (modal_credentials table) when
+    # they are missing or empty, so the UI can fire "Start" without having
+    # the secret in memory.
+    token_id:     str = ""
+    token_secret: str = ""
+    gpu_type:     str = "T4"
+    num_workers:  int = 1
 
 
 def _modal_script(req: ModalStartRequest) -> str:

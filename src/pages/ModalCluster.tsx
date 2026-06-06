@@ -40,6 +40,8 @@ export default function ModalConfig() {
   const [clusterStatus, setClusterStatus] = useState<{ status: string; ray_url: string | null } | null>(null)
   const [starting, setStarting]           = useState(false)
   const [stoppingCluster, setStoppingCluster] = useState(false)
+  const [gpuType, setGpuType]         = useState('T4')
+  const [numWorkers, setNumWorkers]   = useState(1)
 
   const inputStyle: React.CSSProperties = {
     width: '100%', boxSizing: 'border-box', padding: '8px 11px', fontSize: 13,
@@ -140,13 +142,13 @@ export default function ModalConfig() {
       alert('Set Modal credentials first')
       return
     }
-    if (!confirm('Start Modal Ray cluster? (จะมีค่าใช้จ่ายจาก Modal ตาม GPU ที่เลือก)')) return
+    if (!confirm(`Start Modal Ray cluster? (${numWorkers}× ${gpuType} — จะมีค่าใช้จ่ายจาก Modal ตาม GPU ที่เลือก)`)) return
     setStarting(true)
     try {
       const r = await fetch('/api/modal/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gpu_type: 'T4', num_workers: 1 }),
+        body: JSON.stringify({ gpu_type: gpuType, num_workers: numWorkers }),
       })
       if (!r.ok) {
         const t = await r.text()
@@ -373,6 +375,44 @@ export default function ModalConfig() {
               </div>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
+              {/* GPU + workers selectors — disabled while running */}
+              <select
+                value={gpuType}
+                onChange={e => setGpuType(e.target.value)}
+                disabled={clusterRunning || clusterBusy}
+                title="GPU type"
+                style={{
+                  padding: '8px 10px', fontSize: 12, fontWeight: 600,
+                  background: 'var(--bg-base)', color: 'var(--text-primary)',
+                  border: '1px solid var(--border)', borderRadius: 8,
+                  cursor: (clusterRunning || clusterBusy) ? 'not-allowed' : 'pointer',
+                  opacity: (clusterRunning || clusterBusy) ? 0.55 : 1,
+                }}
+              >
+                <option value="T4">T4</option>
+                <option value="L4">L4</option>
+                <option value="A10G">A10G</option>
+                <option value="L40S">L40S</option>
+                <option value="A100">A100 (40GB)</option>
+                <option value="A100-80GB">A100 (80GB)</option>
+                <option value="H100">H100</option>
+                <option value="cpu">CPU only</option>
+              </select>
+              <select
+                value={numWorkers}
+                onChange={e => setNumWorkers(parseInt(e.target.value))}
+                disabled={clusterRunning || clusterBusy}
+                title="Worker count"
+                style={{
+                  padding: '8px 10px', fontSize: 12, fontWeight: 600,
+                  background: 'var(--bg-base)', color: 'var(--text-primary)',
+                  border: '1px solid var(--border)', borderRadius: 8,
+                  cursor: (clusterRunning || clusterBusy) ? 'not-allowed' : 'pointer',
+                  opacity: (clusterRunning || clusterBusy) ? 0.55 : 1,
+                }}
+              >
+                {[1, 2, 4, 8].map(n => <option key={n} value={n}>{n} worker{n > 1 ? 's' : ''}</option>)}
+              </select>
               <button
                 onClick={handleStartCluster}
                 disabled={!cred?.configured || clusterRunning || clusterBusy || starting}
