@@ -247,10 +247,12 @@ export default function Playground() {
   const [result, setResult] = useState<InferenceResult | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  // Cluster reachability — used to flag "Ray" / "Modal" badges as offline
-  // when the underlying cluster isn't responding. null = unknown / not yet probed.
-  const [rayClusterOnline,   setRayClusterOnline]   = useState<boolean | null>(null)
-  const [modalClusterOnline, setModalClusterOnline] = useState<boolean | null>(null)
+  // Cluster reachability — used to flag the "Ray" badge as offline
+  // when the underlying cluster isn't responding. We no longer gate
+  // the Modal badge on cluster state: per-model Modal Web Functions
+  // are independent of the Modal Ray cluster.
+  // null = unknown / not yet probed.
+  const [rayClusterOnline, setRayClusterOnline] = useState<boolean | null>(null)
 
   // Text / VL inference state
   const [systemPrompt, setSystemPrompt] = useState('You are a helpful industrial AI assistant.')
@@ -294,10 +296,7 @@ export default function Playground() {
       fetch('/api/settings/inference/ray-status')
         .then(r => r.ok ? r.json() : { online: false })
         .catch(() => ({ online: false })),
-      fetch('/api/settings/inference/modal-status')
-        .then(r => r.ok ? r.json() : { online: false })
-        .catch(() => ({ online: false })),
-    ]).then(([d, rayStatus, modalStatus]) => {
+    ]).then(([d, rayStatus]) => {
       const ms: Model[] = (d.jobs ?? []).map((j: any) => ({
         id:            j.id,
         name:          j.name,
@@ -310,7 +309,6 @@ export default function Playground() {
       }))
       setModels(ms)
       setRayClusterOnline(!!rayStatus.online)
-      setModalClusterOnline(!!modalStatus.online)
       // Default-select from the *filtered* visible list, not the raw models.
       // Otherwise the closed button shows a model that the dropdown hides.
       // Same URL-required check as the render-time filter below.
@@ -602,8 +600,11 @@ export default function Playground() {
                     {TYPE_LABEL[selectedModel.training_type]}
                   </span>
                   {selectedModel.inference_provider === 'modal' ? (
-                    <span title={modalClusterOnline === false ? 'Modal account unreachable' : 'Deployed on Modal'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: modalClusterOnline === false ? '#ef444420' : '#8b5cf620', color: modalClusterOnline === false ? '#ef4444' : '#8b5cf6', flexShrink: 0 }}>
-                      Modal{modalClusterOnline === false ? ' (offline)' : ''}
+                    // Per-model Modal Web Function — independent of the
+                    // Modal Ray cluster. Show plain 'Modal' (no
+                    // '(offline)' suffix) as long as the URL is set.
+                    <span title={selectedModel.modal_url ? `Deployed on Modal — ${selectedModel.modal_url}` : 'No modal_url set'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#8b5cf620', color: '#8b5cf6', flexShrink: 0 }}>
+                      Modal
                     </span>
                   ) : selectedModel.inference_provider === 'ray' ? (
                     <span title={rayClusterOnline === false ? 'Ray cluster unreachable' : 'Deployed on Ray'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: rayClusterOnline === false ? '#ef444420' : '#f59e0b20', color: rayClusterOnline === false ? '#ef4444' : '#f59e0b', flexShrink: 0 }}>
@@ -671,15 +672,21 @@ export default function Playground() {
                       {TYPE_LABEL[m.training_type]}
                     </span>
                     {m.inference_provider === 'modal' ? (
-                      <span title={modalClusterOnline === false ? 'Modal account unreachable' : 'Deployed on Modal'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: modalClusterOnline === false ? '#ef444420' : '#8b5cf620', color: modalClusterOnline === false ? '#ef4444' : '#8b5cf6', flexShrink: 0 }}>
-                        Modal{modalClusterOnline === false ? ' (offline)' : ''}
+                      // Modal-deployed: the per-model Web Function is its own
+                      // Modal app and is independent of the Modal *Ray*
+                      // cluster. Showing '(offline)' whenever the Ray
+                      // cluster is idle is wrong — the model is reachable
+                      // as long as modal_url is set. (The Ray cluster
+                      // status is only relevant for the *train* flow.)
+                      <span title={m.modal_url ? `Deployed on Modal — ${m.modal_url}` : 'No modal_url set'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#8b5cf620', color: '#8b5cf6', flexShrink: 0 }}>
+                        Modal
                       </span>
                     ) : m.inference_provider === 'ray' ? (
                       <span title={rayClusterOnline === false ? 'Ray cluster unreachable' : 'Deployed on Ray'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: rayClusterOnline === false ? '#ef444420' : '#f59e0b20', color: rayClusterOnline === false ? '#ef4444' : '#f59e0b', flexShrink: 0 }}>
                         Ray{rayClusterOnline === false ? ' (offline)' : ''}
                       </span>
                     ) : (
-                      <span style={{ fontSize: 9, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: 'var(--bg-base)', color: 'var(--text-muted)', flexShrink: 0 }}>Sim</span>
+                      <span style={{ fontSize: 9, fontWeight: 600, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-base)', color: 'var(--text-muted)', flexShrink: 0 }}>Sim</span>
                     )}
                   </button>
                 ))}
