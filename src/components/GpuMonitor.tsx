@@ -5,9 +5,11 @@ import { Cpu, MemoryStick, Thermometer, Zap } from 'lucide-react'
 interface GpuSnapshot {
   ts: number
   gpus: Array<{
-    index: number                // globally unique: <nodeIdx>:<gpuIdx>
+    index: number                // globally unique across clusters (used as history key)
+    localIndex: number           // the GPU's own index on its node (0, 1, 2…)
     nodeIndex: number            // which node this GPU is on
     nodeHost: string             // IP/hostname of the node
+    cluster: 'on-prem' | 'modal' // which Ray cluster this GPU belongs to
     name: string
     utilGpu: number    // 0-100
     memUsedMiB: number
@@ -78,14 +80,22 @@ function GpuCard({
       padding: '14px 16px',
       minWidth: 0,
     }}>
-      {/* GPU name + node host + temp + power */}
+      {/* GPU name + node host + cluster badge + temp + power */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <div style={{ minWidth: 0, flex: 1 }}>
-          <p style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 1, fontFamily: 'var(--font-mono)' }}>
-            node {gpu.nodeIndex} · {gpu.nodeHost || '?'}
-          </p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+            <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4,
+              background: gpu.cluster === 'modal' ? '#8b5cf620' : '#f59e0b20',
+              color:      gpu.cluster === 'modal' ? '#8b5cf6' : '#f59e0b',
+              textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+              {gpu.cluster}
+            </span>
+            <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+              node {gpu.nodeIndex} · {gpu.nodeHost || '?'}
+            </span>
+          </div>
           <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            GPU {gpu.index} · {gpu.name}
+            GPU {gpu.localIndex} · {gpu.name}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexShrink: 0 }}>
@@ -184,29 +194,36 @@ export default function GpuMonitor({ active }: { active: boolean }) {
 
   const MAX_POINTS = 60
 
-  const poll = async () => {
-    try {
-      const res = await fetch('/api/ray/nodes?view=summary')
-      if (!res.ok) { setError(true); return }
-      const data = await res.json()
-      const nodes: any[] = data?.data?.summary ?? []
-      if (!nodes.length) { setError(true); return }
-
-      // Flatten GPUs across ALL nodes (head + every worker). Use globally
-      // unique keys (nodeIdx:gpuIdx) so history is per-GPU. Previously
-      // this only looked at nodes[0] which gave you the head node's
-      // idle GPUs and missed all the training activity on workers.
-      const gpus: GpuSnapshot['gpus'] = []
-      let ramUsedTotal = 0
-      let ramTotal = 0
-      nodes.forEach((node: any, nIdx: number) => {
-        const raylet = node.raylet || {}
-        const nodeHost = raylet.hostname || raylet.nodeManagerAddress || node.ip || '?'
+  /**
+   * Pulls the Ray /nodes?view=summary from `endpointUrl` and appends
+   * its GPUs to `acc`. Tag each GPU with the source cluster ("on-prem"
+   * or "modal") so the UI can label cards correctly. Returns the
+   * number of nodes that were actually present.
+   */
+  const _ingest = async (
+    acc: { gpus: GpuSnapshot['gpus']; ramUsed: number; ramTotal: number; nodes: number },
+    endpointUrl: string,
+    clusterLabel: 'on-prem' | 'modal',
+    globalOffset: number,
+  ) => {
+    const res = await fetch(endpointUrl)
+    if (!res.ok) return
+    const data = await res.json()
+    const nodes: any[] = data?.data?.summary ?? []
+    if (!nodes.length) return
+    nodes.forEach((node: any, nIdx: number) => {
+      const raylet = node.raylet || {}
+      const nodeHost = raylet.hostname || raylet.nodeManagerAddress || node.ip || '?'
         for (const g of (node.gpus ?? [])) {
-          gpus.push({
-            index:       nIdx * 100 + (g.index ?? 0),  // unique per node
+          const localIdx = g.index ?? 0
+          acc.gpus.push({
+            // Globally unique across both clusters. Modal GPUs get
+            // +10_000 to avoid collisions with on-prem keys.
+            index:       globalOffset + nIdx * 100 + localIdx,
+            localIndex:  localIdx,
             nodeIndex:   nIdx,
             nodeHost,
+            cluster:     clusterLabel,
             name:        g.name ?? 'GPU',
             utilGpu:     Math.round(g.utilizationGpu ?? 0),
             memUsedMiB:  g.memoryUsed  ?? 0,
@@ -215,40 +232,57 @@ export default function GpuMonitor({ active }: { active: boolean }) {
             powerW:      Math.round((g.powerMw ?? 0) / 1000),
           })
         }
-        // mem[0] = total, mem[1] = available (Ray's convention).
-        if (Array.isArray(node.mem) && node.mem.length >= 2) {
-          ramUsedTotal += Math.max(0, (node.mem[0] ?? 0) - (node.mem[1] ?? 0))
-          ramTotal    += (node.mem[0] ?? 0)
-        }
-      })
-
-      const ramUsedGb  = ramUsedTotal / 1024 ** 3
-      const ramTotalGb = ramTotal     / 1024 ** 3
-
-      const snap: GpuSnapshot = {
-        ts: Date.now(), gpus, ramUsedGb, ramTotalGb, nodesTotal: nodes.length,
+      if (Array.isArray(node.mem) && node.mem.length >= 2) {
+        acc.ramUsed += Math.max(0, (node.mem[0] ?? 0) - (node.mem[1] ?? 0))
+        acc.ramTotal += (node.mem[0] ?? 0)
       }
-      setLatest(snap)
-      setError(false)
+    })
+    acc.nodes += nodes.length
+  }
 
-      setUtilHist(prev => {
-        const next = { ...prev }
-        for (const g of gpus) {
-          next[g.index] = [...(prev[g.index] ?? []), g.utilGpu].slice(-MAX_POINTS)
-        }
-        return next
-      })
-      setMemHist(prev => {
-        const next = { ...prev }
-        for (const g of gpus) {
-          next[g.index] = [...(prev[g.index] ?? []), g.memUsedMiB].slice(-MAX_POINTS)
-        }
-        return next
-      })
-      setRamHist(prev => [...prev, ramUsedGb].slice(-MAX_POINTS))
-    } catch {
+  const poll = async () => {
+    const acc = { gpus: [] as GpuSnapshot['gpus'], ramUsed: 0, ramTotal: 0, nodes: 0 }
+
+    // Poll BOTH clusters in parallel. Either can 404 / fail; the
+    // other still contributes. This is the fix for "I see 0% util
+    // even though my Modal job is running" — the modal cluster's
+    // Ray dashboard lives at a different URL than the on-prem one.
+    const results = await Promise.allSettled([
+      _ingest(acc, '/api/ray/nodes?view=summary',    'on-prem', 0),
+      _ingest(acc, '/api/modal/nodes?view=summary', 'modal',   10_000),
+    ])
+    const anyOk = results.some(r => r.status === 'fulfilled')
+    if (!anyOk || acc.gpus.length === 0) {
       setError(true)
+      return
     }
+    setError(false)
+
+    const ramUsedGb  = acc.ramUsed / 1024 ** 3
+    const ramTotalGb = acc.ramTotal / 1024 ** 3
+    const snap: GpuSnapshot = {
+      ts: Date.now(),
+      gpus: acc.gpus,
+      ramUsedGb, ramTotalGb,
+      nodesTotal: acc.nodes,
+    }
+    setLatest(snap)
+
+    setUtilHist(prev => {
+      const next = { ...prev }
+      for (const g of acc.gpus) {
+        next[g.index] = [...(prev[g.index] ?? []), g.utilGpu].slice(-MAX_POINTS)
+      }
+      return next
+    })
+    setMemHist(prev => {
+      const next = { ...prev }
+      for (const g of acc.gpus) {
+        next[g.index] = [...(prev[g.index] ?? []), g.memUsedMiB].slice(-MAX_POINTS)
+      }
+      return next
+    })
+    setRamHist(prev => [...prev, ramUsedGb].slice(-MAX_POINTS))
   }
 
   useEffect(() => {
