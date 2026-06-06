@@ -23,6 +23,7 @@ interface DeployedModel {
   engine: string
   created_at: number
   ray_serve_url: string
+  modal_url: string
   inference_provider: string
 }
 
@@ -164,20 +165,25 @@ export default function ApiService() {
         (j: any) => j.status === 'completed' && !j.hidden_in_models
       ) as DeployedModel[]
       setModels(completed)
-      // init status as null (loading) for models with ray provider
+      // init status as null (loading) for models with a real deployment
       const initial: Record<string, boolean | null> = {}
-      completed.forEach(m => { if (m.inference_provider === 'ray' && m.ray_serve_url) initial[m.id] = null })
+      completed.forEach(m => {
+        if (m.inference_provider === 'ray'   && m.ray_serve_url) initial[m.id] = null
+        if (m.inference_provider === 'modal' && m.modal_url)    initial[m.id] = null
+      })
       setServeStatus(initial)
     } catch { setModels([]) }
     setLoading(false)
   }, [])
 
   const checkServeStatus = useCallback(async (modelList: DeployedModel[]) => {
-    const rayModels = modelList.filter(m => m.inference_provider === 'ray' && m.ray_serve_url)
-    if (rayModels.length === 0) return
-    const results = await Promise.allSettled(
-      rayModels.map(m => fetch(`/api/jobs/${m.id}/ray-status`).then(r => r.json()).then(d => ({ id: m.id, online: d.online as boolean })))
-    )
+    const rayModels   = modelList.filter(m => m.inference_provider === 'ray'   && m.ray_serve_url)
+    const modalModels = modelList.filter(m => m.inference_provider === 'modal' && m.modal_url)
+    if (rayModels.length === 0 && modalModels.length === 0) return
+    const results = await Promise.allSettled([
+      ...rayModels.map(m   => fetch(`/api/jobs/${m.id}/ray-status`)  .then(r => r.json()).then(d => ({ id: m.id, online: d.online as boolean, kind: 'ray'   as const }))),
+      ...modalModels.map(m => fetch(`/api/jobs/${m.id}/modal-status`).then(r => r.ok ? r.json() : { online: false }).then(d => ({ id: m.id, online: d.online as boolean, kind: 'modal' as const }))),
+    ])
     setServeStatus(prev => {
       const next = { ...prev }
       results.forEach(r => { if (r.status === 'fulfilled') next[r.value.id] = r.value.online })
@@ -390,37 +396,58 @@ export default function ApiService() {
             No trained models yet — complete a training job to expose an endpoint
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
             {models.map(m => {
               const color = TT_COLORS[m.training_type] ?? '#6366f1'
-              const hasRay = m.inference_provider === 'ray' && !!m.ray_serve_url
-              const online = hasRay ? serveStatus[m.id] : undefined // undefined = no ray, null = loading, bool = known
+              const hasRay   = m.inference_provider === 'ray'   && !!m.ray_serve_url
+              const hasModal = m.inference_provider === 'modal' && !!m.modal_url
+              const hasAny   = hasRay || hasModal
+              const online = hasAny ? serveStatus[m.id] : undefined
               const isOnline = online === true
-              const isOffline = hasRay && online === false
-              const isLoadingStatus = hasRay && online === null
-              const clickable = !hasRay || isOnline  // non-ray models always clickable
+              const isOffline = hasAny && online === false
+              const isLoadingStatus = hasAny && online === null
+              // Clickable if NOT deployed anywhere, OR deployed and online.
+              // Same rule for both Ray and Modal (modal Web Functions are
+              // independent of the Modal Ray cluster).
+              const clickable = !hasAny || isOnline
               return (
                 <button
                   key={m.id}
                   onClick={() => clickable && setSelectedModel(m)}
                   style={{
                     background: 'var(--bg-surface)', border: `1px solid ${isOffline ? 'var(--border-default)' : 'var(--border-default)'}`,
-                    borderRadius: 12, padding: '16px 14px',
+                    borderRadius: 12, padding: '18px 18px',
                     cursor: clickable ? 'pointer' : 'not-allowed',
                     opacity: isOffline ? 0.55 : 1,
                     textAlign: 'left',
                     transition: 'border-color 0.15s, box-shadow 0.15s, opacity 0.15s',
-                    display: 'flex', flexDirection: 'column', gap: 10,
+                    display: 'flex', flexDirection: 'column', gap: 12,
                   }}
                   onMouseEnter={e => { if (clickable) { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.boxShadow = `0 0 0 3px ${color}18` } }}
                   onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.boxShadow = 'none' }}
                 >
                   <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
-                    <div style={{ width: 38, height: 38, borderRadius: 10, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <Zap size={18} color={color} />
+                    <div style={{ width: 42, height: 42, borderRadius: 10, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <Zap size={20} color={color} />
                     </div>
+                    {/* Provider badge — Ray (orange) or Modal (purple) */}
+                    {hasRay ? (
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        fontSize: 9, fontWeight: 700, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
+                        background: '#f59e0b20', color: '#f59e0b',
+                        textTransform: 'uppercase', letterSpacing: '0.04em',
+                      }}>Ray</div>
+                    ) : hasModal ? (
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        fontSize: 9, fontWeight: 700, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
+                        background: '#8b5cf620', color: '#8b5cf6',
+                        textTransform: 'uppercase', letterSpacing: '0.04em',
+                      }}>Modal</div>
+                    ) : null}
                     {/* Online/Offline badge */}
-                    {hasRay && (
+                    {hasAny && (
                       <div style={{
                         display: 'flex', alignItems: 'center', gap: 4,
                         fontSize: 10, fontWeight: 600, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
