@@ -6231,6 +6231,116 @@ def list_minio_buckets():
         return {"buckets": [], "error": str(e)}
 
 
+@app.get("/api/dashboard/stats")
+def dashboard_stats():
+    """Aggregated stats for the Dashboard page. Returns LS task counts
+    across all projects, job counts by status, MinIO bucket sizes, and
+    the saved Ray cluster URL — in a single call."""
+    import boto3 as _boto3
+    import httpx as _httpx
+    from botocore.config import Config as _BotoConfig
+
+    # ── Label Studio: sum task_number / finished_task_number across projects ──
+    ls_total = 0
+    ls_labeled = 0
+    ls_projects = 0
+    ls_error: str | None = None
+    try:
+        r = _httpx.get(
+            f"{LS_API_URL}/api/projects/?page_size=1000",
+            headers={"Authorization": f"Token {LS_TOKEN}"},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            for p in data.get("results", []):
+                ls_total   += int(p.get("task_number", 0) or 0)
+                ls_labeled += int(p.get("finished_task_number", 0) or 0)
+            ls_projects = data.get("count", len(data.get("results", [])))
+        else:
+            ls_error = f"LS /api/projects returned {r.status_code}"
+    except Exception as e:
+        ls_error = str(e)
+
+    # ── Jobs: count by status from SQLite ──
+    jobs_by_status: dict[str, int] = {}
+    jobs_total = 0
+    with get_db() as _jc:
+        for r in _jc.execute("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status").fetchall():
+            jobs_by_status[r["status"] or "unknown"] = int(r["c"])
+            jobs_total += int(r["c"])
+
+    # ── MinIO: bucket sizes via boto3 (paginated internally) ──
+    buckets: list[dict] = []
+    buckets_error: str | None = None
+    try:
+        s3 = _boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name="us-east-1",
+            config=_BotoConfig(s3={"addressing_style": "path"}),
+        )
+        for b in s3.list_buckets().get("Buckets", []):
+            name = b["Name"]
+            total_size = 0
+            total_objects = 0
+            token: str | None = None
+            pages = 0
+            while True:
+                kwargs = {"Bucket": name, "MaxKeys": 1000}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = s3.list_objects_v2(**kwargs)
+                for obj in resp.get("Contents", []) or []:
+                    total_size += int(obj.get("Size", 0) or 0)
+                    total_objects += 1
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
+                pages += 1
+                if pages >= 100:  # safety cap: 100k objects per bucket
+                    break
+            buckets.append({
+                "name": name,
+                "size_bytes": total_size,
+                "object_count": total_objects,
+            })
+    except Exception as e:
+        buckets_error = str(e)
+
+    # ── Ray URL: prefer saved setting, fall back to env default ──
+    ray_url = RAY_URL
+    try:
+        with get_db() as _sc:
+            row = _sc.execute("SELECT value FROM settings WHERE key='ray_head_url'").fetchone()
+        if row and row["value"]:
+            ray_url = row["value"]
+    except Exception:
+        pass
+
+    return {
+        "label_studio": {
+            "total_tasks": ls_total,
+            "labeled":     ls_labeled,
+            "projects":    ls_projects,
+            "error":       ls_error,
+        },
+        "jobs": {
+            "total":     jobs_total,
+            "by_status": jobs_by_status,
+        },
+        "storage": {
+            "buckets": buckets,
+            "error":   buckets_error,
+        },
+        "ray": {
+            "url": ray_url,
+        },
+    }
+
+
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
