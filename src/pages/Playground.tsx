@@ -247,6 +247,11 @@ export default function Playground() {
   const [result, setResult] = useState<InferenceResult | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Cluster reachability — used to flag "Ray" / "Modal" badges as offline
+  // when the underlying cluster isn't responding. null = unknown / not yet probed.
+  const [rayClusterOnline,   setRayClusterOnline]   = useState<boolean | null>(null)
+  const [modalClusterOnline, setModalClusterOnline] = useState<boolean | null>(null)
+
   // Text / VL inference state
   const [systemPrompt, setSystemPrompt] = useState('You are a helpful industrial AI assistant.')
   const [userPrompt, setUserPrompt] = useState('')
@@ -302,6 +307,18 @@ export default function Playground() {
       })
       .catch(() => {})
       .finally(() => setModelsLoading(false))
+
+    // Probe global Ray + Modal cluster reachability so the badge reflects
+    // actual state (the DB column inference_provider is sticky — it stays
+    // 'ray' even after the Ray cluster goes down).
+    fetch('/api/settings/inference/ray-status')
+      .then(r => r.ok ? r.json() : { online: false })
+      .then(d => setRayClusterOnline(!!d.online))
+      .catch(() => setRayClusterOnline(false))
+    fetch('/api/settings/inference/modal-status')
+      .then(r => r.ok ? r.json() : { online: false })
+      .then(d => setModalClusterOnline(!!d.online))
+      .catch(() => setModalClusterOnline(false))
   }, [])
 
   const isLlmModel = (m: Model) => m.training_type === 'llm-text'
@@ -545,9 +562,13 @@ export default function Playground() {
                     {TYPE_LABEL[selectedModel.training_type]}
                   </span>
                   {selectedModel.inference_provider === 'modal' ? (
-                    <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#8b5cf620', color: '#8b5cf6', flexShrink: 0 }}>Modal</span>
+                    <span title={modalClusterOnline === false ? 'Modal account unreachable' : 'Deployed on Modal'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: modalClusterOnline === false ? '#ef444420' : '#8b5cf620', color: modalClusterOnline === false ? '#ef4444' : '#8b5cf6', flexShrink: 0 }}>
+                      Modal{modalClusterOnline === false ? ' (offline)' : ''}
+                    </span>
                   ) : selectedModel.inference_provider === 'ray' ? (
-                    <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#f59e0b20', color: '#f59e0b', flexShrink: 0 }}>Ray</span>
+                    <span title={rayClusterOnline === false ? 'Ray cluster unreachable' : 'Deployed on Ray'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: rayClusterOnline === false ? '#ef444420' : '#f59e0b20', color: rayClusterOnline === false ? '#ef4444' : '#f59e0b', flexShrink: 0 }}>
+                      Ray{rayClusterOnline === false ? ' (offline)' : ''}
+                    </span>
                   ) : (
                     <span style={{ fontSize: 9, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: 'var(--bg-base)', color: 'var(--text-muted)', flexShrink: 0 }}>Sim</span>
                   )}
@@ -593,9 +614,13 @@ export default function Playground() {
                       {TYPE_LABEL[m.training_type]}
                     </span>
                     {m.inference_provider === 'modal' ? (
-                      <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#8b5cf620', color: '#8b5cf6', flexShrink: 0 }}>Modal</span>
+                      <span title={modalClusterOnline === false ? 'Modal account unreachable' : 'Deployed on Modal'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: modalClusterOnline === false ? '#ef444420' : '#8b5cf620', color: modalClusterOnline === false ? '#ef4444' : '#8b5cf6', flexShrink: 0 }}>
+                        Modal{modalClusterOnline === false ? ' (offline)' : ''}
+                      </span>
                     ) : m.inference_provider === 'ray' ? (
-                      <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: '#f59e0b20', color: '#f59e0b', flexShrink: 0 }}>Ray</span>
+                      <span title={rayClusterOnline === false ? 'Ray cluster unreachable' : 'Deployed on Ray'} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: rayClusterOnline === false ? '#ef444420' : '#f59e0b20', color: rayClusterOnline === false ? '#ef4444' : '#f59e0b', flexShrink: 0 }}>
+                        Ray{rayClusterOnline === false ? ' (offline)' : ''}
+                      </span>
                     ) : (
                       <span style={{ fontSize: 9, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: 'var(--bg-base)', color: 'var(--text-muted)', flexShrink: 0 }}>Sim</span>
                     )}
