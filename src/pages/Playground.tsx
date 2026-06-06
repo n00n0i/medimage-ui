@@ -153,14 +153,9 @@ function barColor(conf: number) {
 
 function drawDetections(canvas: HTMLCanvasElement, img: HTMLImageElement, detections: Detection[], threshold: number) {
   const ctx = canvas.getContext('2d')!
-  console.log('[drawDetections] img.naturalWidth:', img.naturalWidth, 'img.naturalHeight:', img.naturalHeight)
-  console.log('[drawDetections] img.src:', img.src)
-  console.log('[drawDetections] img.complete:', img.complete)
   canvas.width  = img.naturalWidth
   canvas.height = img.naturalHeight
-  console.log('[drawDetections] canvas.width:', canvas.width, 'canvas.height:', canvas.height)
   ctx.drawImage(img, 0, 0)
-  console.log('[drawDetections] drawImage complete')
 
   const W = canvas.width
   const H = canvas.height
@@ -194,14 +189,9 @@ function drawDetections(canvas: HTMLCanvasElement, img: HTMLImageElement, detect
 
 function drawSegmentation(canvas: HTMLCanvasElement, img: HTMLImageElement, masks: SegMask[], threshold: number) {
   const ctx = canvas.getContext('2d')!
-  console.log('[drawSegmentation] img.naturalWidth:', img.naturalWidth, 'img.naturalHeight:', img.naturalHeight)
-  console.log('[drawSegmentation] img.src:', img.src)
-  console.log('[drawSegmentation] img.complete:', img.complete)
   canvas.width  = img.naturalWidth
   canvas.height = img.naturalHeight
-  console.log('[drawSegmentation] canvas.width:', canvas.width, 'canvas.height:', canvas.height)
   ctx.drawImage(img, 0, 0)
-  console.log('[drawSegmentation] drawImage complete')
 
   const W = canvas.width
   const H = canvas.height
@@ -270,6 +260,13 @@ export default function Playground() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const imgRef    = useRef<HTMLImageElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Pre-loaded image used ONLY for canvas drawing. Kept separate from the
+  // displayed <img> because toggling that element's display between block/none
+  // (when the result type changes) can cause the browser to re-decode the
+  // image, briefly setting naturalWidth=0 — which races with the canvas draw.
+  const canvasImgRef     = useRef<HTMLImageElement | null>(null)
+  const [canvasImgReady, setCanvasImgReady] = useState(false)
 
   // History
   const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
@@ -362,39 +359,44 @@ export default function Playground() {
     setVlImageUrl(URL.createObjectURL(file))
   }
 
-  // Redraw canvas when result or threshold changes
+  // Pre-load imageUrl into a detached Image for canvas drawing whenever it
+  // changes. This is independent of the visible <img> and is always ready
+  // before the result arrives.
   useEffect(() => {
-    console.log('[useEffect] Triggered - result:', result?.type, 'imageUrl:', imageUrl)
-    if (!result || !canvasRef.current || !imageUrl || !imgRef.current) {
-      console.log('[useEffect] Early return - missing refs or data')
+    if (!imageUrl) {
+      canvasImgRef.current = null
+      setCanvasImgReady(false)
       return
     }
-    if (result.type !== 'detection' && result.type !== 'segmentation') {
-      console.log('[useEffect] Early return - not detection/segmentation')
-      return
+    const img = new Image()
+    const onLoad = () => {
+      canvasImgRef.current = img
+      setCanvasImgReady(true)
     }
+    const onError = () => {
+      canvasImgRef.current = null
+      setCanvasImgReady(false)
+    }
+    img.onload = onLoad
+    img.onerror = onError
+    img.src = imageUrl
+    return () => {
+      img.onload = onLoad
+      img.onerror = onError
+    }
+  }, [imageUrl])
 
+  // Redraw canvas when result or threshold changes. Uses the pre-loaded
+  // canvasImgRef (decoupled from the DOM <img>) so display toggles on the
+  // visible <img> can't cause naturalWidth=0 races.
+  useEffect(() => {
+    if (!result || !canvasRef.current || !canvasImgRef.current || !canvasImgReady) return
+    if (result.type !== 'detection' && result.type !== 'segmentation') return
     const canvas = canvasRef.current
-    const img = imgRef.current
-    console.log('[useEffect] img.complete:', img.complete, 'img.naturalWidth:', img.naturalWidth)
-
-    // If image already loaded, draw immediately
-    if (img.complete && img.naturalWidth > 0) {
-      console.log('[useEffect] Image already loaded - drawing immediately')
-      if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
-      if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
-    } else {
-      console.log('[useEffect] Image not loaded - waiting for load event')
-      // Otherwise wait for image to load
-      const handleLoad = () => {
-        console.log('[useEffect/handleLoad] Image loaded - drawing')
-        if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
-        if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
-      }
-      img.addEventListener('load', handleLoad)
-      return () => img.removeEventListener('load', handleLoad)
-    }
-  }, [result, threshold, imageUrl])
+    const img    = canvasImgRef.current
+    if (result.type === 'detection')   drawDetections(canvas, img, result.detections, threshold)
+    if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
+  }, [result, threshold, canvasImgReady])
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('image/')) return

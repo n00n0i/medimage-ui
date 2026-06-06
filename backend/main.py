@@ -6300,6 +6300,157 @@ _SEG_LABELS = [
 # UploadFile, File, FForm already imported above
 from typing import Optional
 
+# Color palette used when normalizing external (Modal) inference responses.
+# Index is `hash(label) % len` for a stable color per class.
+_INFER_COLORS = [
+    "#6366f1", "#f59e0b", "#10b981", "#ef4444", "#3b82f6",
+    "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4",
+    "#a855f7", "#84cc16", "#eab308", "#22c55e", "#0ea5e9",
+]
+
+
+def _color_for(label: str) -> str:
+    if not label:
+        return _INFER_COLORS[0]
+    return _INFER_COLORS[abs(hash(label)) % len(_INFER_COLORS)]
+
+
+def _normalize_detection_bbox(bbox, img_w: int = 0, img_h: int = 0):
+    """Normalize a detection bbox to [x1, y1, x2, y2] in [0,1] range.
+
+    Accepts either:
+      - normalized xyxy:  [x1, y1, x2, y2] (all in [0,1])
+      - normalized xywh:  [x1, y1, w, h]   (all in [0,1])
+      - absolute xywh:    [x1, y1, w, h]   (pixel values, requires img_w/img_h)
+      - absolute xyxy:    [x1, y1, x2, y2] (pixel values, requires img_w/img_h)
+    """
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return [0.0, 0.0, 0.0, 0.0]
+    x1, y1, a, b = [float(v) for v in bbox]
+    # Heuristic: if either value > 1.5, treat all as absolute pixels
+    absolute = max(abs(x1), abs(y1), abs(a), abs(b)) > 1.5
+    if absolute:
+        if not img_w or not img_h:
+            # Can't normalize without image dims; return as-is and let client handle
+            return [x1, y1, a, b]
+        x1, a = x1 / img_w, a / img_w
+        y1, b = y1 / img_h, b / img_h
+    # Now in [0,1]. Detect xywh vs xyxy: in xywh, a >= x1 and b >= y1.
+    if a >= x1 and b >= y1 and (a - x1) <= 1.5 and (b - y1) <= 1.5 and a <= 1.5 and b <= 1.5:
+        return [max(0.0, min(1.0, x1)),
+                max(0.0, min(1.0, y1)),
+                max(0.0, min(1.0, a)),
+                max(0.0, min(1.0, b))]
+    # Treat as xyxy
+    return [min(x1, a), min(y1, b), max(x1, a), max(y1, b)]
+
+
+def _normalize_inference_response(data: dict, training_type: str, model_name: str) -> dict:
+    """Normalize external (Modal/Ray) responses to match the frontend
+    Detection/SegMask/ClsResult interfaces. Adds label/color/count/model_name
+    and converts xywh→xyxy bboxes when needed.
+    """
+    if not isinstance(data, dict):
+        return data
+    data["model_name"] = data.get("model_name") or model_name
+    tt = data.get("type") or training_type
+
+    if tt == "detection":
+        dets_raw = data.get("detections") or []
+        dets = []
+        for d in dets_raw:
+            if not isinstance(d, dict):
+                continue
+            label = d.get("label") or d.get("class_name") or d.get("class") or f"class_{len(dets)}"
+            try:
+                conf = float(d.get("confidence", d.get("score", 0.0)))
+            except (TypeError, ValueError):
+                conf = 0.0
+            bbox = _normalize_detection_bbox(d.get("bbox") or d.get("box") or [])
+            dets.append({
+                "label":      str(label),
+                "confidence": conf,
+                "bbox":       bbox,
+                "color":      d.get("color") or _color_for(str(label)),
+            })
+        data["detections"] = dets
+        data["count"]      = len(dets)
+
+    elif tt == "segmentation":
+        # Accept either "masks" (with polygon) or "segments" (coverage only)
+        masks_raw = data.get("masks")
+        if masks_raw is None:
+            segs = data.get("segments") or []
+            masks = []
+            for s in segs:
+                if not isinstance(s, dict):
+                    continue
+                label = s.get("label") or s.get("class_name") or f"class_{len(masks)}"
+                try:
+                    cov = float(s.get("coverage", s.get("area_pct", 0.0)))
+                except (TypeError, ValueError):
+                    cov = 0.0
+                try:
+                    conf = float(s.get("confidence", s.get("score", cov)))
+                except (TypeError, ValueError):
+                    conf = cov
+                masks.append({
+                    "label":     str(label),
+                    "confidence": conf,
+                    "area_pct":  cov * 100.0 if cov <= 1.0 else cov,
+                    "color":     s.get("color") or _color_for(str(label)),
+                    "polygon":   s.get("polygon") or [],
+                })
+            data["masks"] = masks
+        else:
+            masks = []
+            for m in masks_raw:
+                if not isinstance(m, dict):
+                    continue
+                label = m.get("label") or m.get("class_name") or f"class_{len(masks)}"
+                try:
+                    conf = float(m.get("confidence", m.get("score", 0.0)))
+                except (TypeError, ValueError):
+                    conf = 0.0
+                try:
+                    area = float(m.get("area_pct", m.get("coverage", 0.0)))
+                except (TypeError, ValueError):
+                    area = 0.0
+                masks.append({
+                    "label":      str(label),
+                    "confidence": conf,
+                    "area_pct":   area,
+                    "color":      m.get("color") or _color_for(str(label)),
+                    "polygon":    m.get("polygon") or [],
+                })
+            data["masks"] = masks
+
+    elif tt == "classification":
+        preds_raw = data.get("predictions") or []
+        preds = []
+        for p in preds_raw:
+            if not isinstance(p, dict):
+                continue
+            label = p.get("label") or p.get("class_name") or f"class_{len(preds)}"
+            try:
+                conf = float(p.get("confidence", p.get("score", 0.0)))
+            except (TypeError, ValueError):
+                conf = 0.0
+            preds.append({"label": str(label), "confidence": conf})
+        data["predictions"] = preds
+        top_label = data.get("top_label")
+        if not top_label and preds:
+            top_label = preds[0]["label"]
+            data["top_label"] = top_label
+        if "top_confidence" not in data:
+            if preds:
+                data["top_confidence"] = preds[0]["confidence"]
+            else:
+                data["top_confidence"] = 0.0
+
+    return data
+
+
 @app.post("/api/inference")
 async def run_inference(
     model_id: str = FForm(...),
@@ -6381,6 +6532,7 @@ async def run_inference(
         data = r.json()
         if isinstance(data, dict):
             data["inference_time_ms"] = round((time.time() - t_start) * 1000)
+            data = _normalize_inference_response(data, training_type, job.get("model_name") or job.get("name") or model_id)
         return data
 
     if provider == "modal" and job.get("modal_url"):

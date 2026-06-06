@@ -80,9 +80,14 @@ services:
     build: ./backend
     environment:
       - LS_API_URL=http://label-studio:8080
+      - LS_PUBLIC_URL=http://100.68.3.42:8085
+      - LS_USER=admin@medimage.local
+      - LS_PASSWORD=admin
       - LS_TOKEN=medimage-ls-token-2026
       - MINIO_URL=http://minio:9000
       - DB_PATH=/data/jobs.db
+      # Keycloak realm `h-forge` runs under /kc (KC_HTTP_RELATIVE_PATH=/kc)
+      - KEYCLOAK_JWKS_URL=http://medimage-keycloak-1:8080/kc/realms/h-forge/protocol/openid-connect/certs
     volumes:
       - api-data:/data
     restart: unless-stopped

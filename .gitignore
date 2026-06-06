@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local install tarballs / extracted sources (never commit)
+*.tgz
+*.tar.gz
+/Python-*/
+/go1.*/

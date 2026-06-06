@@ -80,7 +80,7 @@ src/
 
 ### Environment Variables
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root for the **frontend (medimage-ui)**:
 
 ```env
 BACKEND_URL=http://medimage-api:8000
@@ -90,6 +90,24 @@ RAY_URL=http://localhost:8265
 LS_USER=admin@medimage.local
 LS_PASSWORD=YourPassword
 ```
+
+### Backend (`medimage-api`) Environment Variables
+
+The backend reads several env vars that **must match the rest of the stack** or you will get 401 / DNS / auto-login failures. These are set in `docker-compose.yml` under the `medimage-api` service:
+
+| Variable | Purpose | Default | Notes |
+|----------|---------|---------|-------|
+| `LS_API_URL` | LS URL from inside the docker network | `http://label-studio:8080` | Server-to-server calls |
+| `LS_PUBLIC_URL` | LS URL the user's browser will hit | `LS_API_URL` (broken) | **Must be set to external URL** like `http://100.68.3.42:8085` — used by `/api/ls-goto/{id}` redirects |
+| `LS_USER` | LS login email | `admin@medimage.local` | Must match an actual LS user |
+| `LS_PASSWORD` | LS login password | `admin` | **Must match the password the LS user was created with** — env var is only honored on first container start, not on subsequent restarts |
+| `LS_TOKEN` | LS API token (for direct REST calls) | `''` | Used by dataset sync |
+| `KEYCLOAK_JWKS_URL` | Keycloak JWKS endpoint for JWT verification | `http://medimage-keycloak-1:8080/realms/h-forge/protocol/openid-connect/certs` | **MUST include `/kc`** prefix when Keycloak runs with `KC_HTTP_RELATIVE_PATH=/kc` (the default in this compose) — the correct value is `http://medimage-keycloak-1:8080/kc/realms/h-forge/protocol/openid-connect/certs` |
+| `KEYCLOAK_ENABLED` | Toggle JWT auth | `true` | Set `false` to bypass auth for single-user/internal use |
+| `MINIO_URL` | MinIO S3 endpoint | `http://minio:9000` | |
+| `DB_PATH` | SQLite DB path | `/data/jobs.db` | Persisted via `api-data` volume |
+
+> ⚠️ **Critical gotcha:** `LS_PASSWORD` must match the password that the LS user `admin@medimage.local` was *originally* created with. Changing the env var on an already-initialized LS container has **no effect** — LS only reads it on first start. If you change it, the API's `/api/ls-goto/{id}` will silently fail to log the user in and redirect them to the LS login page. See the [Troubleshooting](#troubleshooting) section.
 
 ### Development
 
@@ -210,6 +228,42 @@ MedImage UI follows the **H-Forge Instrument-Panel** design philosophy:
 }
 ```
 
+## Troubleshooting
+
+Common errors seen after fresh deploys or container rebuilds:
+
+### `Failed to load jobs: HTTP 401` on Jobs/Models pages
+
+**Cause:** JWT auth middleware is rejecting every `/api/*` call.
+**Fix:** Set `KEYCLOAK_JWKS_URL` in `medimage-api` env to include the `/kc` prefix:
+```yaml
+- KEYCLOAK_JWKS_URL=http://medimage-keycloak-1:8080/kc/realms/h-forge/protocol/openid-connect/certs
+```
+If you don't want auth at all, set `KEYCLOAK_ENABLED=false`.
+
+### Open in LS fails with `ERR_NAME_NOT_RESOLVED (-105)` pointing to `http://label-studio:8080/...`
+
+**Cause:** `LS_PUBLIC_URL` is not set, so the API falls back to the internal docker hostname which the browser cannot resolve.
+**Fix:** Add `LS_PUBLIC_URL=http://<your-external-host>:8085` to `medimage-api` env.
+
+### LS auto-login redirects back to `/user/login/` instead of the project
+
+**Cause:** `LS_PASSWORD` env var doesn't match the password the LS user was created with on first container start. The login silently fails and a useless anonymous sessionid is set.
+**Fix:** Use the actual password (default first-start password is `admin`):
+```yaml
+- LS_USER=admin@medimage.local
+- LS_PASSWORD=admin
+```
+
+### Playground image goes black after modal inference
+
+**Cause:** The `<img>` element's `display: 'block' → 'none'` toggle (when result type changes) re-decodes the image, briefly setting `naturalWidth=0`. The useEffect then waits for a `load` event that already fired.
+**Fix:** Already fixed in `src/pages/Playground.tsx` — image is pre-loaded into a separate `Image()` ref, decoupled from the visible `<img>`.
+
+### Jobs/Models show "Failed to load" but Playground inference works
+
+**Cause:** The Jobs/Models pages need a valid Keycloak JWT, but Playground might be using a cached model list from before the API was rebuilt. The new API container needs `KEYCLOAK_JWKS_URL` configured (see above) to verify tokens.
+
 ## Contributing
 
 1. Follow TypeScript strict mode guidelines
@@ -217,6 +271,19 @@ MedImage UI follows the **H-Forge Instrument-Panel** design philosophy:
 3. Maintain design system consistency
 4. Write self-documenting code with clear types
 5. Test integrations with backend services
+
+## Bug Reports & Issue Tracking
+
+All bugs are tracked as **GitHub Issues** on the [issue tracker](https://github.com/n00n0i/medimage-ui/issues). When you encounter a bug:
+
+1. **Search existing issues first** to avoid duplicates.
+2. **Open a new issue** with:
+   - Repro steps (URL, what you clicked, what you expected, what you got)
+   - Browser + console logs / network tab capture
+   - Docker container logs: `docker logs medimage-medimage-api-1 --tail 100`
+   - Environment: which env vars are set in `medimage-api`
+3. Label it `bug` (and `area:frontend` / `area:backend` / `area:auth` / `area:deployment` if relevant).
+4. Trello is used for **project-wide status updates** (e.g. "3 bugs fixed in this sprint") and references issue numbers from GitHub.
 
 ## License
 
