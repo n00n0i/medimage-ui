@@ -273,7 +273,9 @@ export default function TrainModel() {
   const [modalWorkers, setModalWorkers]         = useState(1)
   const [modalStarting, setModalStarting]       = useState(false)
   const [modalStartError, setModalStartError]   = useState('')
-  const [modalClusterLive, setModalClusterLive] = useState<{ status: string; ray_url: string | null } | null>(null)
+  const [modalClusterLive, setModalClusterLive] = useState<{
+    status: string; ray_url: string | null; gpu_type?: string; num_workers?: number
+  } | null>(null)
   const modalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Poll /api/modal/status while the popup is open so the user sees when
@@ -304,6 +306,13 @@ export default function TrainModel() {
       setClusterStatus(s => s ? { ...s, modal: { ...s.modal, available: true, status: 'running' } } : s)
     }
   }, [modalClusterLive?.status])
+
+  // Sync the gpu/workers selectors to whatever the cluster is actually
+  // running with (so the user doesn't have to re-pick on every open).
+  useEffect(() => {
+    if (modalClusterLive?.gpu_type)    setModalGpu(modalClusterLive.gpu_type)
+    if (modalClusterLive?.num_workers) setModalWorkers(modalClusterLive.num_workers)
+  }, [modalClusterLive?.gpu_type, modalClusterLive?.num_workers])
 
   async function startModalFromPopup() {
     setModalStarting(true)

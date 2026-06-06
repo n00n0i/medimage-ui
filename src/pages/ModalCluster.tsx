@@ -37,7 +37,10 @@ export default function ModalConfig() {
   const [deployments, setDeployments]   = useState<ModalDeployment[]>([])
   const [stopping, setStopping]         = useState<Record<string, boolean>>({})
   const [deleting, setDeleting]         = useState(false)
-  const [clusterStatus, setClusterStatus] = useState<{ status: string; ray_url: string | null } | null>(null)
+  const [clusterStatus, setClusterStatus] = useState<{
+    status: string; ray_url: string | null
+    gpu_type?: string; num_workers?: number
+  } | null>(null)
   const [starting, setStarting]           = useState(false)
   const [stoppingCluster, setStoppingCluster] = useState(false)
   const [gpuType, setGpuType]         = useState('T4')
@@ -70,7 +73,14 @@ export default function ModalConfig() {
   const loadClusterStatus = useCallback(async () => {
     try {
       const r = await fetch('/api/modal/status')
-      if (r.ok) setClusterStatus(await r.json())
+      if (r.ok) {
+        const s = await r.json()
+        setClusterStatus(s)
+        // Sync the selectors to the live cluster config so what you see
+        // here matches what the Train popup most-recently started.
+        if (s.gpu_type)    setGpuType(s.gpu_type)
+        if (s.num_workers) setNumWorkers(s.num_workers)
+      }
     } catch { /* ignore */ }
   }, [])
 

@@ -173,7 +173,7 @@ def _sync_verify_token(token: str):
 
 
 # Paths excluded from JWT auth
-_KC_PUBLIC_PATHS = {"/api/health"}
+_KC_PUBLIC_PATHS = {"/api/health", "/api/diag/minio"}
 _KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/")
 
 @app.middleware("http")
@@ -737,6 +737,47 @@ def _resolve_minio_url_for_ray() -> str:
     if not host:
         host = "host.docker.internal"
     return f"http://{host}:9000"
+
+
+def _ping_host_port(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Return True if host:port accepts a TCP connection within the timeout."""
+    import socket as _socket
+    try:
+        with _socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _diagnose_minio_for_ray() -> str:
+    """
+    Check the candidate MinIO host(s) from the worker's point of view and
+    return a short human-readable status string for the training logs.
+    Used when the dataset download fails, so the user can fix the
+    MINIO_HOST_IP / MINIO_PUBLIC_URL env without having to guess.
+    """
+    import socket as _socket
+    from urllib.parse import urlparse as _urlparse
+    candidates: list[tuple[str, int]] = []
+    for url in (MINIO_PUBLIC_URL, MINIO_URL, _resolve_minio_url_for_ray()):
+        try:
+            p = _urlparse(url)
+            if p.hostname and p.port:
+                candidates.append((p.hostname, p.port))
+        except Exception:
+            pass
+    if not candidates:
+        return "no MinIO URL configured"
+    seen = set()
+    lines = []
+    for host, port in candidates:
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        ok = _ping_host_port(host, port)
+        lines.append(f"  {'✓' if ok else '✗'} {host}:{port} {'reachable' if ok else 'UNREACHABLE'}")
+    return "\n".join(lines)
 
 # ─── Real Training Helpers ────────────────────────────────────────────────────
 
@@ -2451,8 +2492,33 @@ def main():
     zip_path = os.path.join(tmpdir, "dataset.zip")
     data_dir = os.path.join(tmpdir, "data")
     print("[train] Downloading dataset ...")
-    r = requests.get(dataset_url, stream=True, timeout=600)
-    r.raise_for_status()
+    try:
+        r = requests.get(dataset_url, stream=True, timeout=600)
+        r.raise_for_status()
+    except Exception as _dl_err:
+        # The presigned URL's host is part of the S3v4 signature, so the
+        # host the worker hits MUST be the one the API signed against.
+        # The API's _resolve_minio_url_for_ray() picks that host from
+        # MINIO_PUBLIC_URL / MINIO_HOST_IP / RAY_URL. If the worker can't
+        # reach the chosen host, surface a clear actionable message
+        # rather than just the raw socket error.
+        from urllib.parse import urlparse as _urlparse
+        try:
+            _u = _urlparse(dataset_url)
+            _bad_host = f"{_u.hostname}:{_u.port}" if _u.hostname else dataset_url
+        except Exception:
+            _bad_host = dataset_url
+        raise RuntimeError(
+            f"Failed to download dataset from {_bad_host}: {_dl_err}.\n"
+            f"  The Ray worker tried to reach MinIO at the host the API "
+            f"signed the URL against ({_bad_host}). That host is either "
+            f"DNS-unresolvable, refusing the connection, or firewalled.\n"
+            f"  Fix: on the medimage-api container, set MINIO_HOST_IP "
+            f"to the IP of the host running docker-compose "
+            f"(or MINIO_PUBLIC_URL=http://that-host:9000) and restart "
+            f"the API. The host must be reachable from the Ray cluster "
+            f"on port 9000."
+        )
     with open(zip_path, "wb") as f:
         for chunk in r.iter_content(8192):
             f.write(chunk)
@@ -3128,7 +3194,49 @@ def get_train_cluster_status():
             "status":     modal_status,
             "ray_url":    modal_ray_url,
             "creds_saved": creds_saved,
+            "gpu_type":    _modal_state.get("gpu_type", "T4"),
+            "num_workers": _modal_state.get("num_workers", 0),
         },
+        "minio_for_ray":   _resolve_minio_url_for_ray(),
+    }
+
+
+@app.get("/api/diag/minio")
+def diag_minio():
+    """
+    Diagnostic endpoint the training script can hit when the dataset
+    download fails. Probes each candidate MinIO host:port and reports
+    reachability + the env vars that would fix it. Cheap (TCP connect only).
+    """
+    from urllib.parse import urlparse as _urlparse
+    candidates: list[dict] = []
+    for label, url in [
+        ("MINIO_PUBLIC_URL",    MINIO_PUBLIC_URL),
+        ("MINIO_URL",           MINIO_URL),
+        ("_resolve_minio_url_for_ray()", _resolve_minio_url_for_ray()),
+    ]:
+        try:
+            p = _urlparse(url)
+            if p.hostname and p.port:
+                candidates.append({
+                    "label":     label,
+                    "url":       url,
+                    "host":      p.hostname,
+                    "port":      p.port,
+                    "reachable": _ping_host_port(p.hostname, p.port),
+                })
+        except Exception:
+            pass
+    return {
+        "RAY_URL":          RAY_URL,
+        "MINIO_HOST_IP":    MINIO_HOST_IP,
+        "candidates":       candidates,
+        "fix_hint": (
+            "If the chosen host is unreachable from the Ray cluster, set "
+            "MINIO_HOST_IP=<ip-of-the-host-running-docker-compose> (or "
+            "MINIO_PUBLIC_URL=http://that-host:9000) on the medimage-api "
+            "container and restart it."
+        ),
     }
 
 
@@ -3843,61 +3951,75 @@ def modal_stop():
         env["MODAL_TOKEN_ID"] = token_id
         env["MODAL_TOKEN_SECRET"] = token_secret
 
-        # Step 1: send stop command
+        # Step 1: send `modal app stop` to drain the app gracefully.
         try:
             r = subprocess.run(
                 ["python3", "-m", "modal", "app", "stop", "medimage-ray"],
-                env=env, timeout=60, capture_output=True, text=True,
+                env=env, timeout=120, capture_output=True, text=True,
             )
             if r.returncode != 0:
                 out = (r.stdout + r.stderr)[-400:].strip()
-                _modal_state["logs"].append(f"Stop command returned exit {r.returncode}: {out}")
-                _modal_state.update(status="error", proc=None)
-                return
-            _modal_state["logs"].append("Stop command accepted. Verifying containers are down...")
+                _modal_state["logs"].append(f"`modal app stop` returned exit {r.returncode}: {out}")
+                # Don't return early — still try container stop below.
+            else:
+                _modal_state["logs"].append("`modal app stop` accepted. Polling container status...")
         except subprocess.TimeoutExpired:
-            _modal_state["logs"].append("Stop timed out — check modal.com dashboard manually.")
-            _modal_state.update(status="error", proc=None)
-            return
+            _modal_state["logs"].append("`modal app stop` timed out after 120s — falling through to container stop.")
         except Exception as exc:
-            _modal_state["logs"].append(f"Stop error: {exc}")
-            _modal_state.update(status="error", proc=None)
-            return
+            _modal_state["logs"].append(f"`modal app stop` error: {exc}")
 
-        # Step 2: verify via `modal app list` — poll up to ~60s
+        # Step 2: forcibly stop any still-running containers. This is what
+        # actually tears down the box on modal.com (the `app stop` is async
+        # and can leave the container up for a few minutes).
         import time as _time
-        for attempt in range(12):
-            _time.sleep(5)
+        deadline = _time.time() + 120  # poll up to 2 min
+        last_seen_running = None
+        while _time.time() < deadline:
             try:
-                check = subprocess.run(
-                    ["python3", "-m", "modal", "app", "list"],
+                cl = subprocess.run(
+                    ["python3", "-m", "modal", "container", "list"],
                     env=env, timeout=15, capture_output=True, text=True,
                 )
-                output = check.stdout + check.stderr
-                # If the app name no longer appears as 'deployed'/'running', it's down
-                lines = [l for l in output.splitlines() if "medimage-ray" in l.lower()]
-                still_up = any(
-                    kw in l.lower() for l in lines
-                    for kw in ("deployed", "running", "active")
-                )
-                if not still_up:
+                out = (cl.stdout or "") + (cl.stderr or "")
+                running_ids = []
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and "medimage-ray" in line:
+                        cid = parts[0]
+                        # skip header row & non-id tokens
+                        if cid and cid[0].lower() in "abcdefghijklmnopqrstuvwxyz":
+                            running_ids.append(cid)
+                if not running_ids:
                     _modal_state["logs"].append(
-                        f"✓ Confirmed: medimage-ray is no longer running on Modal."
+                        "✓ Confirmed: no medimage-ray containers running on Modal."
                     )
-                    _modal_state.update(status="idle", proc=None, ray_url=None)
+                    _modal_state.update(status="idle", proc=None, ray_url=None, num_workers=0, gpu_type="T4")
                     return
+                last_seen_running = running_ids
                 _modal_state["logs"].append(
-                    f"Still shutting down... ({(attempt+1)*5}s)"
+                    f"Still {len(running_ids)} container(s) running, sending stop… "
+                    f"(e.g. {running_ids[0][:12]}…)"
                 )
-            except Exception:
-                pass  # network hiccup — keep polling
+                # Try to stop each running container. Best-effort: errors are
+                # captured in the log, the poll loop will keep trying.
+                for cid in running_ids:
+                    try:
+                        subprocess.run(
+                            ["python3", "-m", "modal", "container", "stop", cid],
+                            env=env, timeout=20, capture_output=True, text=True,
+                        )
+                    except Exception as e:
+                        _modal_state["logs"].append(f"  stop {cid[:12]}… failed: {e}")
+            except Exception as e:
+                _modal_state["logs"].append(f"poll error: {e}")
+            _time.sleep(8)
 
-        # Timed out waiting for confirmation — still mark idle
+        # Timed out — surface this honestly so the user knows.
         _modal_state["logs"].append(
-            "Timed out waiting for shutdown confirmation. "
-            "Cluster may still be stopping — check modal.com/apps."
+            "⚠ Timed out after 2 min waiting for containers to stop. "
+            "They may still be draining on modal.com — check the dashboard."
         )
-        _modal_state.update(status="idle", proc=None, ray_url=None)
+        _modal_state.update(status="idle", proc=None, ray_url=None, num_workers=0, gpu_type="T4")
 
     threading.Thread(target=_do_stop, daemon=True).start()
     return {"status": "stopping"}
@@ -3910,6 +4032,7 @@ def modal_status_ep():
         "ray_url": _modal_state["ray_url"],
         "logs": _modal_state["logs"][-30:],
         "num_workers": _modal_state["num_workers"],
+        "gpu_type":    _modal_state.get("gpu_type", "T4"),
     }
 
 
