@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Cloud, Eye, EyeOff, CheckCircle2, AlertCircle, Loader, ExternalLink, Trash2, RefreshCw, X, StopCircle } from 'lucide-react'
+import { Cloud, Eye, EyeOff, CheckCircle2, AlertCircle, Loader, ExternalLink, Trash2, RefreshCw, X, StopCircle, Play } from 'lucide-react'
 
 interface ModalCredState {
   configured: boolean
@@ -37,6 +37,9 @@ export default function ModalConfig() {
   const [deployments, setDeployments]   = useState<ModalDeployment[]>([])
   const [stopping, setStopping]         = useState<Record<string, boolean>>({})
   const [deleting, setDeleting]         = useState(false)
+  const [clusterStatus, setClusterStatus] = useState<{ status: string; ray_url: string | null } | null>(null)
+  const [starting, setStarting]           = useState(false)
+  const [stoppingCluster, setStoppingCluster] = useState(false)
 
   const inputStyle: React.CSSProperties = {
     width: '100%', boxSizing: 'border-box', padding: '8px 11px', fontSize: 13,
@@ -62,10 +65,20 @@ export default function ModalConfig() {
     } catch { /* ignore */ }
   }, [])
 
+  const loadClusterStatus = useCallback(async () => {
+    try {
+      const r = await fetch('/api/modal/status')
+      if (r.ok) setClusterStatus(await r.json())
+    } catch { /* ignore */ }
+  }, [])
+
   useEffect(() => {
     loadCred()
     loadDeployments()
-  }, [loadCred, loadDeployments])
+    loadClusterStatus()
+    const t = setInterval(loadClusterStatus, 5000)
+    return () => clearInterval(t)
+  }, [loadCred, loadDeployments, loadClusterStatus])
 
   async function handleSave() {
     if (!tokenId.trim() || !tokenSecret.trim()) return
@@ -121,6 +134,40 @@ export default function ModalConfig() {
       setStopping(s => ({ ...s, [modelId]: false }))
     }
   }
+
+  async function handleStartCluster() {
+    if (!cred?.configured) {
+      alert('Set Modal credentials first')
+      return
+    }
+    if (!confirm('Start Modal Ray cluster? (จะมีค่าใช้จ่ายจาก Modal ตาม GPU ที่เลือก)')) return
+    setStarting(true)
+    try {
+      const r = await fetch('/api/modal/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gpu_type: 'T4', num_workers: 1 }),
+      })
+      if (!r.ok) {
+        const t = await r.text()
+        alert(`Start failed: ${t}`)
+      } else {
+        await loadClusterStatus()
+      }
+    } finally { setStarting(false) }
+  }
+
+  async function handleStopCluster() {
+    if (!confirm('Stop Modal Ray cluster? Training jobs running on Modal will be interrupted.')) return
+    setStoppingCluster(true)
+    try {
+      await fetch('/api/modal/stop', { method: 'POST' })
+      await loadClusterStatus()
+    } finally { setStoppingCluster(false) }
+  }
+
+  const clusterRunning = clusterStatus?.status === 'running'
+  const clusterBusy   = clusterStatus?.status === 'deploying' || clusterStatus?.status === 'stopping'
 
   const canSave = tokenId.trim().length > 0 && tokenSecret.trim().length > 0
 
@@ -293,11 +340,68 @@ export default function ModalConfig() {
         }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>วิธีใช้งาน</div>
           <ol style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 5 }}>
-            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>ไปที่หน้า <strong>Models</strong></li>
-            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>เลือก model ที่ต้องการ deploy → แท็บ <strong>Deploy</strong></li>
-            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>เลือก <strong>Modal</strong> tab → กด <strong>Deploy to Modal</strong></li>
-            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>รอ 2–5 นาที — ระบบจะ deploy model บน GPU cloud โดยอัตโนมัติ</li>
+            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>กด <strong>Start Cluster</strong> ด้านล่างเพื่อ spin up Ray cluster บน Modal (T4, 1 worker)</li>
+            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>ไปที่หน้า <strong>Train</strong> — เลือก cluster = <strong>Modal</strong> แล้ว submit job</li>
+            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>หรือ: ไปที่ <strong>Models</strong> → แท็บ <strong>Deploy</strong> → <strong>Modal</strong> tab → <strong>Deploy to Modal</strong></li>
+            <li style={{ fontSize: 12, color: 'var(--text-secondary)' }}>เสร็จแล้วกด <strong>Stop Cluster</strong> เพื่อปิด (ลดค่าใช้จ่าย)</li>
           </ol>
+        </div>
+      )}
+
+      {/* Cluster control — Start / Stop using saved creds */}
+      {cred?.configured && (
+        <div className="card" style={{ marginBottom: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, gap: 10, flexWrap: 'wrap' }}>
+            <div>
+              <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+                Modal Ray Cluster
+                {clusterStatus && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 5,
+                    background: clusterRunning ? '#22c55e20' : clusterStatus.status === 'error' ? '#ef444420' : '#f59e0b20',
+                    color:      clusterRunning ? '#22c55e'   : clusterStatus.status === 'error' ? '#ef4444'   : '#f59e0b',
+                    textTransform: 'uppercase', letterSpacing: '0.06em',
+                  }}>{clusterStatus.status}</span>
+                )}
+              </h3>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                {clusterRunning && clusterStatus?.ray_url
+                  ? <>Ray dashboard: <code style={{ fontFamily: 'var(--font-mono)', color: '#8b5cf6' }}>{clusterStatus.ray_url}</code></>
+                  : clusterBusy
+                    ? <span style={{ color: '#f59e0b' }}>กำลัง {clusterStatus?.status}… (อาจใช้เวลา 1–3 นาที)</span>
+                    : <>ยังไม่ได้ start — เลือก cluster <strong style={{ color: '#8b5cf6' }}>Modal</strong> ในหน้า Train ไม่ได้จนกว่าจะ start</>}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                onClick={handleStartCluster}
+                disabled={!cred?.configured || clusterRunning || clusterBusy || starting}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                  background: (clusterRunning || clusterBusy) ? 'var(--bg-elevated)' : '#8b5cf6',
+                  color:      (clusterRunning || clusterBusy) ? 'var(--text-muted)'  : '#fff',
+                  border: 'none', borderRadius: 8, cursor: (clusterRunning || clusterBusy) ? 'not-allowed' : 'pointer',
+                  opacity: (!cred?.configured || clusterRunning || clusterBusy || starting) ? 0.55 : 1,
+                }}
+              >
+                {starting ? <Loader size={12} className="animate-spin" /> : <Play size={12} />}
+                {starting ? 'Starting…' : 'Start Cluster'}
+              </button>
+              <button
+                onClick={handleStopCluster}
+                disabled={!clusterRunning || stoppingCluster}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                  background: '#ef444415', color: '#ef4444', border: '1px solid #ef444430',
+                  borderRadius: 8, cursor: clusterRunning ? 'pointer' : 'not-allowed',
+                  opacity: (!clusterRunning || stoppingCluster) ? 0.55 : 1,
+                }}
+              >
+                {stoppingCluster ? <Loader size={12} className="animate-spin" /> : <StopCircle size={12} />}
+                {stoppingCluster ? 'Stopping…' : 'Stop Cluster'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

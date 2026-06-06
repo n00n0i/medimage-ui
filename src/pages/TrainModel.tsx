@@ -253,7 +253,7 @@ export default function TrainModel() {
   const [showAllModels, setShowAllModels] = useState(false)
   const [clusterStatus, setClusterStatus] = useState<{
     ray:   { available: boolean; url: string; info: string }
-    modal: { available: boolean; status: string; ray_url: string | null }
+    modal: { available: boolean; status: string; ray_url: string | null; creds_saved?: boolean }
   } | null>(null)
 
   // Fetch cluster availability when on step 3
@@ -916,7 +916,10 @@ export default function TrainModel() {
               <button
                 onClick={() => {
                   if (clusterStatus && !clusterStatus.modal.available) {
-                    showToast('Modal cluster is not running — start it in Modal Config page first', 'error')
+                    const msg = clusterStatus.modal.creds_saved
+                      ? 'Modal cluster not running — click "Start Cluster" on the Modal Config page first'
+                      : 'Modal cluster not running — set credentials and click "Start Cluster" on the Modal Config page first'
+                    showToast(msg, 'error')
                     return
                   }
                   set('cluster', 'modal')
@@ -936,8 +939,10 @@ export default function TrainModel() {
                   <div style={{ fontSize: 11, marginTop: 2 }}>
                     {clusterStatus
                       ? (clusterStatus.modal.available
-                          ? <span style={{ color: 'var(--success)' }}>● Running</span>
-                          : <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — start in Modal Config page</span>)
+                          ? <span style={{ color: 'var(--success)' }}>● Running — ready for training</span>
+                          : clusterStatus.modal.creds_saved
+                            ? <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — go to <a href="/modal-cluster" onClick={e => e.stopPropagation()} style={{ color: 'var(--primary-hover)' }}>Modal Config</a> → Start Cluster</span>
+                            : <span style={{ color: 'var(--error)' }}>● {clusterStatus.modal.status} — set token & secret in <a href="/modal-cluster" onClick={e => e.stopPropagation()} style={{ color: 'var(--primary-hover)' }}>Modal Config</a></span>)
                       : <span style={{ color: 'var(--text-muted)' }}>Checking...</span>}
                   </div>
                 </div>

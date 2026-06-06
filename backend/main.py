@@ -3112,10 +3112,16 @@ def get_train_cluster_status():
 
     modal_status  = _modal_state.get("status", "idle")
     modal_ray_url = _modal_state.get("ray_url")
+    creds_saved   = _load_modal_creds() is not None
 
     return {
         "ray":   {"available": ray_ok,                    "url": RAY_URL,       "info": ray_info},
-        "modal": {"available": modal_status == "running", "status": modal_status, "ray_url": modal_ray_url},
+        "modal": {
+            "available":  modal_status == "running",
+            "status":     modal_status,
+            "ray_url":    modal_ray_url,
+            "creds_saved": creds_saved,
+        },
     }
 
 
@@ -3774,6 +3780,19 @@ def modal_start(req: ModalStartRequest):
     if _modal_state["status"] in ("deploying", "running"):
         from fastapi import HTTPException
         raise HTTPException(status_code=409, detail="Already running — stop first")
+    # Allow the caller to omit creds if they are already saved in the DB
+    # (so the UI can just say "Start" without re-asking for the secret).
+    if not req.token_id or not req.token_secret:
+        saved = _load_modal_creds()
+        if not saved:
+            raise HTTPException(
+                status_code=400,
+                detail="Modal credentials not provided and none saved — go to Modal Config to set them",
+            )
+        req = req.model_copy(update={
+            "token_id":     saved["token_id"],
+            "token_secret": saved["token_secret"],
+        })
     _modal_state.update(status="deploying", ray_url=None, logs=[], proc=None,
                         token_id=req.token_id, token_secret=req.token_secret,
                         gpu_type=req.gpu_type, num_workers=req.num_workers)
