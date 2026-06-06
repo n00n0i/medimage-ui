@@ -3984,11 +3984,14 @@ def modal_stop():
         env["MODAL_TOKEN_SECRET"] = token_secret
 
         # Step 1: send `modal app stop`. With min_containers=0 in the
-        # script, the running container drains within ~20s.
-        _modal_state["logs"].append("→ modal app stop medimage-ray")
+        # script, the running container drains within ~20s. The CLI
+        # asks for interactive confirmation by default — pass --yes
+        # to skip it (we have no TTY here, otherwise it exits 1
+        # with "no interactive terminal detected").
+        _modal_state["logs"].append("→ modal app stop --yes medimage-ray")
         try:
             r = subprocess.run(
-                ["python3", "-m", "modal", "app", "stop", "medimage-ray"],
+                ["python3", "-m", "modal", "app", "stop", "--yes", "medimage-ray"],
                 env=env, timeout=120, capture_output=True, text=True,
             )
             tail = (r.stdout + r.stderr).strip()
@@ -4003,10 +4006,15 @@ def modal_stop():
         except Exception as exc:
             _modal_state["logs"].append(f"⚠ stop error: {exc}")
 
-        # Step 2: poll `modal app list` for the app to actually disappear
-        # from the running list. With min_containers=0 this is ~20s.
+        # Step 2: poll `modal app list` for the app to actually leave
+        # the *running* state. With min_containers=0 this is ~20s.
+        # Note: `modal app list` keeps the app in the list with state
+        # 'stopped' after a successful stop — it doesn't disappear.
+        # We accept any of {stopped, stopping} as terminal, only
+        # {deployed, running, active, initialized, ...} as "still alive".
         import time as _time
-        _modal_state["logs"].append("→ polling `modal app list` for medimage-ray to disappear…")
+        _modal_state["logs"].append("→ polling `modal app list` for medimage-ray to leave the running state…")
+        ALIVE_STATES = ("deployed", "running", "active", "initialized", "pending", "scheduled")
         deadline = _time.time() + 90
         while _time.time() < deadline:
             try:
@@ -4015,21 +4023,28 @@ def modal_stop():
                     env=env, timeout=15, capture_output=True, text=True,
                 )
                 out = (cl.stdout or "") + (cl.stderr or "")
-                still_listed = False
+                still_alive = False
                 state = ""
                 for line in out.splitlines():
                     if "medimage-ray" in line.lower():
-                        still_listed = True
-                        # Try to capture a state word
-                        for kw in ("deployed", "running", "active", "initialized", "stopping", "stopped"):
-                            if kw in line.lower():
+                        line_lower = line.lower()
+                        for kw in ALIVE_STATES:
+                            if kw in line_lower:
+                                still_alive = True
                                 state = kw
                                 break
-                if not still_listed:
-                    _modal_state["logs"].append("✓ medimage-ray no longer in `app list` — cluster is down")
+                        if not still_alive:
+                            for kw in ("stopped", "stopping", "terminated", "disconnected"):
+                                if kw in line.lower():
+                                    state = kw
+                                    break
+                if not still_alive:
+                    _modal_state["logs"].append(
+                        f"✓ medimage-ray state is '{state or 'gone'}' — cluster is down"
+                    )
                     _modal_state.update(status="idle", proc=None, ray_url=None, num_workers=0, gpu_type="T4")
                     return
-                _modal_state["logs"].append(f"  still listed (state: {state or '?'}) — waiting…")
+                _modal_state["logs"].append(f"  still {state} — waiting…")
             except Exception as e:
                 _modal_state["logs"].append(f"  poll error: {e}")
             _time.sleep(6)
