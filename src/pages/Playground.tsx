@@ -153,9 +153,14 @@ function barColor(conf: number) {
 
 function drawDetections(canvas: HTMLCanvasElement, img: HTMLImageElement, detections: Detection[], threshold: number) {
   const ctx = canvas.getContext('2d')!
+  console.log('[drawDetections] img.naturalWidth:', img.naturalWidth, 'img.naturalHeight:', img.naturalHeight)
+  console.log('[drawDetections] img.src:', img.src)
+  console.log('[drawDetections] img.complete:', img.complete)
   canvas.width  = img.naturalWidth
   canvas.height = img.naturalHeight
+  console.log('[drawDetections] canvas.width:', canvas.width, 'canvas.height:', canvas.height)
   ctx.drawImage(img, 0, 0)
+  console.log('[drawDetections] drawImage complete')
 
   const W = canvas.width
   const H = canvas.height
@@ -189,9 +194,14 @@ function drawDetections(canvas: HTMLCanvasElement, img: HTMLImageElement, detect
 
 function drawSegmentation(canvas: HTMLCanvasElement, img: HTMLImageElement, masks: SegMask[], threshold: number) {
   const ctx = canvas.getContext('2d')!
+  console.log('[drawSegmentation] img.naturalWidth:', img.naturalWidth, 'img.naturalHeight:', img.naturalHeight)
+  console.log('[drawSegmentation] img.src:', img.src)
+  console.log('[drawSegmentation] img.complete:', img.complete)
   canvas.width  = img.naturalWidth
   canvas.height = img.naturalHeight
+  console.log('[drawSegmentation] canvas.width:', canvas.width, 'canvas.height:', canvas.height)
   ctx.drawImage(img, 0, 0)
+  console.log('[drawSegmentation] drawImage complete')
 
   const W = canvas.width
   const H = canvas.height
@@ -354,19 +364,30 @@ export default function Playground() {
 
   // Redraw canvas when result or threshold changes
   useEffect(() => {
-    if (!result || !canvasRef.current || !imageUrl || !imgRef.current) return
-    if (result.type !== 'detection' && result.type !== 'segmentation') return
+    console.log('[useEffect] Triggered - result:', result?.type, 'imageUrl:', imageUrl)
+    if (!result || !canvasRef.current || !imageUrl || !imgRef.current) {
+      console.log('[useEffect] Early return - missing refs or data')
+      return
+    }
+    if (result.type !== 'detection' && result.type !== 'segmentation') {
+      console.log('[useEffect] Early return - not detection/segmentation')
+      return
+    }
 
     const canvas = canvasRef.current
     const img = imgRef.current
+    console.log('[useEffect] img.complete:', img.complete, 'img.naturalWidth:', img.naturalWidth)
 
     // If image already loaded, draw immediately
     if (img.complete && img.naturalWidth > 0) {
+      console.log('[useEffect] Image already loaded - drawing immediately')
       if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
       if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
     } else {
+      console.log('[useEffect] Image not loaded - waiting for load event')
       // Otherwise wait for image to load
       const handleLoad = () => {
+        console.log('[useEffect/handleLoad] Image loaded - drawing')
         if (result.type === 'detection') drawDetections(canvas, img, result.detections, threshold)
         if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
       }
