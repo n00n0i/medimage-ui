@@ -2411,7 +2411,7 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
 def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantization,
                        epochs, batch, grad_accum, lr, chat_template, job_id,
                        w_bucket, w_key, minio_url, minio_access, minio_secret,
-                       img_dir=None):
+                       dataset_url=None, project_id=0, img_dir=None):
     """Fine-tune a Vision Language Model via Unsloth's FastVisionModel.
 
     Why unsloth instead of the bare transformers+peft path: unsloth pins
@@ -2419,6 +2419,14 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     we avoid the version-conflict class of bugs (peft 0.11+ needs
     transformers >=4.45 for EncoderDecoderCache, etc.) and the numpy/pandas
     ABI mismatch on this Ray cluster. Same trade-off as the LLM path.
+
+    Dataset resolution (in order):
+    1. text_dataset if set — HF dataset id, local path, or raw JSONL string
+       in {"text"/"instruction", "output"/"response", "image"} format
+    2. dataset_url if set — downloads the LS-project zip built by
+       _export_ls_to_minio, extracts images + annotations.json, builds the
+       conversation dataset from task annotations
+    3. Raise a clear error
 
     Supported models: Qwen2-VL, LLaVA 1.5/1.6, Pixtral, Llama-3.2-Vision,
     Gemma-3 vision. Models unsloth doesn't support (InternVL2, MedGemma,
@@ -2428,9 +2436,10 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     from trl import SFTTrainer, SFTConfig
     from datasets import load_dataset, Dataset as HFDataset
     import torch as _torch
-    import zipfile as _zf, glob as _glob
+    import zipfile as _zf, glob as _glob, tempfile as _tf, json as _json
     from PIL import Image as _Image
     import io as _io, base64 as _b64
+    import requests as _req
 
     print(f"[train] Unsloth VLM — model: {model_name}  lora_r={lora_rank}  4bit={quantization in ('4bit','4-bit','bnb-4bit')}")
     load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
@@ -2452,17 +2461,105 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
         random_state=3407,
     )
 
-    # Load dataset (HF dataset id, local path, or raw JSONL)
-    print(f"[train] Loading dataset: {text_dataset}")
-    try:
-        ds = load_dataset(text_dataset, split="train")
-    except Exception as e:
-        print(f"[warn] HF load failed ({e}), trying as JSONL")
-        import json as _json
-        rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
-        ds = HFDataset.from_list(rows)
+    # ── Dataset resolution ──────────────────────────────────────────────────
+    rows = None  # list of {text/instruction, output/response, image}
+    if text_dataset:
+        # 1. text_dataset path — HF dataset id, local path, or raw JSONL
+        print(f"[train] Loading text_dataset: {text_dataset[:80]}{'...' if len(text_dataset) > 80 else ''}")
+        try:
+            ds = load_dataset(text_dataset, split="train")
+            rows = list(ds)
+        except Exception as e:
+            print(f"[warn] HF load failed ({e}), trying as JSONL")
+            rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
+    elif dataset_url:
+        # 2. project-zip path — download the zip built by _export_ls_to_minio,
+        #    extract images + annotations.json, build conversation rows.
+        tmpdir = _tf.mkdtemp(prefix="vlm_data_")
+        print(f"[train] Downloading dataset zip: {dataset_url}")
+        r = _req.get(dataset_url, stream=True, timeout=600)
+        r.raise_for_status()
+        zip_path = os.path.join(tmpdir, "dataset.zip")
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        with _zf.ZipFile(zip_path) as z:
+            z.extractall(tmpdir)
+        img_dir = img_dir or os.path.join(tmpdir, "images")
+        ann_path = None
+        for cand in (os.path.join(tmpdir, "annotations.json"),
+                     os.path.join(tmpdir, "tasks.json"),
+                     os.path.join(tmpdir, "data", "annotations.json")):
+            if os.path.isfile(cand):
+                ann_path = cand
+                break
+        if not ann_path:
+            raise RuntimeError(
+                f"No annotations.json / tasks.json in zip — VLM needs image+text pairs. "
+                f"Got: {os.listdir(tmpdir)[:20]}"
+            )
+        with open(ann_path) as f:
+            tasks = _json.load(f)
+        print(f"[train] Building VLM rows from {len(tasks)} LS tasks in project {project_id} ...")
+        rows = []
+        for t in tasks:
+            data = t.get("data") or {}
+            anns = t.get("annotations") or t.get("predictions") or []
+            # image: try several keys
+            img_ref = (data.get("image") or data.get("img")
+                       or (data.get("upload") or {}).get("file") or "")
+            # caption/response: join text from first annotation's result list
+            text_out = ""
+            for a in anns:
+                res = a.get("result") or []
+                # VLM-friendly: collect text values from choice/rating/textarea results
+                for r_item in res:
+                    if not isinstance(r_item, dict):
+                        continue
+                    v = r_item.get("value")
+                    if isinstance(v, str) and v.strip():
+                        text_out = v.strip()
+                        break
+                    if isinstance(v, list):
+                        for choice in v:
+                            if isinstance(choice, dict):
+                                texts = [c.get("text", "") for c in choice.get("choices", []) if c.get("text")]
+                                if texts:
+                                    text_out = " ".join(texts)
+                                    break
+                        if text_out:
+                            break
+                if text_out:
+                    break
+            if not img_ref or not text_out:
+                continue
+            # resolve img_ref to a path under img_dir if it's a basename
+            local_img = None
+            cand_paths = [img_ref, os.path.join(img_dir, os.path.basename(img_ref))]
+            for c in cand_paths:
+                if os.path.isfile(c):
+                    local_img = c
+                    break
+            if not local_img:
+                continue
+            rows.append({
+                "text": data.get("prompt", data.get("question", "Describe this image.")),
+                "output": text_out,
+                "image": local_img,
+            })
+        if not rows:
+            raise RuntimeError(
+                f"Built 0 VLM rows from {len(tasks)} tasks. "
+                f"Check that LS annotations have a 'text' value and images are in the zip."
+            )
+        print(f"[train] Built {len(rows)} VLM conversation rows from project {project_id}")
+    else:
+        raise RuntimeError(
+            "VLM training needs either text_dataset (JSONL) or a project "
+            "(dataset_url). Got neither — go back to step 1 and pick a project."
+        )
 
-    # Index local images for path-based references in the dataset
+    # Index local images for path-based references
     local_imgs = {}
     if img_dir and os.path.isdir(img_dir):
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
@@ -2480,6 +2577,8 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
                 return _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
             if raw in local_imgs:
                 return _Image.open(local_imgs[raw]).convert("RGB")
+            if os.path.isfile(raw):
+                return _Image.open(raw).convert("RGB")
             # try as direct path under img_dir
             for ext in ("", ".jpg", ".jpeg", ".png", ".webp"):
                 cand = os.path.join(img_dir or "", raw + ext) if img_dir else ""
@@ -2492,8 +2591,6 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
         out   = example.get("output") or example.get("response") or ""
         img   = _resolve_image(example.get("image"))
         if img is None:
-            # placeholder — keeps the conversation well-formed even when
-            # image references are missing, so training doesn't crash.
             img = _Image.new("RGB", (224, 224), (128, 128, 128))
         user_content = [{"type": "image"}, {"type": "text", "text": instr}]
         return {
@@ -2504,7 +2601,8 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
             "images": [img],
         }
 
-    print(f"[train] Converting {len(ds)} examples to conversation format ...")
+    print(f"[train] Converting {len(rows)} examples to conversation format ...")
+    ds = HFDataset.from_list(rows)
     ds = ds.map(to_conversation, remove_columns=ds.column_names)
 
     save_dir = f"/tmp/vlm_{job_id}"
@@ -2601,6 +2699,7 @@ def main():
     lr            = float(os.environ.get("LR", "0.001"))
     optimizer     = os.environ.get("OPTIMIZER", "AdamW")
     job_id        = os.environ.get("JOB_ID", "unknown")
+    project_id    = int(os.environ.get("PROJECT_ID", "0") or 0)
     dataset_url   = os.environ.get("DATASET_URL", "")
     w_bucket      = os.environ.get("WEIGHTS_BUCKET", "medimage-weights")
     w_key         = os.environ.get("WEIGHTS_KEY", f"{job_id}/best.pt")
@@ -2644,12 +2743,22 @@ def main():
     # numpy/pandas ABI mismatch on this Ray cluster. Models unsloth doesn't
     # support raise a clear error from FastVisionModel.from_pretrained.
     if training_type == "vlm-finetune":
-        if not text_dataset:
-            raise RuntimeError("TEXT_DATASET env var is required for VLM fine-tuning")
+        # text_dataset OR (dataset_url + project_id) is required. The Train
+        # page sends datasetId (LS project) for VLM, which is converted to a
+        # zip + annotations.json by _export_ls_to_minio and exposed via
+        # dataset_url — so we can build the VLM conversation rows from the
+        # project tasks. Fall back to text_dataset (JSONL) when provided.
+        if not text_dataset and not (dataset_url and project_id):
+            raise RuntimeError(
+                "VLM fine-tuning needs either text_dataset (JSONL) or a "
+                "project (dataset_url). Go back to step 1 and pick a "
+                "project, or upload a text dataset in Datasets."
+            )
         train_unsloth_vlm(
             model_name, text_dataset, max_seq_len, lora_rank, quantization,
             epochs, batch, grad_accum, lr, chat_template,
             job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
+            dataset_url=dataset_url, project_id=project_id,
         )
         print("[train] Complete!")
         return
