@@ -3698,6 +3698,12 @@ def _run_on_ray_cluster(job: dict) -> None:
             a fresh _TritonLazyPackage and caches it in sys.modules.
             Same mechanism lets `triton.X.Y` work recursively.
 
+            Every lazy package has a real `__spec__` (ModuleSpec with
+            is_package=True) so importlib.util.find_spec returns it
+            cleanly instead of raising "ValueError: triton.__spec__
+            is None". bitsandbytes.triton.triton_utils.is_triton_available
+            does exactly that check.
+
             Every lazy package is also `__call__`-able as a no-op so
             call patterns like `triton.Config(...)` (used in torchao
             and bitsandbytes) succeed even when the actual
@@ -3707,6 +3713,17 @@ def _run_on_ray_cluster(job: dict) -> None:
             def __init__(self, name):
                 super().__init__(name)
                 self.__path__ = []
+                # Set a proper __spec__ with is_package=True so
+                # find_spec("triton.X") returns this spec instead of
+                # raising ValueError. ModuleSpec name matches the
+                # full dotted name, and submodule_search_locations
+                # is set to __path__ so `import triton.X.Y` knows
+                # where to look for child submodules.
+                import importlib.machinery as _imm_triton
+                self.__spec__ = _imm_triton.ModuleSpec(
+                    name, None, is_package=True)
+                if self.__path__:
+                    self.__spec__.submodule_search_locations = self.__path__
             def __call__(self, *args, **kwargs):
                 # Must be on the CLASS, not the instance — setting
                 # `__call__` on a ModuleType instance is a no-op
