@@ -3693,6 +3693,22 @@ def _run_on_ray_cluster(job: dict) -> None:
         # Pre-set the names bitsandbytes tries to import
         _sys.modules["triton.ops.matmul_perf_model"].early_config_prune = lambda *a, **kw: None
         _sys.modules["triton.ops.matmul_perf_model"].estimate_matmul_time = lambda *a, **kw: 0.0
+        # Stub `triton.language` — torch._dynamo.utils does
+        # `common_constant_types.add(triton.language.dtype)` at import time
+        # (in older torch versions; newer torch pinned a specific triton
+        # version). If triton is missing the `language` submodule (which
+        # is what we have when triton isn't installed and we stub it),
+        # the dynamo import fails. The actual `dtype` value doesn't
+        # matter for our VLM training — we never go through dynamo
+        # tracing. So we just give the stub a `dtype` attribute that
+        # accepts `add()`.
+        if not hasattr(_sys.modules["triton"], "language"):
+            _triton_lang = _types.ModuleType("triton.language")
+            class _StubDtype:
+                def __repr__(self): return "<stub triton.language.dtype>"
+            _triton_lang.dtype = _StubDtype()
+            _sys.modules["triton.language"] = _triton_lang
+            _sys.modules["triton"].language = _triton_lang
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
