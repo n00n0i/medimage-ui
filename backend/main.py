@@ -3344,19 +3344,29 @@ def _run_on_ray_cluster(job: dict) -> None:
     _set_step(job_id, "connect")
     _append_log(job_id, f"[cluster] Connecting to Ray at {ray_addr}")
 
-    # Export dataset from Label Studio (skip for LLM/VLM — uses HF text_dataset instead)
+    # Export dataset from Label Studio. Skip only when the engine+training
+    # type doesn't need image data at all (LLM with text_dataset, self-supervised
+    # paths that fetch from a different source, etc.). VLM is special: it can
+    # use EITHER a JSONL text_dataset OR the project's image+annotation zip
+    # — so we only skip the export when the job has a text_dataset attached.
     engine = job.get("engine", "Ultralytics")
     training_type_for_export = job.get("training_type", "detection")
-    _is_llm = engine == "Unsloth" or training_type_for_export in ("llm-text", "vlm-finetune")
-    if _is_llm:
+    _job_text_dataset = job.get("text_dataset", "") or ""
+    _is_pure_llm = (engine == "Unsloth" and training_type_for_export == "llm-text")
+    _is_vlm_with_text = (training_type_for_export == "vlm-finetune" and bool(_job_text_dataset))
+    if _is_pure_llm or _is_vlm_with_text:
         dataset_url = ""
-        _append_log(job_id, "[cluster] LLM engine — skipping LS export (uses text_dataset)")
+        _append_log(job_id, "[cluster] Using text_dataset — skipping LS export")
     else:
         _set_step(job_id, "export")
         _append_log(job_id, f"[cluster] Exporting dataset from LS project {project_id} ...")
-        # SMP segmentation and self-supervised need image data from JSON export
-        # HuggingFace vision also needs JSON so we can download images from MinIO
-        _needs_json = engine in ("Segmentation Models PyTorch", "HuggingFace") or training_type_for_export == "self-supervised"
+        # SMP segmentation, self-supervised, HuggingFace vision, and VLM-without-
+        # text-dataset all need JSON so we can download images from MinIO.
+        _needs_json = (
+            engine in ("Segmentation Models PyTorch", "HuggingFace")
+            or training_type_for_export == "self-supervised"
+            or training_type_for_export == "vlm-finetune"
+        )
         _export_fmt = "JSON" if _needs_json else "YOLO"
         dataset_url = _export_ls_to_minio(project_id, job_id, preferred_fmt=_export_fmt)
         _append_log(job_id, "[cluster] Dataset exported and staged in MinIO ✓")
