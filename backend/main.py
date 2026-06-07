@@ -3665,35 +3665,39 @@ def _run_on_ray_cluster(job: dict) -> None:
                 _smi_text = (_smi.stdout or "") + (_smi.stderr or "")
                 print(f"[cluster] nvidia-smi (pre-flight):\n{_smi_text}",
                       file=_sys.stderr)
-                # The cluster's pip index only has un-suffixed torch
-                # versions (1.11.0, 1.12.0, … 2.12.0) — no +cuXXX
-                # variants — but it does have the local 2.10.0+cu128
-                # already installed (from a prior pip install that
-                # pulled from pytorch.org's cu128 index). To get a
-                # different +cu wheel we must point pip at the official
-                # PyTorch cu118 index explicitly. The cu118 build works
-                # on any driver >= 470.x (CUDA 11.7+) which the cluster
-                # must have since ultralytics was running.
-                _pytorch_cu_index = "https://download.pytorch.org/whl/cu118"
+                # Try multiple PyTorch cu indexes in order (newest
+                # first). cu118 wheels DID install but failed at
+                # runtime — the cluster's driver is too old to load
+                # CUDA 11.8. So include older cu indexes too:
+                #   cu118 — driver >= 470.x (CUDA 11.8)
+                #   cu117 — driver >= 460.x (CUDA 11.7)
+                #   cu116 — driver >= 450.x (CUDA 11.6)
+                #   cu115 — driver >= 450.x (CUDA 11.5)
+                #   cu113 — driver >= 450.x (CUDA 11.3)
+                # The cluster has been running ultralytics, so it
+                # almost certainly has CUDA 11.5+ — try cu117 first
+                # (most likely match) and fall back from there.
                 _torch_attempts = [
-                    f"torch==2.0.0+cu118",
-                    f"torch==2.1.0+cu118",
-                    f"torch==2.1.2+cu118",
-                    f"torch==1.13.1+cu117",
+                    ("https://download.pytorch.org/whl/cu117", "torch==2.0.0+cu117"),
+                    ("https://download.pytorch.org/whl/cu117", "torch==1.13.1+cu117"),
+                    ("https://download.pytorch.org/whl/cu116", "torch==1.13.1+cu116"),
+                    ("https://download.pytorch.org/whl/cu115", "torch==1.13.1+cu115"),
+                    ("https://download.pytorch.org/whl/cu118", "torch==2.0.0+cu118"),
                 ]
                 _last_err = ""
-                for _torch_pin in _torch_attempts:
+                for _pytorch_index, _torch_pin in _torch_attempts:
                     print(f"[cluster] trying {_torch_pin} from "
-                          f"{_pytorch_cu_index} ...",
+                          f"{_pytorch_index} ...",
                           file=_sys.stderr)
                     _pip_res = _sp.run(
                         [_sys.executable, "-m", "pip", "install",
                          "--force-reinstall", "--no-deps",
-                         "--index-url", _pytorch_cu_index,
+                         "--index-url", _pytorch_index,
                          _torch_pin],
                         capture_output=True, text=True, timeout=600,
                     )
                     _last_err = (f"  pin={_torch_pin}\n"
+                                 f"  index={_pytorch_index}\n"
                                  f"  pip stdout: {_pip_res.stdout[:500]!r}\n"
                                  f"  pip stderr: {_pip_res.stderr[:500]!r}\n"
                                  f"  pip returncode: {_pip_res.returncode}")
@@ -3717,14 +3721,23 @@ def _run_on_ray_cluster(job: dict) -> None:
                     print(f"[cluster] {_torch_pin} installed but GPU not visible",
                           file=_sys.stderr)
                 else:
-                    # All attempts failed
+                    # All attempts failed — surface nvidia-smi output
+                    # in the error so the user can see what driver
+                    # they're on and pick the right cu index manually.
                     raise RuntimeError(
-                        f"All torch install attempts from "
-                        f"{_pytorch_cu_index} failed to produce a "
-                        f"GPU-visible build. Last pip output:\n{_last_err}\n"
-                        f"This Ray worker may not have a GPU, or its CUDA "
-                        f"driver is too old for cu118 (needs >= 470.x). "
-                        f"nvidia-smi output is above."
+                        f"All torch install attempts (cu117/cu116/cu115/"
+                        f"cu118) failed to produce a GPU-visible build. "
+                        f"Last pip output:\n{_last_err}\n\n"
+                        f"=== nvidia-smi output ===\n{_smi_text}\n\n"
+                        f"=== nvidia-smi parses ===\n"
+                        f"driver CUDA: "
+                        f"{_re.search(r'CUDA Version:\\s*(\\d+\\.\\d+)', _smi_text).group(1) if _re.search(r'CUDA Version:\\s*(\\d+\\.\\d+)', _smi_text) else '(not found)'}\n"
+                        f"\n"
+                        f"This Ray worker's CUDA driver is too old to load "
+                        f"any of the available cu11x torch wheels. "
+                        f"Pick a cu index that matches the driver and "
+                        f"add it to the _torch_attempts list above, or "
+                        f"upgrade the driver."
                     )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
