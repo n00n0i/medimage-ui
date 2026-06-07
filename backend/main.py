@@ -2442,6 +2442,9 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     # unsloth import) so we always see the output even when the import
     # itself fails.
     import os as _os
+    import subprocess as _sp
+    import sys as _sys
+    import socket as _sock
     import torch as _torch_diag
     print(f"[train]   torch={_torch_diag.__version__}  "
           f"cuda_available={_torch_diag.cuda.is_available()}  "
@@ -2450,7 +2453,6 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     if _torch_diag.cuda.is_available():
         for _di in range(_torch_diag.cuda.device_count()):
             print(f"[train]   device[{_di}]={_torch_diag.cuda.get_device_name(_di)}")
-    import socket as _sock
     print(f"[train]   hostname={_sock.gethostname()}  "
           f"NVIDIA_VISIBLE_DEVICES={_os.environ.get('NVIDIA_VISIBLE_DEVICES', '(unset)')}  "
           f"CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}")
