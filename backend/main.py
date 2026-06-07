@@ -2476,9 +2476,16 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
              "--force-reinstall", "torch==2.1.2"],
             capture_output=True,
         )
-        # Re-import torch so unsloth_zoo sees the new version
-        import importlib
-        importlib.reload(_torch_diag)
+        # Clear torch from sys.modules so the next import loads the freshly-
+        # installed version. importlib.reload(torch) also works in principle
+        # but it triggers a "single TORCH_LIBRARY can be used to register
+        # the namespace triton" error because torch re-registers its
+        # internal namespaces on reload. Deleting the cached modules +
+        # a fresh import is the safe pattern.
+        for _k in list(_sys.modules.keys()):
+            if _k == "torch" or _k.startswith("torch."):
+                del _sys.modules[_k]
+        import torch as _torch_diag
         print(f"[train]   after reinstall: torch={_torch_diag.__version__}  "
               f"cuda_available={_torch_diag.cuda.is_available()}  "
               f"device_count={_torch_diag.cuda.device_count()}")
