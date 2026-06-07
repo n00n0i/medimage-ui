@@ -3724,14 +3724,15 @@ def _run_on_ray_cluster(job: dict) -> None:
                     # All attempts failed — surface nvidia-smi output
                     # in the error so the user can see what driver
                     # they're on and pick the right cu index manually.
+                    _drv_match = _re.search(r"CUDA Version:\s*(\d+\.\d+)", _smi_text)
+                    _driver_cuda = _drv_match.group(1) if _drv_match else "(not found)"
                     raise RuntimeError(
                         f"All torch install attempts (cu117/cu116/cu115/"
                         f"cu118) failed to produce a GPU-visible build. "
                         f"Last pip output:\n{_last_err}\n\n"
                         f"=== nvidia-smi output ===\n{_smi_text}\n\n"
-                        f"=== nvidia-smi parses ===\n"
-                        f"driver CUDA: "
-                        f"{_re.search(r'CUDA Version:\\s*(\\d+\\.\\d+)', _smi_text).group(1) if _re.search(r'CUDA Version:\\s*(\\d+\\.\\d+)', _smi_text) else '(not found)'}\n"
+                        f"=== nvidia-smi parsed ===\n"
+                        f"driver CUDA: {_driver_cuda}\n"
                         f"\n"
                         f"This Ray worker's CUDA driver is too old to load "
                         f"any of the available cu11x torch wheels. "
