@@ -2,8 +2,19 @@ import { useState, useEffect } from 'react'
 import {
   UserCircle, Lock, Smartphone, Eye, EyeOff,
   CheckCircle2, AlertCircle, Trash2, QrCode, ShieldCheck, RefreshCw,
+  KeyRound, ExternalLink, Save, LogOut, Clock, Globe, Calendar,
 } from 'lucide-react'
 import keycloak from '../keycloak'
+
+function formatRelativeTime(unixSeconds: number | undefined): string {
+  if (!unixSeconds) return '—'
+  const diff = Math.floor(Date.now() / 1000) - unixSeconds
+  if (diff < 60) return 'just now'
+  if (diff < 3600) return `${Math.floor(diff / 60)} min ago`
+  if (diff < 86400) return `${Math.floor(diff / 3600)} h ago`
+  if (diff < 604800) return `${Math.floor(diff / 86400)} d ago`
+  return new Date(unixSeconds * 1000).toLocaleDateString('th-TH', { year: 'numeric', month: 'short', day: 'numeric' })
+}
 
 interface TOTPCredential {
   id: string
@@ -378,6 +389,272 @@ function TOTPSection() {
   )
 }
 
+// ─── HuggingFace Token ────────────────────────────────────────────────────────
+function HuggingFaceTokenSection() {
+  const [state, setState] = useState<{
+    configured: boolean; mask?: string; hf_username?: string; updated_at?: string
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [editing, setEditing] = useState(false)
+  const [token, setToken] = useState('')
+  const [showToken, setShowToken] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [verifying, setVerifying] = useState(false)
+  const [verifyResult, setVerifyResult] = useState<{
+    ok: boolean; hf_username?: string; orgs?: string[]; token_type?: string; error?: string
+  } | null>(null)
+  const [status, setStatus] = useState<{ type: 'error' | 'success'; msg: string } | null>(null)
+
+  const loadState = async () => {
+    setLoading(true)
+    try {
+      await keycloak.updateToken(30)
+      const res = await fetch('/api/profile/huggingface-token')
+      if (res.ok) setState(await res.json())
+    } catch { /* ignore */ } finally { setLoading(false) }
+  }
+
+  useEffect(() => { loadState() }, [])
+
+  const save = async () => {
+    if (!token.trim()) { setStatus({ type: 'error', msg: 'Token is required' }); return }
+    setSaving(true); setStatus(null); setVerifyResult(null)
+    try {
+      await keycloak.updateToken(30)
+      const res = await fetch('/api/profile/huggingface-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: token.trim() }),
+      })
+      if (!res.ok) {
+        const t = await res.text()
+        let detail = 'Failed to save token'
+        try { detail = JSON.parse(t).detail || detail } catch { /* ignore */ }
+        throw new Error(detail)
+      }
+      setStatus({ type: 'success', msg: 'Token saved — click Verify to confirm it works' })
+      setToken('')
+      setShowToken(false)
+      setEditing(false)
+      await loadState()
+    } catch (e: any) {
+      setStatus({ type: 'error', msg: e.message })
+    } finally { setSaving(false) }
+  }
+
+  const remove = async () => {
+    if (!confirm('Remove the saved HuggingFace token? Training jobs that depend on it will fall back to the server default.')) return
+    setRemoving(true); setStatus(null); setVerifyResult(null)
+    try {
+      await keycloak.updateToken(30)
+      const res = await fetch('/api/profile/huggingface-token', { method: 'DELETE' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setStatus({ type: 'success', msg: 'Token removed' })
+      setVerifyResult(null)
+      await loadState()
+    } catch (e: any) {
+      setStatus({ type: 'error', msg: e.message })
+    } finally { setRemoving(false) }
+  }
+
+  const verify = async () => {
+    setVerifying(true); setStatus(null); setVerifyResult(null)
+    try {
+      await keycloak.updateToken(30)
+      const res = await fetch('/api/profile/huggingface-token/verify', { method: 'POST' })
+      const data = await res.json()
+      setVerifyResult(data)
+      if (data.ok) {
+        setStatus({ type: 'success', msg: `Token verified — authenticated as ${data.hf_username || 'unknown user'}` })
+        await loadState()
+      } else {
+        setStatus({ type: 'error', msg: data.error || 'Verification failed' })
+      }
+    } catch (e: any) {
+      setStatus({ type: 'error', msg: e.message })
+    } finally { setVerifying(false) }
+  }
+
+  return (
+    <SectionCard
+      icon={<KeyRound size={18} style={{ color: 'var(--primary)' }} />}
+      title="HuggingFace Token"
+      description="Personal access token. Used to load gated models (e.g. MahmoodLab/UNI) and private dataset/model repos when launching training jobs."
+    >
+      {status && <Alert type={status.type}>{status.msg}</Alert>}
+
+      {loading ? (
+        <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Loading…</div>
+      ) : state?.configured ? (
+        <>
+          {/* Current state */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '12px 16px', borderRadius: 10,
+            border: '1px solid var(--border-default)',
+            background: 'var(--bg-elevated)',
+            marginBottom: 14,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+              <div style={{ width: 32, height: 32, borderRadius: 8, background: 'rgba(34,197,94,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <ShieldCheck size={16} style={{ color: 'var(--success, #22c55e)' }} />
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ fontWeight: 600, fontSize: 13.5, color: 'var(--text-primary)' }}>
+                    {state.hf_username || 'HuggingFace account'}
+                  </span>
+                  <code style={{
+                    fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)',
+                    background: 'var(--bg-base)', padding: '2px 8px', borderRadius: 5,
+                    border: '1px solid var(--border-default)',
+                  }}>{state.mask}</code>
+                </div>
+                {state.updated_at && (
+                  <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 3 }}>
+                    Updated {new Date(state.updated_at + 'Z').toLocaleString()}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Verification result */}
+          {verifyResult?.ok && (
+            <div style={{
+              padding: '10px 14px', borderRadius: 8, fontSize: 12.5, lineHeight: 1.55,
+              background: 'rgba(34,197,94,0.06)',
+              border: '1px solid rgba(34,197,94,0.18)',
+              color: 'var(--text-secondary)', marginBottom: 14,
+            }}>
+              <div style={{ fontWeight: 600, color: 'var(--success, #22c55e)', marginBottom: 4 }}>
+                Token is valid
+              </div>
+              <div>Account: <code style={{ fontFamily: 'var(--font-mono)' }}>{verifyResult.hf_username}</code> ({verifyResult.token_type || 'user'})</div>
+              {verifyResult.orgs && verifyResult.orgs.length > 0 && (
+                <div style={{ marginTop: 4 }}>Orgs: {verifyResult.orgs.join(', ')}</div>
+              )}
+            </div>
+          )}
+
+          {/* Actions */}
+          {!editing && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                onClick={verify}
+                disabled={verifying}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', borderRadius: 8, border: '1px solid var(--border-default)', background: 'transparent', color: 'var(--text-secondary)', cursor: verifying ? 'not-allowed' : 'pointer', fontSize: 13, fontWeight: 500, opacity: verifying ? 0.6 : 1 }}
+              >
+                {verifying ? <RefreshCw size={13} className="spin" /> : <ShieldCheck size={13} />}
+                {verifying ? 'Verifying…' : 'Verify Token'}
+              </button>
+              <button
+                onClick={() => { setEditing(true); setStatus(null); setVerifyResult(null) }}
+                style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid var(--border-default)', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 13, fontWeight: 500 }}
+              >
+                Replace Token
+              </button>
+              <button
+                onClick={remove}
+                disabled={removing}
+                title="Remove token"
+                style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '8px 14px', borderRadius: 8, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.06)', color: 'var(--danger, #ef4444)', cursor: removing ? 'not-allowed' : 'pointer', fontSize: 13, fontWeight: 500, opacity: removing ? 0.6 : 1 }}
+              >
+                <Trash2 size={12} /> {removing ? 'Removing…' : 'Remove'}
+              </button>
+            </div>
+          )}
+
+          {/* Edit form (replace) */}
+          {editing && (
+            <div style={{ maxWidth: 480 }}>
+              <Field label="New HuggingFace Token">
+                <div style={{ position: 'relative' }}>
+                  <input
+                    style={{ ...inputStyle, paddingRight: 40, fontFamily: 'var(--font-mono)' }}
+                    type={showToken ? 'text' : 'password'}
+                    value={token}
+                    onChange={e => setToken(e.target.value)}
+                    placeholder="hf_xxxxxxxxxxxxxxxxxxxx"
+                    autoComplete="off"
+                    spellCheck={false}
+                    autoFocus
+                  />
+                  <button onClick={() => setShowToken(v => !v)} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }} type="button">
+                    {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
+              </Field>
+              <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                <button
+                  onClick={save}
+                  disabled={saving || !token.trim()}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 18px', borderRadius: 8, border: 'none', background: 'var(--primary)', color: '#fff', cursor: (saving || !token.trim()) ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: 13, opacity: (saving || !token.trim()) ? 0.6 : 1 }}
+                >
+                  {saving ? <RefreshCw size={13} className="spin" /> : <Save size={13} />}
+                  {saving ? 'Saving…' : 'Save Token'}
+                </button>
+                <button
+                  onClick={() => { setEditing(false); setToken(''); setStatus(null) }}
+                  style={{ padding: '8px 14px', borderRadius: 8, border: '1px solid var(--border-default)', background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 13 }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        /* Not configured */
+        <div style={{ maxWidth: 480 }}>
+          <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.55 }}>
+            No token saved. Gated models like <code style={{ fontFamily: 'var(--font-mono)' }}>MahmoodLab/UNI</code> and private repos will fail to load.
+          </div>
+          <Field label="HuggingFace Token">
+            <div style={{ position: 'relative' }}>
+              <input
+                style={{ ...inputStyle, paddingRight: 40, fontFamily: 'var(--font-mono)' }}
+                type={showToken ? 'text' : 'password'}
+                value={token}
+                onChange={e => setToken(e.target.value)}
+                placeholder="hf_xxxxxxxxxxxxxxxxxxxx"
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus
+              />
+              <button onClick={() => setShowToken(v => !v)} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }} type="button">
+                {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+          </Field>
+          <div style={{ display: 'flex', gap: 8, marginTop: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button
+              onClick={save}
+              disabled={saving || !token.trim()}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 18px', borderRadius: 8, border: 'none', background: 'var(--primary)', color: '#fff', cursor: (saving || !token.trim()) ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: 13, opacity: (saving || !token.trim()) ? 0.6 : 1 }}
+            >
+              {saving ? <RefreshCw size={13} className="spin" /> : <Save size={13} />}
+              {saving ? 'Saving…' : 'Save Token'}
+            </button>
+            <a
+              href="https://huggingface.co/settings/tokens"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--text-muted)', textDecoration: 'none' }}
+            >
+              Get a token <ExternalLink size={11} />
+            </a>
+          </div>
+        </div>
+      )}
+
+      <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }`}</style>
+    </SectionCard>
+  )
+}
+
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function Profile() {
   const tp = keycloak.tokenParsed as Record<string, any> | undefined
@@ -386,6 +663,17 @@ export default function Profile() {
   const name = [tp?.given_name, tp?.family_name].filter(Boolean).join(' ') || '—'
   const roles = (tp?.realm_access?.roles ?? []) as string[]
   const isAdmin = roles.includes('platform-admin')
+  const sessionInfo = keycloak.idTokenParsed as Record<string, any> | undefined
+  const authTime = sessionInfo?.auth_time as number | undefined
+  const lastLogin = formatRelativeTime(authTime)
+  const sessionExpires = tp?.exp ? formatRelativeTime(tp.exp) : '—'
+  const ssoProvider = (tp?.iss as string | undefined)?.split('/realms/')[1] ?? 'h-forge'
+
+  const handleLogout = () => {
+    if (confirm('Sign out of H-Forge? You will need to log in again to access the platform.')) {
+      keycloak.logout()
+    }
+  }
 
   return (
     <div style={{ maxWidth: 680 }}>
@@ -421,11 +709,73 @@ export default function Profile() {
         </div>
       </SectionCard>
 
+      {/* Session & SSO */}
+      <SectionCard
+        icon={<Globe size={18} style={{ color: 'var(--primary)' }} />}
+        title="Session & SSO"
+        description="Information about your current sign-in session."
+      >
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 14, maxWidth: 600 }}>
+          <Field label="SSO Realm">
+            <div style={{ ...readonlyStyle, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <ShieldCheck size={13} style={{ color: 'var(--success, #22c55e)' }} />
+              <span>{ssoProvider}</span>
+            </div>
+          </Field>
+          <Field label="Last Sign-in">
+            <div style={{ ...readonlyStyle, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Clock size={13} style={{ color: 'var(--text-muted)' }} />
+              <span>{lastLogin}</span>
+            </div>
+          </Field>
+          <Field label="Session Expires">
+            <div style={{ ...readonlyStyle, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Calendar size={13} style={{ color: 'var(--text-muted)' }} />
+              <span>in {sessionExpires}</span>
+            </div>
+          </Field>
+        </div>
+      </SectionCard>
+
       {/* Change Password */}
       <ChangePassword />
 
+      {/* HuggingFace Token (used by training jobs to access gated models) */}
+      <HuggingFaceTokenSection />
+
       {/* 2FA / TOTP */}
       <TOTPSection />
+
+      {/* Sign out */}
+      <SectionCard
+        icon={<LogOut size={18} style={{ color: 'var(--danger, #ef4444)' }} />}
+        title="Sign Out"
+        description="End your current session. You'll need to re-authenticate via SSO to access the platform."
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+          <div style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.55, maxWidth: 420 }}>
+            You're currently signed in as <strong style={{ color: 'var(--text-secondary)' }}>{username}</strong>.
+            Click the button to end this session and return to the sign-in page.
+          </div>
+          <button
+            onClick={handleLogout}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8,
+              padding: '10px 22px', borderRadius: 8,
+              border: '1px solid rgba(239,68,68,0.35)',
+              background: 'rgba(239,68,68,0.08)',
+              color: 'var(--danger, #ef4444)',
+              cursor: 'pointer', fontWeight: 600, fontSize: 13.5,
+              transition: 'background 0.12s ease, border-color 0.12s ease',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(239,68,68,0.15)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.5)' }}
+            onMouseLeave={e => { e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.35)' }}
+          >
+            <LogOut size={14} />
+            Sign out of H-Forge
+          </button>
+        </div>
+      </SectionCard>
     </div>
   )
 }

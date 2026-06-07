@@ -18,7 +18,7 @@ interface ApiKey {
 interface DeployedModel {
   id: string
   name: string
-  model_name: string
+  model: string
   training_type: string
   engine: string
   created_at: number
@@ -159,11 +159,9 @@ export default function ApiService() {
   const fetchModels = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await fetch('/api/jobs')
+      const res = await fetch('/api/jobs?view=models')
       const data = await res.json()
-      const completed = (data.jobs ?? []).filter(
-        (j: any) => j.status === 'completed' && !j.hidden_in_models
-      ) as DeployedModel[]
+      const completed = (data.jobs ?? []) as DeployedModel[]
       setModels(completed)
       // init status as null (loading) for models with a real deployment
       const initial: Record<string, boolean | null> = {}
@@ -467,7 +465,7 @@ export default function ApiService() {
                   </div>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.model_name}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.model}</div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'auto' }}>
                     <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 4, background: color + '22', color, fontWeight: 600 }}>
@@ -613,7 +611,7 @@ console.log(data)`
                 <span style={{ fontSize: 11, padding: '1px 7px', borderRadius: 4, background: color + '22', color, fontWeight: 600 }}>
                   {TT_LABELS[m.training_type] ?? m.training_type}
                 </span>
-                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{m.model_name}</span>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{m.model}</span>
                 <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>·</span>
                 <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{fmtDate(m.created_at)}</span>
               </div>

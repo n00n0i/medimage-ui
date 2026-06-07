@@ -90,6 +90,7 @@ def init_db():
             ("cluster",          "TEXT DEFAULT 'ray'"),
             ("pipeline_step",    "TEXT DEFAULT ''"),
             ("updated_at",       "TEXT DEFAULT ''"),
+            ("user_id",          "TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {defval}")
@@ -127,6 +128,14 @@ def init_db():
                 id          INTEGER PRIMARY KEY CHECK (id = 1),
                 token_id    TEXT NOT NULL,
                 token_secret TEXT NOT NULL,
+                updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS huggingface_tokens (
+                user_id     TEXT PRIMARY KEY,
+                token       TEXT NOT NULL,
+                hf_username TEXT DEFAULT '',
                 updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -591,6 +600,138 @@ def modal_credentials_verify():
         return {"ok": ok, "output": output[:400]}
     except Exception as exc:
         return {"ok": False, "output": str(exc)[:400]}
+
+
+# ─── HuggingFace Token (per-user) ────────────────────────────────────────────
+# Stored per Keycloak user_id. Used to:
+#   1) inject HF_TOKEN / HUGGING_FACE_HUB_TOKEN into training env vars
+#      so the Ray/Modal worker can pull gated models (e.g. MahmoodLab/UNI)
+#   2) authenticate the backend's own calls to huggingface.co (dataset
+#      import, model metadata probes) so private repos work too
+# The raw token is NEVER returned via GET — only a masked preview + whoami info.
+
+
+def _load_user_hf_token(user_id: str) -> str:
+    """Return the saved HF token for a Keycloak user, or '' if not configured."""
+    if not user_id:
+        return ""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT token FROM huggingface_tokens WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return (row["token"] if row else "") or ""
+
+
+def _mask_hf_token(tok: str) -> str:
+    """Return a safe preview like 'hf_AbC…xYz' — never the full token."""
+    if not tok:
+        return ""
+    if len(tok) <= 10:
+        return "•" * len(tok)
+    return f"{tok[:4]}…{tok[-4:]}"
+
+
+@app.get("/api/profile/huggingface-token")
+def profile_hf_token_get(request: Request):
+    """Return whether a token is configured for the current user (masked)."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    user_id = payload.get("sub", "")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT token, hf_username, updated_at FROM huggingface_tokens WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "mask":       _mask_hf_token(row["token"]),
+        "hf_username": row["hf_username"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+@app.post("/api/profile/huggingface-token")
+async def profile_hf_token_save(request: Request):
+    """Save or replace the current user's HF token."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    user_id = payload.get("sub", "")
+    body    = await request.json()
+    token   = (body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(400, "Token is required")
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO huggingface_tokens (user_id, token, hf_username, updated_at)
+               VALUES (?, ?, '', CURRENT_TIMESTAMP)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 token=excluded.token,
+                 hf_username='',
+                 updated_at=CURRENT_TIMESTAMP""",
+            (user_id, token),
+        )
+        conn.commit()
+    return {"ok": True, "mask": _mask_hf_token(token)}
+
+
+@app.delete("/api/profile/huggingface-token")
+def profile_hf_token_delete(request: Request):
+    """Remove the current user's HF token."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    user_id = payload.get("sub", "")
+    with get_db() as conn:
+        conn.execute("DELETE FROM huggingface_tokens WHERE user_id=?", (user_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/profile/huggingface-token/verify")
+def profile_hf_token_verify(request: Request):
+    """Verify the saved token by calling HF whoami-v2. Caches hf_username."""
+    import requests as _req
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    user_id = payload.get("sub", "")
+    token   = _load_user_hf_token(user_id)
+    if not token:
+        raise HTTPException(400, "No token saved")
+    try:
+        r = _req.get(
+            "https://huggingface.co/api/whoami-v2",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        if r.status_code == 401:
+            return {"ok": False, "error": "Token rejected (401) — invalid or expired"}
+        if r.status_code == 403:
+            return {"ok": False, "error": "Token forbidden (403) — account suspended?"}
+        if not r.ok:
+            return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        info   = r.json()
+        user   = info.get("name") or info.get("fullname") or info.get("id") or ""
+        orgs   = [o.get("name", "") for o in (info.get("orgs") or []) if o.get("name")]
+        # Cache the username for UI display
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE huggingface_tokens SET hf_username=? WHERE user_id=?",
+                (user, user_id),
+            )
+            conn.commit()
+        return {
+            "ok":          True,
+            "hf_username": user,
+            "orgs":        orgs,
+            "token_type":  info.get("type", "user"),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
 
 
 @app.get("/api/modal/deployments")
@@ -2972,6 +3113,17 @@ def _run_on_ray_cluster(job: dict) -> None:
     weights_bucket = "medimage-weights"
     weights_key    = f"{job_id}/best.pt"
     script_b64     = base64.b64encode(_VISION_TRAIN_SCRIPT.encode()).decode()
+    # Resolve the submitter's saved HuggingFace token. If they haven't saved
+    # one in their profile, fall back to whatever HF_TOKEN is set on the API
+    # container's environment (operator-level default for shared infra).
+    _job_user_id   = job.get("user_id", "") or ""
+    _user_hf_tok   = _load_user_hf_token(_job_user_id)
+    _hf_token      = _user_hf_tok or os.getenv("HF_TOKEN", "") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+    if _hf_token:
+        # Also export into the API process so any *synchronous* HF calls
+        # in the worker (e.g. dataset tree fetches) inherit the token.
+        os.environ["HF_TOKEN"] = _hf_token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token
     env_vars = {
         "ENGINE":          engine,
         "TRAINING_TYPE":   training_type,
@@ -2991,8 +3143,8 @@ def _run_on_ray_cluster(job: dict) -> None:
         "MINIO_SECRET_KEY": MINIO_SECRET_KEY,
         "LS_PUBLIC_URL":   LS_PUBLIC_URL,
         "LS_TOKEN":        LS_TOKEN,
-        "HF_TOKEN":        os.getenv("HF_TOKEN", ""),
-        "HUGGING_FACE_HUB_TOKEN": os.getenv("HF_TOKEN", ""),
+        "HF_TOKEN":        _hf_token,
+        "HUGGING_FACE_HUB_TOKEN": _hf_token,
         # LLM-specific
         "TEXT_DATASET":    job.get("text_dataset", ""),
         "LORA_RANK":       str(job.get("lora_rank", 16)),
@@ -3289,10 +3441,15 @@ def _check_zero_shot(model_name: str, engine: str):
 
 
 @app.post("/api/train/{project_id}")
-def submit_job(project_id: int, req: TrainRequest):
+def submit_job(project_id: int, req: TrainRequest, request: Request):
     req.model_name = _normalize_model_name(req.model_name)
     _check_zero_shot(req.model_name, req.engine)
     job_id = str(uuid.uuid4())[:8]
+    # Capture the submitter's Keycloak user_id so the worker can pick up
+    # that user's saved HuggingFace token (for gated models like
+    # MahmoodLab/UNI). Falls back to '' when auth is disabled.
+    _user_payload = _extract_token_payload(request)
+    submitter_user_id = _user_payload.get("sub", "") if _user_payload else ""
     is_llm = req.training_type in ("llm-text", "vlm-finetune")
     if is_llm:
         ds_label = req.text_dataset or f"dataset-{project_id}"
@@ -3318,8 +3475,8 @@ def submit_job(project_id: int, req: TrainRequest):
                (id, name, project_id, dataset, training_type, model_name, engine,
                 epochs, batch_size, learning_rate, optimizer, imgsz, notes,
                 lora_rank, quantization, max_seq_len, chat_template, grad_accum, text_dataset,
-                cluster, status, progress, log, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?)""",
+                cluster, status, progress, log, created_at, user_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?,?)""",
             (
                 job_id, name, project_id, dataset_label,
                 req.training_type, req.model_name, req.engine,
@@ -3329,6 +3486,7 @@ def submit_job(project_id: int, req: TrainRequest):
                 req.chat_template, req.grad_accum, req.text_dataset,
                 cluster,
                 time.time(),
+                submitter_user_id,
             ),
         )
         conn.commit()
@@ -3682,7 +3840,7 @@ class ImportModelRequest(BaseModel):
     notes: str = ""
 
 
-def _run_import(job_id: str, req: ImportModelRequest):
+def _run_import(job_id: str, req: ImportModelRequest, user_id: str = ""):
     """Register an imported / pretrained model. No weights download needed —
     the Ray Serve actor loads pretrained weights from MODEL_NAME at deploy time."""
     try:
@@ -3694,12 +3852,18 @@ def _run_import(job_id: str, req: ImportModelRequest):
         _append_log(job_id, f"Registering model: {req.model_name} ({req.engine} / {req.training_type})")
         _set_progress(job_id, 50)
 
-        # Validate HuggingFace model exists (quick metadata fetch, no download)
+        # Validate HuggingFace model exists (quick metadata fetch, no download).
+        # Use the submitter's saved HF token so private/gated models verify.
         if req.source_type == "huggingface" and req.model_name:
+            _hf_token = _load_user_hf_token(user_id) or os.getenv("HF_TOKEN", "") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+            _headers  = {"Authorization": f"Bearer {_hf_token}"} if _hf_token else {}
             try:
                 import urllib.request as _ur
-                _url = f"https://huggingface.co/api/models/{req.model_name}"
-                _ur.urlopen(_url, timeout=10)  # noqa: S310 — validating public HF model
+                _req2 = _ur.Request(
+                    f"https://huggingface.co/api/models/{req.model_name}",
+                    headers=_headers,
+                )
+                _ur.urlopen(_req2, timeout=10)  # noqa: S310 — validating HF model
                 _append_log(job_id, f"HuggingFace model '{req.model_name}' verified ✓")
             except Exception as _ve:
                 _append_log(job_id, f"Warning: could not verify HuggingFace model ({_ve}) — proceeding anyway")
@@ -3715,25 +3879,27 @@ def _run_import(job_id: str, req: ImportModelRequest):
 
 
 @app.post("/api/models/import")
-def import_model(req: ImportModelRequest):
+def import_model(req: ImportModelRequest, request: Request):
     job_id = str(uuid.uuid4())[:8]
+    _user_payload = _extract_token_payload(request)
+    user_id = _user_payload.get("sub", "") if _user_payload else ""
     with get_db() as conn:
         conn.execute(
             """INSERT INTO jobs
                (id, name, project_id, dataset, training_type, model_name, engine,
                 epochs, batch_size, learning_rate, optimizer, imgsz, notes,
-                status, progress, log, created_at, source, source_url)
-               VALUES (?,?,0,'pretrained',?,?,?,0,0,0,'—',0,?,'queued',0,'',?,?,?)""",
+                status, progress, log, created_at, source, source_url, user_id)
+               VALUES (?,?,0,'pretrained',?,?,?,0,0,0,'—',0,?,'queued',0,'',?,?,?,?)""",
             (
                 job_id, req.name,
                 req.training_type, req.model_name, req.engine,
                 req.notes, time.time(),
-                "imported", req.source_url,
+                "imported", req.source_url, user_id,
             ),
         )
         conn.commit()
 
-    threading.Thread(target=_run_import, args=(job_id, req), daemon=True).start()
+    threading.Thread(target=_run_import, args=(job_id, req, user_id), daemon=True).start()
     return {"job_id": job_id}
 
 
@@ -6373,10 +6539,14 @@ def _log_hf(job_id: str, line: str):
     _hf_import_jobs[job_id]["log"] += f"[{ts}] {line}\n"
 
 
-def _run_hf_import(job_id: str, req: HFImportRequest):
+def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
     import requests as _req
     import boto3 as _boto3
     from botocore.exceptions import ClientError as _CE
+    # Use the submitter's saved HF token (so gated/private dataset repos
+    # are accessible). Falls back to the API process env if absent.
+    _hf_token = _load_user_hf_token(user_id) or os.getenv("HF_TOKEN", "") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+    _hf_headers = {"Authorization": f"Bearer {_hf_token}"} if _hf_token else {}
 
     job = _hf_import_jobs[job_id]
     job["status"] = "running"
@@ -6405,7 +6575,7 @@ def _run_hf_import(job_id: str, req: HFImportRequest):
         # 2. List files from HF dataset repo
         _log_hf(job_id, f"Fetching file tree: huggingface.co/datasets/{req.hf_dataset_id}...")
         tree_url = f"https://huggingface.co/api/datasets/{req.hf_dataset_id}/tree/main"
-        r = _req.get(tree_url, timeout=30)
+        r = _req.get(tree_url, headers=_hf_headers, timeout=30)
         if not r.ok:
             raise Exception(f"HuggingFace API returned HTTP {r.status_code} — dataset not found or is private")
 
@@ -6414,7 +6584,7 @@ def _run_hf_import(job_id: str, req: HFImportRequest):
 
         # If no blobs at root, try data/ subdirectory
         if not blobs:
-            r2 = _req.get(f"{tree_url}/data", timeout=30)
+            r2 = _req.get(f"{tree_url}/data", headers=_hf_headers, timeout=30)
             if r2.ok:
                 blobs += [e for e in r2.json() if e.get("type") == "blob"]
 
@@ -6458,7 +6628,7 @@ def _run_hf_import(job_id: str, req: HFImportRequest):
             _log_hf(job_id, f"↓ [{i+1}/{len(blobs)}] {path}  ({sz_str})")
 
             hf_url = f"https://huggingface.co/datasets/{req.hf_dataset_id}/resolve/main/{path}"
-            dl = _req.get(hf_url, timeout=120)
+            dl = _req.get(hf_url, headers=_hf_headers, timeout=120)
             if not dl.ok:
                 _log_hf(job_id, f"  ⚠ HTTP {dl.status_code} — skipping")
                 continue
@@ -6485,7 +6655,7 @@ def _run_hf_import(job_id: str, req: HFImportRequest):
 
 
 @app.post("/api/datasets/import-hf")
-def import_hf_dataset(req: HFImportRequest):
+def import_hf_dataset(req: HFImportRequest, request: Request):
     import re as _re
     if not _re.match(r"^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$", req.bucket_name):
         raise HTTPException(
@@ -6493,7 +6663,9 @@ def import_hf_dataset(req: HFImportRequest):
             detail="Bucket name: 3–63 lowercase letters/numbers/hyphens, no leading/trailing hyphens",
         )
     if not req.hf_dataset_id.strip():
-        raise HTTPException(status_code=400, detail="HuggingFace dataset ID is required")
+        raise HTTPException(400, detail="HuggingFace dataset ID is required")
+    _user_payload = _extract_token_payload(request)
+    user_id = _user_payload.get("sub", "") if _user_payload else ""
 
     job_id = str(uuid.uuid4())[:8]
     _hf_import_jobs[job_id] = {
@@ -6506,7 +6678,7 @@ def import_hf_dataset(req: HFImportRequest):
         "done_files": 0,
         "total_files": 0,
     }
-    threading.Thread(target=_run_hf_import, args=(job_id, req), daemon=True).start()
+    threading.Thread(target=_run_hf_import, args=(job_id, req, user_id), daemon=True).start()
     return {"job_id": job_id}
 
 
