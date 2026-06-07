@@ -1,7 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useState } from 'react'
 import Dashboard from './pages/Dashboard'
-import TrainModel from './pages/TrainModel'
+import TrainDeepLearning from './pages/TrainDeepLearning'
+import TrainLLM from './pages/TrainLLM'
 import Datasets from './pages/Datasets'
 import Projects from './pages/Projects'
 import Jobs from './pages/Jobs'
@@ -55,7 +56,9 @@ function AppInner() {
             <Route path="/" element={<Navigate to="/projects" replace />} />
             <Route path="/projects"  element={<Projects />} />
             <Route path="/datasets"  element={<Datasets />} />
-            <Route path="/train"     element={<TrainModel />} />
+            <Route path="/train"     element={<Navigate to="/train/deep-learning" replace />} />
+            <Route path="/train/deep-learning" element={<TrainDeepLearning />} />
+            <Route path="/train/llm"  element={<TrainLLM />} />
             <Route path="/jobs"      element={<Jobs />} />
             <Route path="/models"    element={<Models />} />
             <Route path="/dashboard" element={<Dashboard />} />

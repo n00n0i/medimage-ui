@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import {
   FolderSync, Database, Brain, ListChecks, LayoutDashboard,
-  ChevronLeft, ChevronRight, Activity, Server, HardDrive, BrainCircuit, BookOpen, FlaskConical, Zap, Cloud, LogOut, User, Users, UserCircle,
+  ChevronLeft, ChevronRight, Activity, Server, HardDrive, BrainCircuit, BookOpen, FlaskConical, Zap, Cloud, LogOut, User, Users, UserCircle, Cpu, MessageSquare,
 } from 'lucide-react'
 import { useState } from 'react'
 import keycloak from '../keycloak'
@@ -10,7 +10,6 @@ const allNavItems = [
   { to: '/projects',     label: 'Projects',     icon: FolderSync,       adminOnly: false },
   { to: '/datasets',     label: 'Datasets',     icon: Database,         adminOnly: false },
   { to: '/storage',      label: 'Storage',      icon: HardDrive,        adminOnly: false },
-  { to: '/train',        label: 'Train',        icon: Brain,            adminOnly: false },
   { to: '/jobs',         label: 'Jobs',         icon: ListChecks,       adminOnly: false },
   { to: '/models',       label: 'Models',       icon: BrainCircuit,     adminOnly: false },
   { to: '/playground',   label: 'Playground',   icon: FlaskConical,     adminOnly: false },
@@ -21,6 +20,14 @@ const allNavItems = [
   { to: '/status',       label: 'Status',       icon: Activity,         adminOnly: false },
   { to: '/dashboard',    label: 'Dashboard',    icon: LayoutDashboard,  adminOnly: false },
   { to: '/users',        label: 'Users',        icon: Users,            adminOnly: true  },
+]
+
+// Train submenu — separate from the main flat list so we can render
+// it as a parent group with 2 indented children (Deep Learning +
+// Large Language Model) instead of 2 top-level items.
+const trainSubItems = [
+  { to: '/train/deep-learning', label: 'Deep Learning',         icon: Cpu,           adminOnly: false },
+  { to: '/train/llm',            label: 'Large Language Model',  icon: MessageSquare, adminOnly: false },
 ]
 
 interface SidebarProps {
@@ -92,34 +99,89 @@ export default function Sidebar({ onCollapsedChange }: SidebarProps) {
 
       {/* Nav Items */}
       <nav style={{ flex: 1, padding: '12px 10px', display: 'flex', flexDirection: 'column', gap: 3, overflowY: 'auto', overflowX: 'hidden' }}>
-        {navItems.map(({ to, label, icon: Icon }) => (
-          <NavLink
-            key={to}
-            to={to}
-            style={({ isActive }) => ({
-              display: 'flex',
-              alignItems: 'center',
-              gap: 12,
-              padding: collapsed ? '10px 0' : '8px 10px',
-              justifyContent: collapsed ? 'center' : 'flex-start',
-              borderRadius: 8,
-              textDecoration: 'none',
-              transition: 'background 0.12s ease, color 0.12s ease',
-              background: isActive ? 'var(--primary-dim)' : 'transparent',
-              color: isActive ? 'var(--primary-hover)' : 'var(--text-secondary)',
-            })}
-            className="sidebar-nav-item"
-          >
-            <Icon size={17} style={{ flexShrink: 0, color: 'inherit' }} />
-            {!collapsed && (
-              <div style={{ overflow: 'hidden' }}>
-                <div style={{ fontWeight: 500, fontSize: 13.5, color: 'inherit', whiteSpace: 'nowrap' }}>
-                  {label}
+        {navItems.map(({ to, label, icon: Icon }) => {
+          // Inject the Train submenu group right after the
+          // Storage item so the sidebar reads as: Storage,
+          // then "Train → Deep Learning / LLM" as a parent
+          // group, then Jobs / Models / ...
+          const showTrainGroupAfter = to === '/storage'
+          return (
+            <div key={to}>
+              <NavLink
+                to={to}
+                style={({ isActive }) => ({
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: collapsed ? '10px 0' : '8px 10px',
+                  justifyContent: collapsed ? 'center' : 'flex-start',
+                  borderRadius: 8,
+                  textDecoration: 'none',
+                  transition: 'background 0.12s ease, color 0.12s ease',
+                  background: isActive ? 'var(--primary-dim)' : 'transparent',
+                  color: isActive ? 'var(--primary-hover)' : 'var(--text-secondary)',
+                })}
+                className="sidebar-nav-item"
+              >
+                <Icon size={17} style={{ flexShrink: 0, color: 'inherit' }} />
+                {!collapsed && (
+                  <div style={{ overflow: 'hidden' }}>
+                    <div style={{ fontWeight: 500, fontSize: 13.5, color: 'inherit', whiteSpace: 'nowrap' }}>
+                      {label}
+                    </div>
+                  </div>
+                )}
+              </NavLink>
+              {showTrainGroupAfter && (
+                <div style={{ marginTop: 2 }}>
+                  {!collapsed && (
+                    <div style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '6px 10px 4px 10px',
+                      color: 'var(--text-muted)',
+                      fontSize: 11.5, fontWeight: 600,
+                      textTransform: 'uppercase', letterSpacing: '0.06em',
+                    }}>
+                      <Brain size={12} />
+                      <span>Train</span>
+                    </div>
+                  )}
+                  {trainSubItems
+                    .filter(s => !s.adminOnly || isAdmin)
+                    .map(({ to: subTo, label: subLabel, icon: SubIcon }) => (
+                      <NavLink
+                        key={subTo}
+                        to={subTo}
+                        style={({ isActive }) => ({
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          padding: collapsed ? '8px 0' : '6px 10px 6px 28px',
+                          justifyContent: collapsed ? 'center' : 'flex-start',
+                          borderRadius: 8,
+                          textDecoration: 'none',
+                          transition: 'background 0.12s ease, color 0.12s ease',
+                          background: isActive ? 'var(--primary-dim)' : 'transparent',
+                          color: isActive ? 'var(--primary-hover)' : 'var(--text-secondary)',
+                          fontSize: 13,
+                        })}
+                        className="sidebar-nav-item"
+                      >
+                        <SubIcon size={15} style={{ flexShrink: 0, color: 'inherit' }} />
+                        {!collapsed && (
+                          <div style={{ overflow: 'hidden' }}>
+                            <div style={{ fontWeight: 500, fontSize: 13, color: 'inherit', whiteSpace: 'nowrap' }}>
+                              {subLabel}
+                            </div>
+                          </div>
+                        )}
+                      </NavLink>
+                    ))}
                 </div>
-              </div>
-            )}
-          </NavLink>
-        ))}
+              )}
+            </div>
+          )
+        })}
       </nav>
 
       {/* Bottom: Cluster Status + Collapse */}

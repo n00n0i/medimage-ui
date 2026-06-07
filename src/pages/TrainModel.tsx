@@ -227,7 +227,13 @@ function parseRequiredGb(hardware: string): number {
   return m ? parseInt(m[1]) : 0
 }
 
-export default function TrainModel() {
+export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
+  // If a `types` prop is passed, only those training-type cards show
+  // in step 0. Used by the Deep-Learning / LLM wrapper pages so the
+  // sidebar submenus can scope their content without duplicating the
+  // 1480-line form. Default = all six training types (legacy /train).
+  const _allowed: TrainingType[] | null = types && types.length ? types : null
+  const showType = (t: TrainingType) => _allowed === null || _allowed.includes(t)
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const [retrainSource, setRetrainSource] = useState<{ id: string; name: string } | null>(null)
@@ -736,8 +742,7 @@ export default function TrainModel() {
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>เลือกประเภทงานที่ต้องการ — ระบบจะแนะนำ engine และ model ที่เหมาะสม</p>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-            {/* Classification */}
-            <button
+            {showType('classification') && (<button
               onClick={() => { set('trainingType', 'classification'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'classification' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
@@ -758,10 +763,9 @@ export default function TrainModel() {
                 <span>{countForType('classification')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* Object Detection */}
-            <button
+            {showType('detection') && (<button
               onClick={() => { set('trainingType', 'detection'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'detection' ? { borderColor: 'var(--warning)', background: 'var(--warning-dim)' } : {}}
@@ -782,10 +786,9 @@ export default function TrainModel() {
                 <span>{countForType('detection')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* Segmentation */}
-            <button
+            {showType('segmentation') && (<button
               onClick={() => { set('trainingType', 'segmentation'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'segmentation' ? { borderColor: 'var(--success)', background: 'var(--success-dim)' } : {}}
@@ -806,10 +809,9 @@ export default function TrainModel() {
                 <span>{countForType('segmentation')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* VLM Fine-tune */}
-            <button
+            {showType('vlm-finetune') && (<button
               onClick={() => { set('trainingType', 'vlm-finetune'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'vlm-finetune' ? { borderColor: 'var(--info)', background: 'var(--info-dim)' } : {}}
@@ -830,10 +832,9 @@ export default function TrainModel() {
                 <span>GPU 16GB+ required</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* Self-Supervised */}
-            <button
+            {showType('self-supervised') && (<button
               onClick={() => { set('trainingType', 'self-supervised'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'self-supervised' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
@@ -854,10 +855,9 @@ export default function TrainModel() {
                 <span>{countForType('self-supervised')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* LLM Text Fine-tuning */}
-            <button
+            {showType('llm-text') && (<button
               onClick={() => { set('trainingType', 'llm-text'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'llm-text' ? { borderColor: '#8b5cf6', background: 'rgba(139,92,246,0.08)' } : {}}
@@ -878,7 +878,7 @@ export default function TrainModel() {
                 <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>QLoRA 4-bit</span>
                 <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>Unsloth 2x faster</span>
               </div>
-            </button>
+            </button>)}
           </div>
         </div>
       )}
