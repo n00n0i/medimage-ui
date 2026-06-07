@@ -3681,52 +3681,96 @@ def _run_on_ray_cluster(job: dict) -> None:
         _sys.modules["sklearn.metrics"].matthews_corrcoef = None
         class _UndefinedMetricWarning(Warning): pass
         _sys.modules["sklearn.exceptions"].UndefinedMetricWarning = _UndefinedMetricWarning
-        # Stub bitsandbytes' triton integration if a stale bitsandbytes (0.43.x)
-        # got installed. 0.43.x imports `from triton.ops.matmul_perf_model
-        # import early_config_prune, estimate_matmul_time`, but triton 3.0+
-        # removed `triton.ops`. Stubbing the module lets the import succeed
-        # even if pip didn't honor our `bitsandbytes==0.45.0` pin. Same
-        # defense-in-depth pattern as the sklearn stub above.
-        #
-        # IMPORTANT: `triton` itself must be a PACKAGE (have __path__) —
-        # not a bare ModuleType — because code does
-        # `import triton.backends.compiler` and `import triton.language.dtype`
-        # which require it to be navigable as a package. A plain
-        # ModuleType gives "triton is not a package" at the first
-        # `import triton.X` attempt.
+        # Stub triton and any submodules that code might import. The
+        # cluster has a partial triton install (some submodules present,
+        # others like `triton.ops.matmul_perf_model` and `triton.compiler`
+        # missing). Each broken import path goes through
+        # torch._inductor / torch._dynamo / bitsandbytes.triton_based_modules
+        # and crashes. Use a `__getattr__` on the triton root that
+        # lazy-creates any missing submodule stub on demand, so the
+        # next `import triton.X` is handled without us having to
+        # enumerate every possible X.
+        class _TritonRoot(_types.ModuleType):
+            """Stub for the triton package. Any `triton.X` access that
+            doesn't resolve to a real attribute or pre-stubbed submodule
+            creates an empty stub module and caches it in sys.modules.
+            """
+            def __init__(self):
+                super().__init__("triton")
+                self.__path__ = []  # mark as package so `import triton.X` works
+            def __getattr__(self, name):
+                if name.startswith("_") and name not in ("__path__",):
+                    raise AttributeError(name)
+                full = f"triton.{name}"
+                if full not in _sys.modules:
+                    sub = _types.ModuleType(full)
+                    sub.__path__ = []
+                    _sys.modules[full] = sub
+                return _sys.modules[full]
+
         if "triton" not in _sys.modules:
-            _triton_root = _types.ModuleType("triton")
-            _triton_root.__path__ = []   # marks it as a package
-            _sys.modules["triton"] = _triton_root
+            _sys.modules["triton"] = _TritonRoot()
+        else:
+            # triton is already imported but might be a bare module
+            # (no __path__); upgrade it to a package so submodule
+            # imports work. Don't replace the module object itself —
+            # something else might already hold a reference.
+            _existing = _sys.modules["triton"]
+            try:
+                _existing.__path__ = []
+            except (AttributeError, TypeError):
+                pass
+            # Inject our __getattr__ for any missing submodule
+            if not isinstance(_existing, _TritonRoot):
+                _original_getattr = type(_existing).__getattr__
+                def _make_getattr(orig):
+                    def __getattr__(self, name):
+                        if name.startswith("_") and name not in ("__path__",):
+                            return orig(self, name)
+                        try:
+                            return orig(self, name)
+                        except AttributeError:
+                            full = f"triton.{name}"
+                            if full not in _sys.modules:
+                                sub = _types.ModuleType(full)
+                                sub.__path__ = []
+                                _sys.modules[full] = sub
+                            return _sys.modules[full]
+                    return __getattr__
+                try:
+                    type(_existing).__getattr__ = _make_getattr(_original_getattr)
+                except (AttributeError, TypeError):
+                    # Last resort: replace with our stub. We do this
+                    # only if we can't patch the class, because
+                    # replacing breaks any existing reference holders.
+                    _sys.modules["triton"] = _TritonRoot()
+        # Pre-stub the submodules that have known attribute requirements.
+        # The lazy __getattr__ above will also handle any other
+        # `triton.X` we haven't pre-listed, but pre-listing these
+        # is faster (no stub allocation on every access) and lets us
+        # set the specific attributes the callers need.
         for _triton_pkg in ("triton.ops", "triton.ops.matmul_perf_model",
                             "triton.language", "triton.backends",
-                            "triton.backends.compiler"):
+                            "triton.backends.compiler", "triton.compiler",
+                            "triton.compiler.compiler",
+                            "triton.runtime", "triton.testing"):
             if _triton_pkg not in _sys.modules:
                 _sys.modules[_triton_pkg] = _types.ModuleType(_triton_pkg)
+                _sys.modules[_triton_pkg].__path__ = []
         # Pre-set the names bitsandbytes tries to import
         _sys.modules["triton.ops.matmul_perf_model"].early_config_prune = lambda *a, **kw: None
         _sys.modules["triton.ops.matmul_perf_model"].estimate_matmul_time = lambda *a, **kw: 0.0
-        # Stub `triton.language` — torch._dynamo.utils does
-        # `common_constant_types.add(triton.language.dtype)` at import time
-        # (in older torch versions; newer torch pinned a specific triton
-        # version). If triton is missing the `language` submodule (which
-        # is what we have when triton isn't installed and we stub it),
-        # the dynamo import fails. The actual `dtype` value doesn't
-        # matter for our VLM training — we never go through dynamo
-        # tracing. So we just give the stub a `dtype` attribute that
-        # accepts `add()`.
-        if not hasattr(_sys.modules["triton"], "language"):
-            _triton_lang = _types.ModuleType("triton.language")
+        # Stub `triton.language.dtype` — torch._dynamo.utils does
+        # `common_constant_types.add(triton.language.dtype)` at import time.
+        if not hasattr(_sys.modules["triton.language"], "dtype"):
             class _StubDtype:
                 def __repr__(self): return "<stub triton.language.dtype>"
-            _triton_lang.dtype = _StubDtype()
-            _sys.modules["triton.language"] = _triton_lang
-            _sys.modules["triton"].language = _triton_lang
-        # Pre-register triton.backends.compiler and friends as attrs on
-        # the triton package, so `from triton.backends.compiler import X`
-        # finds the stubbed submodule via attribute lookup.
-        _sys.modules["triton"].ops = _sys.modules["triton.ops"]
-        _sys.modules["triton"].backends = _sys.modules["triton.backends"]
+            _sys.modules["triton.language"].dtype = _StubDtype()
+        # Pre-register submodule attrs on the triton package so attribute
+        # access (triton.ops, triton.backends) finds the stubs.
+        for _sub_name in ("ops", "language", "backends", "compiler", "runtime", "testing"):
+            if not hasattr(_sys.modules["triton"], _sub_name):
+                setattr(_sys.modules["triton"], _sub_name, _sys.modules[f"triton.{_sub_name}"])
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
