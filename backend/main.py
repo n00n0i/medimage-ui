@@ -3707,13 +3707,19 @@ def _run_on_ray_cluster(job: dict) -> None:
             def __init__(self, name):
                 super().__init__(name)
                 self.__path__ = []
+            def __call__(self, *args, **kwargs):
+                # Must be on the CLASS, not the instance — setting
+                # `__call__` on a ModuleType instance is a no-op
+                # because ModuleType uses slot descriptors for its
+                # attributes. Class-level __call__ makes every instance
+                # of _TritonLazyPackage callable.
+                return self
             def __getattr__(self, name):
                 if name.startswith("_") and name not in ("__path__",):
                     raise AttributeError(name)
                 full = f"{self.__name__}.{name}"
                 if full not in _sys.modules:
                     sub = _TritonLazyPackage(full)
-                    sub.__call__ = lambda *a, **kw: sub  # triton.Config(...) -> sub
                     _sys.modules[full] = sub
                 return _sys.modules[full]
 
