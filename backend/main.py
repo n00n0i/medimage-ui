@@ -2636,24 +2636,17 @@ def main():
         print("[train] Complete!")
         return
 
-    # 3-VLM. Unsloth VLM fine-tuning (Qwen2-VL, LLaVA, Pixtral, Llama-3.2-Vision)
-    if engine == "Unsloth" and training_type == "vlm-finetune":
+    # 3-VLM. All VLM training goes through Unsloth (engine=Unsloth, HuggingFace,
+    # or LLaVA all route here). Unsloth pins compatible
+    # transformers/peft/bitsandbytes versions, avoiding the bare-HF
+    # version-conflict class of bugs (peft 0.11+ needing
+    # transformers >=4.45 for EncoderDecoderCache, etc.) and the
+    # numpy/pandas ABI mismatch on this Ray cluster. Models unsloth doesn't
+    # support raise a clear error from FastVisionModel.from_pretrained.
+    if training_type == "vlm-finetune":
         if not text_dataset:
             raise RuntimeError("TEXT_DATASET env var is required for VLM fine-tuning")
         train_unsloth_vlm(
-            model_name, text_dataset, max_seq_len, lora_rank, quantization,
-            epochs, batch, grad_accum, lr, chat_template,
-            job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
-        )
-        print("[train] Complete!")
-        return
-
-    # 3-VLM. HuggingFace VLM fine-tuning — fallback for VLMs unsloth doesn't
-    # support (InternVL2, MedGemma, SmolVLM, etc.). Bare transformers+peft
-    # install is pinned to versions that don't fight each other on the
-    # Ray cluster.
-    if training_type == "vlm-finetune":
-        train_vlm_finetune(
             model_name, text_dataset, max_seq_len, lora_rank, quantization,
             epochs, batch, grad_accum, lr, chat_template,
             job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
@@ -3318,16 +3311,16 @@ def _run_on_ray_cluster(job: dict) -> None:
         pip_pkgs = ["segment-anything", "monai>=1.3", "nibabel", "boto3>=1.34", "Pillow"]
     elif engine == "nnU-Net":
         pip_pkgs = ["nnunetv2", "nibabel", "boto3>=1.34", "Pillow"]
-    elif engine == "Unsloth" and training_type == "vlm-finetune":
-        # Unsloth pins compatible transformers/peft/bitsandbytes internally, so
-        # we avoid the version-conflict class of bugs (peft 0.11+ needs
+    elif training_type == "vlm-finetune":
+        # All VLM training uses Unsloth (see main() routing). Unsloth pins
+        # compatible transformers/peft/bitsandbytes internally, so we avoid
+        # the version-conflict class of bugs (peft 0.11+ needing
         # transformers >=4.45 for EncoderDecoderCache, etc.) and the
-        # numpy/pandas ABI mismatch on this Ray cluster. Same trade-off as
-        # the LLM Unsloth path above.
+        # numpy/pandas ABI mismatch on this Ray cluster.
         pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
     elif engine == "Unsloth":
         pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
-    elif engine == "HuggingFace" or training_type == "vlm-finetune":
+    elif engine == "HuggingFace":
         # numpy<2.0 keeps ABI compatibility with the cluster's pre-installed
         # pandas (built against numpy 1.x dtype size 96). Without the pin, the
         # transformers/datasets deps pull numpy 2.x (size 88) and break
