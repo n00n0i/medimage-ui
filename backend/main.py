@@ -3541,15 +3541,56 @@ def _run_on_ray_cluster(job: dict) -> None:
         # find any torch accelerator? You need a GPU." at import time if
         # torch.cuda.is_available() is False. A previous run's pip install
         # may have upgraded torch to a version that doesn't match the
-        # cluster's CUDA driver. Force-reinstall torch==2.1.2 (matches the
-        # CUDA 11.8 / 12.1 drivers ultralytics has been using on this
-        # cluster) BEFORE the training script exec, so the script's first
-        # `import torch` loads the fresh version cleanly. Doing it here in
-        # the _run_training_inline process (where torch hasn't been
-        # imported yet) is essential — torch's C extension registers
-        # global state on first load and can't be reloaded in-process
-        # (causes "function '_has_torch_function' already has a docstring").
+        # cluster's CUDA driver. Detect the driver version from nvidia-smi
+        # and install the matching torch +cu build, BEFORE the training
+        # script exec, so the script's first `import torch` loads the
+        # fresh version cleanly. Doing it here in the _run_training_inline
+        # process (where torch hasn't been imported yet) is essential —
+        # torch's C extension registers global state on first load and
+        # can't be reloaded in-process (causes "function '_has_torch_function'
+        # already has a docstring").
         if any("unsloth" in p for p in _pip_pkgs_for_worker):
+            # Detect driver version from nvidia-smi. The driver supports
+            # CUDA up to a certain version (e.g. "CUDA Version: 12.1" means
+            # the driver can run CUDA 12.1 or older torch wheels). PyTorch
+            # wheels are tagged +cuXYZ (cu117, cu118, cu121, ...). Pick the
+            # highest cu wheel whose version is <= the driver's reported
+            # max CUDA.
+            import re as _re
+            _smi_out = _sp.run(
+                ["bash", "-lc",
+                 "nvidia-smi 2>&1 | head -20 || echo 'nvidia-smi not available'"],
+                capture_output=True, text=True, timeout=10,
+            )
+            _smi_text = (_smi_out.stdout or "") + (_smi_out.stderr or "")
+            print(f"[cluster] nvidia-smi:\n{_smi_text}",
+                  file=_sys.stderr)
+            _driver_match = _re.search(
+                r"CUDA Version:\s*(\d+)\.(\d+)", _smi_text)
+            if _driver_match:
+                _drv_major = int(_driver_match.group(1))
+                _drv_minor = int(_driver_match.group(2))
+            else:
+                # Fall back to a safe default — CUDA 11.8 covers most clusters
+                _drv_major, _drv_minor = 11, 8
+            # Map (major, minor) -> torch +cu tag. We pick the highest cu
+            # version that's <= the driver, capped at cu121 (newest 2.1.x).
+            # cu117 = CUDA 11.7, cu118 = CUDA 11.8, cu121 = CUDA 12.1.
+            if _drv_major >= 12 and _drv_minor >= 1:
+                _torch_cu = "cu121"
+            elif _drv_major >= 12:
+                _torch_cu = "cu118"  # 12.0 driver can still run cu118 wheels
+            elif _drv_major == 11 and _drv_minor >= 8:
+                _torch_cu = "cu118"
+            elif _drv_major == 11 and _drv_minor >= 7:
+                _torch_cu = "cu117"
+            else:
+                _torch_cu = "cu117"
+            _torch_ver = "2.1.2"
+            _torch_pin = f"torch=={_torch_ver}+{_torch_cu}"
+            print(f"[cluster] driver CUDA {_drv_major}.{_drv_minor} -> "
+                  f"installing {_torch_pin}",
+                  file=_sys.stderr)
             _gpu_check = _sp.run(
                 [_sys.executable, "-c",
                  "import torch; import sys; "
@@ -3558,11 +3599,11 @@ def _run_on_ray_cluster(job: dict) -> None:
             )
             if _gpu_check.returncode != 0:
                 print(f"[cluster] ⚠ torch cannot see GPU — "
-                      f"force-reinstalling torch==2.1.2 ...",
+                      f"force-reinstalling {_torch_pin} ...",
                       file=_sys.stderr)
                 _sp.run(
                     [_sys.executable, "-m", "pip", "install", "-q",
-                     "--force-reinstall", "torch==2.1.2"],
+                     "--force-reinstall", _torch_pin],
                     capture_output=True, text=True, timeout=600,
                 )
                 # Sanity check the new torch in a fresh subprocess
@@ -3577,11 +3618,13 @@ def _run_on_ray_cluster(job: dict) -> None:
                       file=_sys.stderr)
                 if _gpu_recheck.returncode != 0:
                     raise RuntimeError(
-                        f"torch reinstall succeeded but GPU still not visible. "
+                        f"torch reinstall ({_torch_pin}) succeeded but GPU "
+                        f"still not visible. "
                         f"stdout: {_gpu_recheck.stdout[:300]!r} "
                         f"stderr: {_gpu_recheck.stderr[:300]!r}. "
-                        f"This Ray worker may not have a GPU, or its CUDA driver "
-                        f"is too old for torch 2.1.2."
+                        f"This Ray worker may not have a GPU, or its CUDA "
+                        f"driver is too old for the {_torch_cu} build of "
+                        f"torch {_torch_ver}. nvidia-smi output is above."
                     )
         # Stub sklearn submodules BEFORE exec'ing the script. The transformers
         # Trainer import chain pulls sklearn -> pandas, and on this cluster
