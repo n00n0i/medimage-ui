@@ -3583,7 +3583,8 @@ def _run_on_ray_cluster(job: dict) -> None:
         #   transformers==4.45.2  has EncoderDecoderCache
         #   peft<0.11             last 0.10.x; doesn't import EncoderDecoderCache
         #   accelerate==0.34.2
-        #   bitsandbytes==0.43.3
+        #   bitsandbytes==0.45.0   removed the triton.ops import that
+        #                           0.43.x had (broken on newer triton)
         #   datasets==2.18.0
         #   numpy<2.0             keeps pandas 1.x ABI on this cluster
         # We deliberately do NOT install torch — the cluster's pre-installed
@@ -3594,7 +3595,7 @@ def _run_on_ray_cluster(job: dict) -> None:
             "transformers==4.45.2",
             "peft<0.11",
             "accelerate==0.34.2",
-            "bitsandbytes==0.43.3",
+            "bitsandbytes==0.45.0",
             "datasets==2.18.0",
             "boto3>=1.34",
             "Pillow",
@@ -3680,6 +3681,18 @@ def _run_on_ray_cluster(job: dict) -> None:
         _sys.modules["sklearn.metrics"].matthews_corrcoef = None
         class _UndefinedMetricWarning(Warning): pass
         _sys.modules["sklearn.exceptions"].UndefinedMetricWarning = _UndefinedMetricWarning
+        # Stub bitsandbytes' triton integration if a stale bitsandbytes (0.43.x)
+        # got installed. 0.43.x imports `from triton.ops.matmul_perf_model
+        # import early_config_prune, estimate_matmul_time`, but triton 3.0+
+        # removed `triton.ops`. Stubbing the module lets the import succeed
+        # even if pip didn't honor our `bitsandbytes==0.45.0` pin. Same
+        # defense-in-depth pattern as the sklearn stub above.
+        for _triton_pkg in ("triton", "triton.ops", "triton.ops.matmul_perf_model"):
+            if _triton_pkg not in _sys.modules:
+                _sys.modules[_triton_pkg] = _types.ModuleType(_triton_pkg)
+        # Pre-set the names bitsandbytes tries to import
+        _sys.modules["triton.ops.matmul_perf_model"].early_config_prune = lambda *a, **kw: None
+        _sys.modules["triton.ops.matmul_perf_model"].estimate_matmul_time = lambda *a, **kw: 0.0
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
