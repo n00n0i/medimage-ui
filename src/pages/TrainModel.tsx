@@ -102,13 +102,20 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   ],
 
   // ── VLM Fine-tuning ───────────────────────────────────────────────────────────
+  // All VLM models go through the Unsloth path on the backend. Unsloth pins
+  // compatible transformers/peft/bitsandbytes versions, so we avoid the
+  // bare-HF version-conflict class of bugs and the numpy/pandas ABI mismatch
+  // on the Ray cluster. Unsloth supports Qwen2-VL, LLaVA, Pixtral, and
+  // Llama-3.2-Vision; for models unsloth doesn't have a pre-built
+  // bnb-4bit version of, we still pass the original model id and unsloth
+  // tries to load it (will raise a clear error if unsupported).
   'vlm-finetune': [
-    { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'LLaVA',      model: 'llava-v1.6-mistral-7b',          hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: false },
-    { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',   engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit', hardware: 'GPU 16GB+', description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: false },
-    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'HuggingFace', model: 'OpenGVLab/InternVL2-8B',        hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: false },
-    { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'HuggingFace', model: 'google/paligemma2-3b-pt-448',   hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: false },
-    { value: 'medgemma-4b', label: 'MedGemma-4B-IT',          engine: 'HuggingFace', model: 'google/medgemma-4b-it',         hardware: 'GPU 12GB+',  description: 'Google medical VLM — pre-trained บน medical images & text, ดีสำหรับ radiology, pathology, dermatology', compatible: true  },
-    { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'HuggingFace', model: 'HuggingFaceTB/SmolVLM-500M-Instruct', hardware: 'GPU 6GB+', description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
+    { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'Unsloth',    model: 'unsloth/llava-v1.6-mistral-7b-bnb-4bit',  hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: true  },
+    { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',    engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit',   hardware: 'GPU 16GB+',  description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: true  },
+    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'Unsloth',    model: 'unsloth/InternVL2-8B-bnb-4bit',           hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: false },
+    { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'Unsloth',    model: 'unsloth/paligemma2-3b-pt-448-bnb-4bit',  hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: true  },
+    { value: 'medgemma-4b', label: 'MedGemma-4B-IT',          engine: 'Unsloth',    model: 'unsloth/medgemma-4b-it-bnb-4bit',         hardware: 'GPU 12GB+',  description: 'Google medical VLM — pre-trained บน medical images & text, ดีสำหรับ radiology, pathology, dermatology', compatible: true  },
+    { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'Unsloth',    model: 'HuggingFaceTB/SmolVLM-500M-Instruct',     hardware: 'GPU 6GB+',   description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
   ],
 
   // ── Self-supervised / SSL ────────────────────────────────────────────────────

@@ -2408,6 +2408,140 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
     print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
 
 
+def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantization,
+                       epochs, batch, grad_accum, lr, chat_template, job_id,
+                       w_bucket, w_key, minio_url, minio_access, minio_secret,
+                       img_dir=None):
+    """Fine-tune a Vision Language Model via Unsloth's FastVisionModel.
+
+    Why unsloth instead of the bare transformers+peft path: unsloth pins
+    compatible versions of transformers / peft / bitsandbytes internally, so
+    we avoid the version-conflict class of bugs (peft 0.11+ needs
+    transformers >=4.45 for EncoderDecoderCache, etc.) and the numpy/pandas
+    ABI mismatch on this Ray cluster. Same trade-off as the LLM path.
+
+    Supported models: Qwen2-VL, LLaVA 1.5/1.6, Pixtral, Llama-3.2-Vision,
+    Gemma-3 vision. Models unsloth doesn't support (InternVL2, MedGemma,
+    SmolVLM) raise a clear error from FastVisionModel.from_pretrained.
+    """
+    from unsloth import FastVisionModel
+    from trl import SFTTrainer, SFTConfig
+    from datasets import load_dataset, Dataset as HFDataset
+    import torch as _torch
+    import zipfile as _zf, glob as _glob
+    from PIL import Image as _Image
+    import io as _io, base64 as _b64
+
+    print(f"[train] Unsloth VLM — model: {model_name}  lora_r={lora_rank}  4bit={quantization in ('4bit','4-bit','bnb-4bit')}")
+    load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
+
+    # Load model + processor. For VLMs, FastVisionModel returns (model, processor)
+    # where the processor handles both text tokenization and image preprocessing.
+    model, processor = FastVisionModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_len,
+        load_in_4bit=load_in_4bit,
+    )
+    model = FastVisionModel.get_peft_model(
+        model,
+        r=lora_rank,
+        lora_alpha=lora_rank * 2,
+        target_modules="all-linear",
+        lora_dropout=0.05,
+        bias="none",
+        random_state=3407,
+    )
+
+    # Load dataset (HF dataset id, local path, or raw JSONL)
+    print(f"[train] Loading dataset: {text_dataset}")
+    try:
+        ds = load_dataset(text_dataset, split="train")
+    except Exception as e:
+        print(f"[warn] HF load failed ({e}), trying as JSONL")
+        import json as _json
+        rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
+        ds = HFDataset.from_list(rows)
+
+    # Index local images for path-based references in the dataset
+    local_imgs = {}
+    if img_dir and os.path.isdir(img_dir):
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+            for p in _glob.glob(os.path.join(img_dir, "**", ext), recursive=True):
+                local_imgs[os.path.basename(p)] = p
+
+    def _resolve_image(raw):
+        if raw is None:
+            return None
+        if isinstance(raw, _Image.Image):
+            return raw.convert("RGB")
+        if isinstance(raw, str):
+            if raw.startswith("data:"):
+                _, data = raw.split(",", 1)
+                return _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
+            if raw in local_imgs:
+                return _Image.open(local_imgs[raw]).convert("RGB")
+            # try as direct path under img_dir
+            for ext in ("", ".jpg", ".jpeg", ".png", ".webp"):
+                cand = os.path.join(img_dir or "", raw + ext) if img_dir else ""
+                if cand and os.path.isfile(cand):
+                    return _Image.open(cand).convert("RGB")
+        return None
+
+    def to_conversation(example):
+        instr = example.get("text") or example.get("instruction") or ""
+        out   = example.get("output") or example.get("response") or ""
+        img   = _resolve_image(example.get("image"))
+        if img is None:
+            # placeholder — keeps the conversation well-formed even when
+            # image references are missing, so training doesn't crash.
+            img = _Image.new("RGB", (224, 224), (128, 128, 128))
+        user_content = [{"type": "image"}, {"type": "text", "text": instr}]
+        return {
+            "messages": [
+                {"role": "user",      "content": user_content},
+                {"role": "assistant", "content": [{"type": "text", "text": out}]},
+            ],
+            "images": [img],
+        }
+
+    print(f"[train] Converting {len(ds)} examples to conversation format ...")
+    ds = ds.map(to_conversation, remove_columns=ds.column_names)
+
+    save_dir = f"/tmp/vlm_{job_id}"
+    trainer = SFTTrainer(
+        model=model,
+        processing_class=processor,
+        train_dataset=ds,
+        args=SFTConfig(
+            output_dir=save_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=lr,
+            fp16=not _torch.cuda.is_bf16_supported(),
+            bf16=_torch.cuda.is_bf16_supported(),
+            logging_steps=10,
+            save_strategy="no",
+            max_length=max_seq_len,
+            dataloader_num_workers=0,
+            remove_unused_columns=False,
+        ),
+    )
+    trainer.train()
+
+    print("[train] Unsloth VLM training complete. Saving LoRA adapter ...")
+    model.save_pretrained(save_dir)
+    processor.save_pretrained(save_dir)
+
+    zip_path = f"/tmp/vlm_{job_id}.zip"
+    with _zf.ZipFile(zip_path, "w", _zf.ZIP_DEFLATED) as zf:
+        for fp in Path(save_dir).rglob("*"):
+            if fp.is_file():
+                zf.write(fp, fp.relative_to(save_dir))
+    upload_to_minio(zip_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
+    print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
+
+
 def train_ultralytics(yaml_path, data_dir, model_name, training_type, epochs, imgsz, batch, lr, optimizer, job_id, w_bucket, w_key, minio_url, minio_access, minio_secret):
     """Train detection / segmentation / YOLO-cls model with ultralytics."""
     import sys, types as _types
@@ -2491,7 +2625,7 @@ def main():
 
     # ── Engines that do NOT need an image dataset zip ─────────────────────────
     # 3-LLM. Unsloth LLM fine-tuning
-    if engine == "Unsloth":
+    if engine == "Unsloth" and training_type != "vlm-finetune":
         if not text_dataset:
             raise RuntimeError("TEXT_DATASET env var is required for LLM fine-tuning")
         train_unsloth_llm(
@@ -2502,7 +2636,22 @@ def main():
         print("[train] Complete!")
         return
 
-    # 3-VLM. HuggingFace VLM fine-tuning (LLaVA-style)
+    # 3-VLM. Unsloth VLM fine-tuning (Qwen2-VL, LLaVA, Pixtral, Llama-3.2-Vision)
+    if engine == "Unsloth" and training_type == "vlm-finetune":
+        if not text_dataset:
+            raise RuntimeError("TEXT_DATASET env var is required for VLM fine-tuning")
+        train_unsloth_vlm(
+            model_name, text_dataset, max_seq_len, lora_rank, quantization,
+            epochs, batch, grad_accum, lr, chat_template,
+            job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
+        )
+        print("[train] Complete!")
+        return
+
+    # 3-VLM. HuggingFace VLM fine-tuning — fallback for VLMs unsloth doesn't
+    # support (InternVL2, MedGemma, SmolVLM, etc.). Bare transformers+peft
+    # install is pinned to versions that don't fight each other on the
+    # Ray cluster.
     if training_type == "vlm-finetune":
         train_vlm_finetune(
             model_name, text_dataset, max_seq_len, lora_rank, quantization,
@@ -3169,6 +3318,13 @@ def _run_on_ray_cluster(job: dict) -> None:
         pip_pkgs = ["segment-anything", "monai>=1.3", "nibabel", "boto3>=1.34", "Pillow"]
     elif engine == "nnU-Net":
         pip_pkgs = ["nnunetv2", "nibabel", "boto3>=1.34", "Pillow"]
+    elif engine == "Unsloth" and training_type == "vlm-finetune":
+        # Unsloth pins compatible transformers/peft/bitsandbytes internally, so
+        # we avoid the version-conflict class of bugs (peft 0.11+ needs
+        # transformers >=4.45 for EncoderDecoderCache, etc.) and the
+        # numpy/pandas ABI mismatch on this Ray cluster. Same trade-off as
+        # the LLM Unsloth path above.
+        pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
     elif engine == "Unsloth":
         pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
     elif engine == "HuggingFace" or training_type == "vlm-finetune":
