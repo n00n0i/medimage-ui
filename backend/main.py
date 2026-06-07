@@ -2432,36 +2432,23 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     Gemma-3 vision. Models unsloth doesn't support (InternVL2, MedGemma,
     SmolVLM) raise a clear error from FastVisionModel.from_pretrained.
     """
-    from unsloth import FastVisionModel
-    from trl import SFTTrainer, SFTConfig
-    from datasets import load_dataset, Dataset as HFDataset
-    import torch as _torch
-    import zipfile as _zf, glob as _glob, tempfile as _tf, json as _json
-    from PIL import Image as _Image
-    import io as _io, base64 as _b64
-    import requests as _req
-
     print(f"[train] Unsloth VLM — model: {model_name}  lora_r={lora_rank}  4bit={quantization in ('4bit','4-bit','bnb-4bit')}")
-    # Diagnostic: print torch + CUDA + Ray worker info BEFORE unsloth import.
-    # unsloth_zoo calls torch.cuda.is_available() (and friends) at import
-    # time and raises a hard error if it doesn't find a GPU. If this prints
-    # a torch version that doesn't see the GPU, the pip install above
-    # upgraded torch to one that doesn't match the cluster's CUDA driver.
-    try:
-        import torch as _torch_diag
-        print(f"[train]   torch={_torch_diag.__version__}  "
-              f"cuda_available={_torch_diag.cuda.is_available()}  "
-              f"cuda_version={_torch_diag.version.cuda}  "
-              f"device_count={_torch_diag.cuda.device_count()}")
-        if _torch_diag.cuda.is_available():
-            for _di in range(_torch_diag.cuda.device_count()):
-                print(f"[train]   device[{_di}]={_torch_diag.cuda.get_device_name(_di)}")
-    except Exception as _diag_err:
-        print(f"[train]   torch diagnostic failed: {_diag_err}")
-    # Also print the worker's hostname + visible nvidia devices, so we can
-    # tell whether the Ray worker is the same host that ultralytics has
-    # been running on, and whether NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES
-    # are set to something unexpected.
+    # Diagnostic: print torch + CUDA + Ray worker info BEFORE the unsloth
+    # import. unsloth_zoo calls torch.cuda.is_available() at import time
+    # and raises a hard error if it doesn't see a GPU. If this prints a
+    # torch that doesn't see the GPU, a previous run's pip install must
+    # have upgraded torch to a version that no longer matches the
+    # cluster's CUDA driver. The diagnostic runs *first* (before the
+    # unsloth import) so we always see the output even when the import
+    # itself fails.
+    import torch as _torch_diag
+    print(f"[train]   torch={_torch_diag.__version__}  "
+          f"cuda_available={_torch_diag.cuda.is_available()}  "
+          f"cuda_version={_torch_diag.version.cuda}  "
+          f"device_count={_torch_diag.cuda.device_count()}")
+    if _torch_diag.cuda.is_available():
+        for _di in range(_torch_diag.cuda.device_count()):
+            print(f"[train]   device[{_di}]={_torch_diag.cuda.get_device_name(_di)}")
     import socket as _sock
     print(f"[train]   hostname={_sock.gethostname()}  "
           f"NVIDIA_VISIBLE_DEVICES={_os.environ.get('NVIDIA_VISIBLE_DEVICES', '(unset)')}  "
@@ -2473,6 +2460,41 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     for _ln in (_sp_diag.stdout or "").splitlines():
         if _ln.strip():
             print(f"[train]   nvidia-smi: {_ln.strip()}")
+    # If torch can't see the GPU, a previous pip install (an early
+    # unsloth attempt without --no-deps) likely upgraded torch to a
+    # version that doesn't match the cluster's CUDA driver. Force-
+    # reinstall torch to a known-good version. We pick 2.1.2 because
+    # it's the latest 2.1.x and works with the CUDA 11.8 / 12.1 drivers
+    # the Ray cluster has been using for ultralytics.
+    if not _torch_diag.cuda.is_available():
+        print(f"[train]   ⚠ torch cannot see GPU — force-reinstalling torch==2.1.2 ...")
+        _sp.run(
+            [_sys.executable, "-m", "pip", "install", "-q",
+             "--force-reinstall", "torch==2.1.2"],
+            capture_output=True,
+        )
+        # Re-import torch so unsloth_zoo sees the new version
+        import importlib
+        importlib.reload(_torch_diag)
+        print(f"[train]   after reinstall: torch={_torch_diag.__version__}  "
+              f"cuda_available={_torch_diag.cuda.is_available()}  "
+              f"device_count={_torch_diag.cuda.device_count()}")
+        if not _torch_diag.cuda.is_available():
+            raise RuntimeError(
+                f"torch {_torch_diag.__version__} still cannot see a GPU on "
+                f"hostname={_sock.gethostname()}. nvidia-smi output above shows "
+                f"what the kernel sees. This Ray worker is either on a different "
+                f"host than the GPU, or the cluster's CUDA driver is too old for "
+                f"torch 2.1.2. Check the diagnostic output above."
+            )
+    from unsloth import FastVisionModel
+    from trl import SFTTrainer, SFTConfig
+    from datasets import load_dataset, Dataset as HFDataset
+    import torch as _torch
+    import zipfile as _zf, glob as _glob, tempfile as _tf, json as _json
+    from PIL import Image as _Image
+    import io as _io, base64 as _b64
+    import requests as _req
     load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
 
     # Load model + processor. For VLMs, FastVisionModel returns (model, processor)
