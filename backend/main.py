@@ -3530,59 +3530,59 @@ def _run_on_ray_cluster(job: dict) -> None:
                  "--no-deps", "unsloth"],
                 capture_output=True,
             )
-    # Install required packages directly — avoids the virtualenv requirement
-    if _pip_pkgs_for_worker:
-        _sp.run(
-            [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
-            capture_output=True,
-        )
-    # Pre-flight: if unsloth is in the install list, verify that the
-    # worker's torch can see a GPU. unsloth_zoo raises "Unsloth cannot
-    # find any torch accelerator? You need a GPU." at import time if
-    # torch.cuda.is_available() is False. A previous run's pip install
-    # may have upgraded torch to a version that doesn't match the
-    # cluster's CUDA driver. Force-reinstall torch==2.1.2 (matches the
-    # CUDA 11.8 / 12.1 drivers ultralytics has been using on this
-    # cluster) BEFORE the training script exec, so the script's first
-    # `import torch` loads the fresh version cleanly. Doing it here in
-    # the _run_training_inline process (where torch hasn't been
-    # imported yet) is essential — torch's C extension registers
-    # global state on first load and can't be reloaded in-process
-    # (causes "function '_has_torch_function' already has a docstring").
-    if any("unsloth" in p for p in _pip_pkgs_for_worker):
-        _gpu_check = _sp.run(
-            [_sys.executable, "-c",
-             "import torch; import sys; "
-             "sys.exit(0 if torch.cuda.is_available() else 1)"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if _gpu_check.returncode != 0:
-            print(f"[cluster] ⚠ torch cannot see GPU — "
-                  f"force-reinstalling torch==2.1.2 ...",
-                  file=_sys.stderr)
+        # Install required packages directly — avoids the virtualenv requirement
+        if _pip_pkgs_for_worker:
             _sp.run(
-                [_sys.executable, "-m", "pip", "install", "-q",
-                 "--force-reinstall", "torch==2.1.2"],
-                capture_output=True, text=True, timeout=600,
+                [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
+                capture_output=True,
             )
-            # Sanity check the new torch in a fresh subprocess
-            _gpu_recheck = _sp.run(
+        # Pre-flight: if unsloth is in the install list, verify that the
+        # worker's torch can see a GPU. unsloth_zoo raises "Unsloth cannot
+        # find any torch accelerator? You need a GPU." at import time if
+        # torch.cuda.is_available() is False. A previous run's pip install
+        # may have upgraded torch to a version that doesn't match the
+        # cluster's CUDA driver. Force-reinstall torch==2.1.2 (matches the
+        # CUDA 11.8 / 12.1 drivers ultralytics has been using on this
+        # cluster) BEFORE the training script exec, so the script's first
+        # `import torch` loads the fresh version cleanly. Doing it here in
+        # the _run_training_inline process (where torch hasn't been
+        # imported yet) is essential — torch's C extension registers
+        # global state on first load and can't be reloaded in-process
+        # (causes "function '_has_torch_function' already has a docstring").
+        if any("unsloth" in p for p in _pip_pkgs_for_worker):
+            _gpu_check = _sp.run(
                 [_sys.executable, "-c",
-                 "import torch, sys; "
-                 "print(f\"torch={torch.__version__} cuda_avail={torch.cuda.is_available()} devices={torch.cuda.device_count()}\", file=sys.stderr); "
+                 "import torch; import sys; "
                  "sys.exit(0 if torch.cuda.is_available() else 1)"],
                 capture_output=True, text=True, timeout=60,
             )
-            print(_gpu_recheck.stderr.strip() or "(no output)",
-                  file=_sys.stderr)
-            if _gpu_recheck.returncode != 0:
-                raise RuntimeError(
-                    f"torch reinstall succeeded but GPU still not visible. "
-                    f"stdout: {_gpu_recheck.stdout[:300]!r} "
-                    f"stderr: {_gpu_recheck.stderr[:300]!r}. "
-                    f"This Ray worker may not have a GPU, or its CUDA driver "
-                    f"is too old for torch 2.1.2."
+            if _gpu_check.returncode != 0:
+                print(f"[cluster] ⚠ torch cannot see GPU — "
+                      f"force-reinstalling torch==2.1.2 ...",
+                      file=_sys.stderr)
+                _sp.run(
+                    [_sys.executable, "-m", "pip", "install", "-q",
+                     "--force-reinstall", "torch==2.1.2"],
+                    capture_output=True, text=True, timeout=600,
                 )
+                # Sanity check the new torch in a fresh subprocess
+                _gpu_recheck = _sp.run(
+                    [_sys.executable, "-c",
+                     "import torch, sys; "
+                     "print(f\"torch={torch.__version__} cuda_avail={torch.cuda.is_available()} devices={torch.cuda.device_count()}\", file=sys.stderr); "
+                     "sys.exit(0 if torch.cuda.is_available() else 1)"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                print(_gpu_recheck.stderr.strip() or "(no output)",
+                      file=_sys.stderr)
+                if _gpu_recheck.returncode != 0:
+                    raise RuntimeError(
+                        f"torch reinstall succeeded but GPU still not visible. "
+                        f"stdout: {_gpu_recheck.stdout[:300]!r} "
+                        f"stderr: {_gpu_recheck.stderr[:300]!r}. "
+                        f"This Ray worker may not have a GPU, or its CUDA driver "
+                        f"is too old for torch 2.1.2."
+                    )
         # Stub sklearn submodules BEFORE exec'ing the script. The transformers
         # Trainer import chain pulls sklearn -> pandas, and on this cluster
         # pandas._libs can fail with a numpy ABI mismatch
