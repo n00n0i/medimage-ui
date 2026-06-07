@@ -3194,6 +3194,19 @@ def _run_on_ray_cluster(job: dict) -> None:
     def _run_training_inline(script_b64_arg: str, env_vars_arg: dict) -> dict:
         import os as _os, base64 as _b64, sys as _sys, subprocess as _sp, types as _types
         from io import StringIO as _StringIO
+        # Force numpy to a 1.x version FIRST. Without --force-reinstall, pip's
+        # resolver can leave a numpy 2.x in place from a previous run (since
+        # the other deps in pip_pkgs don't directly require numpy, pip sees
+        # the existing 2.x as "already satisfied"). The pre-installed pandas
+        # was built for numpy 1.x ABI (dtype size 96), so any later import of
+        # pandas._libs will crash with "numpy.dtype size changed" until numpy
+        # is back on 1.x. This explicit reinstall runs before the other
+        # packages so its resolved version sticks.
+        _sp.run(
+            [_sys.executable, "-m", "pip", "install", "-q",
+             "--force-reinstall", "numpy<2.0"],
+            capture_output=True,
+        )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
             _sp.run(
@@ -3207,15 +3220,35 @@ def _run_on_ray_cluster(job: dict) -> None:
         # VLM/HF training paths don't actually need sklearn metrics, so
         # pre-stubbing them lets transformers import succeed even if a future
         # package install clobbers the numpy ABI. Idempotent.
-        for _m in ("sklearn", "sklearn.metrics", "sklearn.utils",
+        #
+        # The top-level "sklearn" stub MUST have a real __spec__ (not None) —
+        # transformers.utils.import_utils line 153 does
+        #     _sklearn_available = importlib.util.find_spec("sklearn") is not None
+        # and find_spec reads sys.modules[name].__spec__. A bare types.ModuleType
+        # has __spec__=None which makes find_spec raise ValueError instead of
+        # returning None. Use importlib.machinery.ModuleSpec to give it a real
+        # spec with submodule_search_locations so `import sklearn.metrics`
+        # resolves to our stubbed submodule.
+        import importlib.machinery as _imm
+        _sklearn_spec = _imm.ModuleSpec("sklearn", None, is_package=True)
+        _sklearn_spec.submodule_search_locations = []
+        _sklearn_stub = _types.ModuleType("sklearn")
+        _sklearn_stub.__spec__ = _sklearn_spec
+        _sys.modules["sklearn"] = _sklearn_stub
+        for _m in ("sklearn.metrics", "sklearn.utils",
                    "sklearn.utils._param_validation", "sklearn.utils._chunking",
                    "sklearn.exceptions"):
             if _m not in _sys.modules:
                 _m_mod = _types.ModuleType(_m)
-                if _m == "sklearn.exceptions":
-                    class UndefinedMetricWarning(Exception): pass
-                    _m_mod.UndefinedMetricWarning = UndefinedMetricWarning
+                _m_mod.__spec__ = _imm.ModuleSpec(_m, None)
                 _sys.modules[_m] = _m_mod
+        # Pre-set the names transformers actually tries to import, so
+        # `from sklearn.metrics import f1_score, matthews_corrcoef` succeeds
+        # without raising ImportError. (VLM/HF training never calls them.)
+        _sys.modules["sklearn.metrics"].f1_score = None
+        _sys.modules["sklearn.metrics"].matthews_corrcoef = None
+        class _UndefinedMetricWarning(Warning): pass
+        _sys.modules["sklearn.exceptions"].UndefinedMetricWarning = _UndefinedMetricWarning
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
