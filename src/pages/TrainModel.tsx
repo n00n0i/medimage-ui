@@ -459,12 +459,12 @@ export default function TrainModel() {
       showToast('กรุณาเลือก model ก่อน', 'error')
       return
     }
-    const llm = isLlmType(config.trainingType)
-    if (!llm && !config.datasetId) {
+    const needsText = needsTextDataset(config.trainingType)
+    if (!needsText && !config.datasetId) {
       showToast('กรุณาเลือก dataset', 'error')
       return
     }
-    if (llm && !config.textDatasetId) {
+    if (needsText && !config.textDatasetId) {
       showToast('กรุณาเลือก text dataset', 'error')
       return
     }
@@ -482,7 +482,7 @@ export default function TrainModel() {
     setLaunching(true)
     showToast('🚀 Launching training job...', 'success')
 
-    const projectId = llm ? 0 : config.datasetId
+    const projectId = needsText ? 0 : config.datasetId
 
     try {
       const res = await fetch(`/api/train/${projectId}`, {
