@@ -927,6 +927,48 @@ def _diagnose_minio_for_ray() -> str:
         lines.append(f"  {'✓' if ok else '✗'} {host}:{port} {'reachable' if ok else 'UNREACHABLE'}")
     return "\n".join(lines)
 
+# ─── VLM/LLM source shipping ──────────────────────────────────────────────────
+#
+# The Modal Ray image bakes deps (transformers / peft / trl / bitsandbytes /
+# accelerate / datasets / numpy<2.0) but NOT vlm_llm_train.py itself, because
+# .add_local_python_source() only injects the module into the Modal function's
+# own Python process — Ray workers it spawns run in a fresh Python process
+# where that import is unavailable.
+#
+# Workaround: read vlm_llm_train.py at API startup, base64-encode it once,
+# cache it, and ship the base64 string as a Ray task argument. The Ray
+# worker decodes it, writes to /app/vlm_llm_train.py (idempotent — skip if
+# already there from a previous task or shared filesystem), adds /app to
+# sys.path, and then `import vlm_llm_train` works normally.
+#
+# The local Ray cluster case (worker shares the API container's filesystem)
+# also works — /app/vlm_llm_train.py is already on disk, the write is a
+# no-op, the import resolves against the file directly.
+
+_VLM_LLM_TRAIN_SOURCE_B64: str = ""
+_VLM_LLM_TRAIN_SOURCE_LOADED: bool = False
+
+def _load_vlm_llm_source_b64() -> str:
+    """Read vlm_llm_train.py from the same directory as main.py and
+    return its base64 encoding. Cached after first call. Returns "" if
+    the file is missing (caller will see the import fail with a clear
+    error)."""
+    global _VLM_LLM_TRAIN_SOURCE_B64, _VLM_LLM_TRAIN_SOURCE_LOADED
+    if _VLM_LLM_TRAIN_SOURCE_LOADED:
+        return _VLM_LLM_TRAIN_SOURCE_B64
+    # __file__ resolves to this module's path (main.py's location)
+    # whether the module is imported as `main` or run as `__main__`.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _path = os.path.join(_here, "vlm_llm_train.py")
+    if not os.path.isfile(_path):
+        # Fallback: relative to CWD (Modal's default is /root/)
+        _path = os.path.join(os.getcwd(), "vlm_llm_train.py")
+    if os.path.isfile(_path):
+        with open(_path, "rb") as _f:
+            _VLM_LLM_TRAIN_SOURCE_B64 = base64.b64encode(_f.read()).decode()
+    _VLM_LLM_TRAIN_SOURCE_LOADED = True
+    return _VLM_LLM_TRAIN_SOURCE_B64
+
 # ─── Real Training Helpers ────────────────────────────────────────────────────
 
 # Vision training script (runs on Ray cluster — supports Ultralytics YOLO and PyTorch/TIMM)
@@ -2944,14 +2986,45 @@ def _run_on_ray_cluster(job: dict) -> None:
     # below so changes to one don't affect the other.
     _is_vlm_llm = (engine == "Unsloth") or (training_type == "vlm-finetune")
     if _is_vlm_llm:
-        def _run_vlm_llm_inline(env_vars_arg: dict) -> dict:
-            """Ray-remote body for VLM/LLM jobs. The Ray worker image
-            bakes vlm_llm_train as a local source, so the import below
-            resolves on the worker. Delegates to vlm_llm_train.run()
-            which sets env vars, runs the torch pre-flight, installs
-            import stubs, and dispatches to the right train function.
-            Returns {stdout, weights_path} just like _run_training_inline
-            so the post-Run handling below can be shared."""
+        _vlm_llm_source_b64 = _load_vlm_llm_source_b64()
+        if not _vlm_llm_source_b64:
+            raise RuntimeError(
+                "vlm_llm_train.py not found next to main.py — the VLM/LLM "
+                "training module is required for this job. Make sure "
+                "vlm_llm_train.py is in the backend/ directory."
+            )
+        def _run_vlm_llm_inline(env_vars_arg: dict, source_b64: str) -> dict:
+            """Ray-remote body for VLM/LLM jobs. Materialises
+            vlm_llm_train.py on the Ray worker (Modal's image bakes the
+            deps but not the source) and delegates to its run().
+
+            Modal's .add_local_python_source() only injects the module
+            into the Modal function's own Python process; Ray workers
+            it spawns run in a fresh Python process where that import
+            is unavailable. We work around it by shipping the source
+            code as a base64 string in the task arg, writing it to
+            /app/vlm_llm_train.py on the worker (idempotent), and
+            adding /app to sys.path before importing.
+
+            On a local Ray cluster where the worker shares the API
+            container's filesystem, the file is already on disk and
+            the write is a no-op — the import resolves against the
+            real file. The 1-arg form (no source_b64) is supported
+            for the local case for backwards compatibility, falling
+            back to whatever /app/vlm_llm_train.py is already there.
+            """
+            import os as _os, sys as _sys, base64 as _b64
+            _target = "/app/vlm_llm_train.py"
+            if source_b64 and not _os.path.isfile(_target):
+                with open(_target, "wb") as _f:
+                    _f.write(_b64.b64decode(source_b64))
+            elif not source_b64 and not _os.path.isfile(_target):
+                raise RuntimeError(
+                    f"vlm_llm_train.py missing on worker and no source "
+                    f"supplied (looked at {_target})"
+                )
+            if "/app" not in _sys.path:
+                _sys.path.insert(0, "/app")
             from vlm_llm_train import run as _run_vlm_llm
             return _run_vlm_llm(env_vars_arg)
 
@@ -2960,7 +3033,7 @@ def _run_on_ray_cluster(job: dict) -> None:
             _append_log(job_id, f"[cluster] Connected ({len(ray.nodes())} node(s))")
             _set_step(job_id, "submit")
             remote_fn = ray.remote(_run_vlm_llm_inline)
-            future    = remote_fn.remote(env_vars)
+            future    = remote_fn.remote(env_vars, _vlm_llm_source_b64)
             _append_log(job_id, "[cluster] VLM/LLM training task submitted, waiting ...")
 
             elapsed  = 0
@@ -3954,15 +4027,19 @@ def _modal_script(req: ModalStartRequest) -> str:
             # path. The VLM torch pre-flight in vlm_llm_train.py still
             # force-reinstalls cu wheels if the pre-installed torch
             # can't see a GPU.
+            #
+            # vlm_llm_train.py itself is NOT baked via
+            # .add_local_python_source() — that only makes the module
+            # importable in the Modal function's own Python process, not
+            # in Ray workers it spawns. We ship the source as a base64
+            # string from the API container at job-start time, and the
+            # Ray worker writes it to /app/vlm_llm_train.py before
+            # importing. See _run_vlm_llm_inline.
             .pip_install(
                 "transformers", "peft", "trl", "bitsandbytes",
                 "accelerate", "datasets", "numpy<2.0",
                 "Pillow", "boto3", "requests",
             )
-            # Bake the vlm_llm_train module itself so the Ray worker can
-            # `import vlm_llm_train` directly (no inline string-exec
-            # gymnastics, no cloudpickle of `main` module reference).
-            .add_local_python_source("vlm_llm_train")
         )
 
         # Head node — min_containers=0 so 'modal app stop' actually tears
