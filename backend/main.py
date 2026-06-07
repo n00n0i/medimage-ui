@@ -3687,7 +3687,20 @@ def _run_on_ray_cluster(job: dict) -> None:
         # removed `triton.ops`. Stubbing the module lets the import succeed
         # even if pip didn't honor our `bitsandbytes==0.45.0` pin. Same
         # defense-in-depth pattern as the sklearn stub above.
-        for _triton_pkg in ("triton", "triton.ops", "triton.ops.matmul_perf_model"):
+        #
+        # IMPORTANT: `triton` itself must be a PACKAGE (have __path__) —
+        # not a bare ModuleType — because code does
+        # `import triton.backends.compiler` and `import triton.language.dtype`
+        # which require it to be navigable as a package. A plain
+        # ModuleType gives "triton is not a package" at the first
+        # `import triton.X` attempt.
+        if "triton" not in _sys.modules:
+            _triton_root = _types.ModuleType("triton")
+            _triton_root.__path__ = []   # marks it as a package
+            _sys.modules["triton"] = _triton_root
+        for _triton_pkg in ("triton.ops", "triton.ops.matmul_perf_model",
+                            "triton.language", "triton.backends",
+                            "triton.backends.compiler"):
             if _triton_pkg not in _sys.modules:
                 _sys.modules[_triton_pkg] = _types.ModuleType(_triton_pkg)
         # Pre-set the names bitsandbytes tries to import
@@ -3709,6 +3722,11 @@ def _run_on_ray_cluster(job: dict) -> None:
             _triton_lang.dtype = _StubDtype()
             _sys.modules["triton.language"] = _triton_lang
             _sys.modules["triton"].language = _triton_lang
+        # Pre-register triton.backends.compiler and friends as attrs on
+        # the triton package, so `from triton.backends.compiler import X`
+        # finds the stubbed submodule via attribute lookup.
+        _sys.modules["triton"].ops = _sys.modules["triton.ops"]
+        _sys.modules["triton"].backends = _sys.modules["triton.backends"]
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
