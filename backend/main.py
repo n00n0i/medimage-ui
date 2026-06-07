@@ -3172,8 +3172,14 @@ def _run_on_ray_cluster(job: dict) -> None:
     elif engine == "Unsloth":
         pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
     elif engine == "HuggingFace" or training_type == "vlm-finetune":
+        # numpy<2.0 keeps ABI compatibility with the cluster's pre-installed
+        # pandas (built against numpy 1.x dtype size 96). Without the pin, the
+        # transformers/datasets deps pull numpy 2.x (size 88) and break
+        # pandas._libs.interval import — which crashes Trainer import via the
+        # transformers -> sklearn -> pandas chain before training can even start.
         pip_pkgs = ["transformers>=4.40", "peft>=0.10", "accelerate>=0.28",
-                    "bitsandbytes>=0.43", "datasets>=2.18", "boto3>=1.34", "Pillow"]
+                    "bitsandbytes>=0.43", "datasets>=2.18",
+                    "boto3>=1.34", "Pillow", "numpy<2.0"]
     elif training_type == "self-supervised":
         pip_pkgs = ["boto3>=1.34", "requests", "Pillow"]  # torch/torchvision pre-installed
     else:
@@ -3186,7 +3192,7 @@ def _run_on_ray_cluster(job: dict) -> None:
     # requiring virtualenv on the worker node (runtime_env pip needs virtualenv).
     _pip_pkgs_for_worker = pip_pkgs
     def _run_training_inline(script_b64_arg: str, env_vars_arg: dict) -> dict:
-        import os as _os, base64 as _b64, sys as _sys, subprocess as _sp
+        import os as _os, base64 as _b64, sys as _sys, subprocess as _sp, types as _types
         from io import StringIO as _StringIO
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
@@ -3194,6 +3200,22 @@ def _run_on_ray_cluster(job: dict) -> None:
                 [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
                 capture_output=True,
             )
+        # Stub sklearn submodules BEFORE exec'ing the script. The transformers
+        # Trainer import chain pulls sklearn -> pandas, and on this cluster
+        # pandas._libs can fail with a numpy ABI mismatch
+        # ("numpy.dtype size changed, may indicate binary incompatibility").
+        # VLM/HF training paths don't actually need sklearn metrics, so
+        # pre-stubbing them lets transformers import succeed even if a future
+        # package install clobbers the numpy ABI. Idempotent.
+        for _m in ("sklearn", "sklearn.metrics", "sklearn.utils",
+                   "sklearn.utils._param_validation", "sklearn.utils._chunking",
+                   "sklearn.exceptions"):
+            if _m not in _sys.modules:
+                _m_mod = _types.ModuleType(_m)
+                if _m == "sklearn.exceptions":
+                    class UndefinedMetricWarning(Exception): pass
+                    _m_mod.UndefinedMetricWarning = UndefinedMetricWarning
+                _sys.modules[_m] = _m_mod
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
