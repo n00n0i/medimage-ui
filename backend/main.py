@@ -3688,6 +3688,7 @@ def _run_on_ray_cluster(job: dict) -> None:
                     ("https://download.pytorch.org/whl/cu118", "torch==2.0.0+cu118"),
                     ("https://download.pytorch.org/whl/cu117", "torch==2.0.0+cu117"),
                 ]
+                _attempt_logs = []  # collect every attempt for the error msg
                 _last_err = ""
                 for _pytorch_index, _torch_pin in _torch_attempts:
                     print(f"[cluster] trying {_torch_pin} from "
@@ -3705,6 +3706,7 @@ def _run_on_ray_cluster(job: dict) -> None:
                                  f"  pip stdout: {_pip_res.stdout[:500]!r}\n"
                                  f"  pip stderr: {_pip_res.stderr[:500]!r}\n"
                                  f"  pip returncode: {_pip_res.returncode}")
+                    _attempt_logs.append(_last_err)
                     if _pip_res.returncode != 0:
                         print(f"[cluster] pip install {_torch_pin} failed:\n{_last_err}",
                               file=_sys.stderr)
@@ -3725,24 +3727,30 @@ def _run_on_ray_cluster(job: dict) -> None:
                     print(f"[cluster] {_torch_pin} installed but GPU not visible",
                           file=_sys.stderr)
                 else:
-                    # All attempts failed — surface nvidia-smi output
-                    # in the error so the user can see what driver
-                    # they're on and pick the right cu index manually.
+                    # All attempts failed — surface EVERY attempt's
+                    # pip output + nvidia-smi so the user can see
+                    # what their driver supports and which wheels
+                    # pip rejected vs which installed-but-don't-load.
                     _drv_match = _re.search(r"CUDA Version:\s*(\d+\.\d+)", _smi_text)
                     _driver_cuda = _drv_match.group(1) if _drv_match else "(not found)"
+                    _all_attempts = "\n\n".join(
+                        f"=== attempt {i+1}/{len(_torch_attempts)} ===\n{log}"
+                        for i, log in enumerate(_attempt_logs))
                     raise RuntimeError(
-                        f"All torch install attempts (cu117/cu116/cu115/"
-                        f"cu118) failed to produce a GPU-visible build. "
-                        f"Last pip output:\n{_last_err}\n\n"
+                        f"All torch install attempts failed to produce a "
+                        f"GPU-visible build.\n\n"
                         f"=== nvidia-smi output ===\n{_smi_text}\n\n"
                         f"=== nvidia-smi parsed ===\n"
                         f"driver CUDA: {_driver_cuda}\n"
                         f"\n"
-                        f"This Ray worker's CUDA driver is too old to load "
-                        f"any of the available cu11x torch wheels. "
-                        f"Pick a cu index that matches the driver and "
-                        f"add it to the _torch_attempts list above, or "
-                        f"upgrade the driver."
+                        f"=== every pip attempt ({len(_torch_attempts)}) ===\n"
+                        f"{_all_attempts}\n"
+                        f"\n"
+                        f"If all cu wheels installed successfully but "
+                        f"cuda_available stayed False, the cluster's "
+                        f"libcudart or libcuda probably has the wrong "
+                        f"version. Check that LD_LIBRARY_PATH points to "
+                        f"the cluster's CUDA 13.0 lib dir."
                     )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
