@@ -3711,16 +3711,29 @@ def _run_on_ray_cluster(job: dict) -> None:
                         print(f"[cluster] pip install {_torch_pin} failed:\n{_last_err}",
                               file=_sys.stderr)
                         continue
-                    _gpu_recheck = _sp.run(
+                    # Probe with more detail: where is torch loaded from,
+                    # what's LD_LIBRARY_PATH, where is libcuda.so. This
+                    # helps us tell whether the wheel installed into
+                    # the right place and why the CUDA init is failing.
+                    _probe = _sp.run(
                         [_sys.executable, "-c",
-                         "import torch, sys; "
-                         "print(f\"torch={torch.__version__} cuda_avail={torch.cuda.is_available()} devices={torch.cuda.device_count()}\", file=sys.stderr); "
-                         "sys.exit(0 if torch.cuda.is_available() else 1)"],
+                         "import torch, sys, os, ctypes.util; "
+                         "_t = torch; "
+                         "print(f'torch.__file__={_t.__file__}', file=sys.stderr); "
+                         "print(f'torch.__version__={_t.__version__}', file=sys.stderr); "
+                         "print(f'torch.version.cuda={_t.version.cuda}', file=sys.stderr); "
+                         "print(f'torch.backends.cuda.is_built()={_t.backends.cuda.is_built()}', file=sys.stderr); "
+                         "_lc = ctypes.util.find_library('cuda'); "
+                         "print(f'ctypes.util.find_library(cuda)={_lc}', file=sys.stderr); "
+                         "print(f'LD_LIBRARY_PATH={os.environ.get(\"LD_LIBRARY_PATH\", \"(unset)\")}', file=sys.stderr); "
+                         "print(f'cuda_available={_t.cuda.is_available()}', file=sys.stderr); "
+                         "print(f'devices={_t.cuda.device_count() if _t.cuda.is_available() else 0}', file=sys.stderr); "
+                         "sys.exit(0 if _t.cuda.is_available() else 1)"],
                         capture_output=True, text=True, timeout=60,
                     )
-                    print(_gpu_recheck.stderr.strip() or "(no output)",
+                    print(_probe.stderr.strip() or "(no probe output)",
                           file=_sys.stderr)
-                    if _gpu_recheck.returncode == 0:
+                    if _probe.returncode == 0:
                         print(f"[cluster] ✅ {_torch_pin} works",
                               file=_sys.stderr)
                         break
@@ -3736,6 +3749,14 @@ def _run_on_ray_cluster(job: dict) -> None:
                     _all_attempts = "\n\n".join(
                         f"=== attempt {i+1}/{len(_torch_attempts)} ===\n{log}"
                         for i, log in enumerate(_attempt_logs))
+                    # Find libcuda.so on the system (it's the GPU
+                    # driver library, not bundled with torch wheels)
+                    _libcuda = _sp.run(
+                        ["bash", "-lc",
+                         "ldconfig -p 2>/dev/null | grep -E 'libcuda\\.so' | head -5; "
+                         "find / -name 'libcuda.so*' 2>/dev/null | head -5"],
+                        capture_output=True, text=True, timeout=30,
+                    )
                     raise RuntimeError(
                         f"All torch install attempts failed to produce a "
                         f"GPU-visible build.\n\n"
@@ -3746,11 +3767,21 @@ def _run_on_ray_cluster(job: dict) -> None:
                         f"=== every pip attempt ({len(_torch_attempts)}) ===\n"
                         f"{_all_attempts}\n"
                         f"\n"
-                        f"If all cu wheels installed successfully but "
-                        f"cuda_available stayed False, the cluster's "
-                        f"libcudart or libcuda probably has the wrong "
-                        f"version. Check that LD_LIBRARY_PATH points to "
-                        f"the cluster's CUDA 13.0 lib dir."
+                        f"=== libcuda search ===\n"
+                        f"{_libcuda.stdout[:500] if _libcuda.stdout else '(not found)'}\n"
+                        f"\n"
+                        f"Common causes when all wheels install OK but\n"
+                        f"torch.cuda.is_available() stays False:\n"
+                        f"  - libcuda.so (the GPU driver library) is not\n"
+                        f"    in the loader's path. PyTorch wheels bundle\n"
+                        f"    libcudart but NOT libcuda. Check\n"
+                        f"    'ldconfig -p | grep libcuda' on the worker.\n"
+                        f"  - The Ray task is running in a chroot or\n"
+                        f"    container without access to the host's\n"
+                        f"    /dev/nvidia* device nodes.\n"
+                        f"  - nvidia-smi works for the user but the\n"
+                        f"    pip-installed python is in a different env\n"
+                        f"    that can't see the same /dev.\n"
                     )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
