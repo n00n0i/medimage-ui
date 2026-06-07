@@ -2441,6 +2441,7 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     # cluster's CUDA driver. The diagnostic runs *first* (before the
     # unsloth import) so we always see the output even when the import
     # itself fails.
+    import os as _os
     import torch as _torch_diag
     print(f"[train]   torch={_torch_diag.__version__}  "
           f"cuda_available={_torch_diag.cuda.is_available()}  "
