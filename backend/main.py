@@ -2284,8 +2284,27 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
 def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantization,
                         epochs, batch, grad_accum, lr, chat_template, job_id,
                         w_bucket, w_key, minio_url, minio_access, minio_secret,
-                        img_dir=None):
-    """Fine-tune a Vision Language Model (LLaVA-style) using HuggingFace transformers + PEFT LoRA."""
+                        dataset_url=None, project_id=0, img_dir=None):
+    """Fine-tune a Vision Language Model using bare HuggingFace transformers + PEFT.
+
+    Originally we tried Unsloth's FastVisionModel here, but unsloth's
+    dependency tree (transformers / peft / bitsandbytes / torch +cu) is
+    almost impossible to satisfy on this Ray cluster without breaking the
+    pre-installed torch that ultralytics relies on. We now pin a known-good
+    versions explicitly:
+      transformers==4.45.2  (has EncoderDecoderCache; satisfies peft 0.11+)
+      peft<0.11             (last 0.10.x; no EncoderDecoderCache import)
+      accelerate==0.34.2
+      bitsandbytes==0.43.3
+      datasets==2.18.0
+      numpy<2.0             (preserves pandas 1.x ABI on this cluster)
+
+    Dataset resolution (in order):
+    1. text_dataset if set — HF dataset id, local path, or raw JSONL
+    2. dataset_url if set — LS project zip, extract annotations.json +
+       images, build VLM rows from task annotations
+    3. Error
+    """
     import zipfile as _zf
     import torch
     from transformers import (
@@ -2295,10 +2314,17 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
     from peft import LoraConfig, get_peft_model
     from datasets import load_dataset, Dataset as HFDataset
     from PIL import Image as _Image
-    import io as _io, base64 as _b64, glob as _glob
+    import io as _io, base64 as _b64, glob as _glob, tempfile as _tf, json as _json
+    import requests as _req
 
-    print(f"[train] VLM fine-tune — model: {model_name}  lora_r={lora_rank}")
+    print(f"[train] VLM fine-tune (HF) — model: {model_name}  lora_r={lora_rank}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device != "cuda":
+        raise RuntimeError(
+            f"torch {torch.__version__} on this Ray worker cannot see a GPU "
+            f"(cuda_available=False). VLM training needs CUDA. See the "
+            f"pre-flight nvidia-smi / torch install output in the cluster log."
+        )
 
     # Quantization config
     load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
@@ -2329,54 +2355,143 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
     vlm = get_peft_model(vlm, lora_cfg)
     vlm.print_trainable_parameters()
 
-    # Load text/vision dataset
-    print(f"[train] Loading dataset: {text_dataset}")
-    try:
-        ds = load_dataset(text_dataset, split="train")
-    except Exception as e:
-        print(f"[warn] HF load failed ({e}), trying as JSONL")
-        import json as _json
-        rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
-        ds = HFDataset.from_list(rows)
+    # ── Dataset resolution (same logic as train_unsloth_vlm) ──────────────
+    rows = None
+    if text_dataset:
+        print(f"[train] Loading text_dataset: {text_dataset[:80]}{'...' if len(text_dataset) > 80 else ''}")
+        try:
+            ds = load_dataset(text_dataset, split="train")
+            rows = list(ds)
+        except Exception as e:
+            print(f"[warn] HF load failed ({e}), trying as JSONL")
+            rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
+    elif dataset_url:
+        tmpdir = _tf.mkdtemp(prefix="vlm_data_")
+        print(f"[train] Downloading dataset zip: {dataset_url}")
+        r = _req.get(dataset_url, stream=True, timeout=600)
+        r.raise_for_status()
+        zip_path = os.path.join(tmpdir, "dataset.zip")
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        with _zf.ZipFile(zip_path) as z:
+            z.extractall(tmpdir)
+        img_dir = img_dir or os.path.join(tmpdir, "images")
+        ann_path = None
+        for cand in (os.path.join(tmpdir, "annotations.json"),
+                     os.path.join(tmpdir, "tasks.json"),
+                     os.path.join(tmpdir, "data", "annotations.json")):
+            if os.path.isfile(cand):
+                ann_path = cand
+                break
+        if not ann_path:
+            raise RuntimeError(
+                f"No annotations.json / tasks.json in zip — VLM needs image+text pairs. "
+                f"Got: {os.listdir(tmpdir)[:20]}"
+            )
+        with open(ann_path) as f:
+            tasks = _json.load(f)
+        print(f"[train] Building VLM rows from {len(tasks)} LS tasks in project {project_id} ...")
+        rows = []
+        for t in tasks:
+            data = t.get("data") or {}
+            anns = t.get("annotations") or t.get("predictions") or []
+            img_ref = (data.get("image") or data.get("img")
+                       or (data.get("upload") or {}).get("file") or "")
+            text_out = ""
+            for a in anns:
+                res = a.get("result") or []
+                for r_item in res:
+                    if not isinstance(r_item, dict):
+                        continue
+                    v = r_item.get("value")
+                    if isinstance(v, str) and v.strip():
+                        text_out = v.strip()
+                        break
+                    if isinstance(v, list):
+                        for choice in v:
+                            if isinstance(choice, dict):
+                                texts = [c.get("text", "") for c in choice.get("choices", []) if c.get("text")]
+                                if texts:
+                                    text_out = " ".join(texts)
+                                    break
+                        if text_out:
+                            break
+                if text_out:
+                    break
+            if not img_ref or not text_out:
+                continue
+            local_img = None
+            cand_paths = [img_ref, os.path.join(img_dir, os.path.basename(img_ref))]
+            for c in cand_paths:
+                if os.path.isfile(c):
+                    local_img = c
+                    break
+            if not local_img:
+                continue
+            rows.append({
+                "text": data.get("prompt", data.get("question", "Describe this image.")),
+                "output": text_out,
+                "image": local_img,
+            })
+        if not rows:
+            raise RuntimeError(
+                f"Built 0 VLM rows from {len(tasks)} tasks. "
+                f"Check that LS annotations have a 'text' value and images are in the zip."
+            )
+        print(f"[train] Built {len(rows)} VLM conversation rows from project {project_id}")
+    else:
+        raise RuntimeError(
+            "VLM training needs either text_dataset (JSONL) or a project "
+            "(dataset_url). Got neither — go back to step 1 and pick a project."
+        )
 
-    # Collect local images if img_dir provided
+    # Index local images
     local_imgs = {}
     if img_dir and os.path.isdir(img_dir):
-        for ext in ("*.jpg", "*.jpeg", "*.png"):
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
             for p in _glob.glob(os.path.join(img_dir, "**", ext), recursive=True):
                 local_imgs[os.path.basename(p)] = p
 
-    # Tokenize and format for VLM
+    def _resolve_image(raw):
+        if raw is None:
+            return None
+        if isinstance(raw, _Image.Image):
+            return raw.convert("RGB")
+        if isinstance(raw, str):
+            if raw.startswith("data:"):
+                _, data = raw.split(",", 1)
+                return _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
+            if raw in local_imgs:
+                return _Image.open(local_imgs[raw]).convert("RGB")
+            if os.path.isfile(raw):
+                return _Image.open(raw).convert("RGB")
+            for ext in ("", ".jpg", ".jpeg", ".png", ".webp"):
+                cand = os.path.join(img_dir or "", raw + ext) if img_dir else ""
+                if cand and os.path.isfile(cand):
+                    return _Image.open(cand).convert("RGB")
+        return None
+
     def preprocess(examples):
         texts, images = [], []
         for i in range(len(examples.get("text", examples.get("instruction", [""]*len(examples))))):
-            # Build prompt
             instr_key = "text" if "text" in examples else "instruction"
             output_key = "output" if "output" in examples else "response"
             instruction = examples[instr_key][i] if instr_key in examples else ""
             output = examples[output_key][i] if output_key in examples else ""
             prompt = f"<|user|>\n{instruction}\n<|assistant|>\n{output}"
             texts.append(prompt)
-            # Image: try to get from dataset or local
-            img = None
-            if "image" in examples and examples["image"][i] is not None:
-                raw = examples["image"][i]
-                if isinstance(raw, str) and raw.startswith("data:"):
-                    _, data = raw.split(",", 1)
-                    img = _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
-                elif isinstance(raw, _Image.Image):
-                    img = raw.convert("RGB")
+            img = _resolve_image(examples.get("image", [None] * len(texts))[i] if "image" in examples else None)
             if img is None:
-                img = _Image.new("RGB", (imgsz if 'imgsz' in dir() else 224,
-                                          imgsz if 'imgsz' in dir() else 224), (128, 128, 128))
+                img = _Image.new("RGB", (224, 224), (128, 128, 128))
             images.append(img)
         enc = processor(text=texts, images=images, return_tensors="pt",
                         padding=True, truncation=True, max_length=max_seq_len)
         enc["labels"] = enc["input_ids"].clone()
         return enc
 
-    imgsz = 224  # default VLM image size
-    print(f"[train] Preprocessing {len(ds)} examples ...")
+    print(f"[train] Preprocessing {len(rows)} examples ...")
+    ds = HFDataset.from_list(rows)
     ds = ds.map(preprocess, batched=True, batch_size=4, remove_columns=ds.column_names)
     ds.set_format("torch")
 
@@ -2773,26 +2888,19 @@ def main():
         print("[train] Complete!")
         return
 
-    # 3-VLM. All VLM training goes through Unsloth (engine=Unsloth, HuggingFace,
-    # or LLaVA all route here). Unsloth pins compatible
-    # transformers/peft/bitsandbytes versions, avoiding the bare-HF
-    # version-conflict class of bugs (peft 0.11+ needing
-    # transformers >=4.45 for EncoderDecoderCache, etc.) and the
-    # numpy/pandas ABI mismatch on this Ray cluster. Models unsloth doesn't
-    # support raise a clear error from FastVisionModel.from_pretrained.
+    # 3-VLM. HuggingFace transformers + PEFT path. (Unsloth was attempted
+    # earlier but the install conflicts with this Ray cluster's
+    # pre-installed torch; the bare-HF path with pinned versions is
+    # the only thing that works here.) The pin set is in pip_pkgs below:
+    # transformers 4.45.x + peft <0.11 + bitsandbytes 0.43 + numpy<2.0.
     if training_type == "vlm-finetune":
-        # text_dataset OR (dataset_url + project_id) is required. The Train
-        # page sends datasetId (LS project) for VLM, which is converted to a
-        # zip + annotations.json by _export_ls_to_minio and exposed via
-        # dataset_url — so we can build the VLM conversation rows from the
-        # project tasks. Fall back to text_dataset (JSONL) when provided.
         if not text_dataset and not (dataset_url and project_id):
             raise RuntimeError(
                 "VLM fine-tuning needs either text_dataset (JSONL) or a "
                 "project (dataset_url). Go back to step 1 and pick a "
                 "project, or upload a text dataset in Datasets."
             )
-        train_unsloth_vlm(
+        train_vlm_finetune(
             model_name, text_dataset, max_seq_len, lora_rank, quantization,
             epochs, batch, grad_accum, lr, chat_template,
             job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
@@ -3469,12 +3577,29 @@ def _run_on_ray_cluster(job: dict) -> None:
     elif engine == "nnU-Net":
         pip_pkgs = ["nnunetv2", "nibabel", "boto3>=1.34", "Pillow"]
     elif training_type == "vlm-finetune":
-        # All VLM training uses Unsloth (see main() routing). Unsloth pins
-        # compatible transformers/peft/bitsandbytes internally, so we avoid
-        # the version-conflict class of bugs (peft 0.11+ needing
-        # transformers >=4.45 for EncoderDecoderCache, etc.) and the
-        # numpy/pandas ABI mismatch on this Ray cluster.
-        pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
+        # VLM via bare HuggingFace transformers + PEFT (see main() routing).
+        # Pinned versions chosen to avoid the version-conflict and
+        # numpy/pandas ABI issues seen on this Ray cluster:
+        #   transformers==4.45.2  has EncoderDecoderCache
+        #   peft<0.11             last 0.10.x; doesn't import EncoderDecoderCache
+        #   accelerate==0.34.2
+        #   bitsandbytes==0.43.3
+        #   datasets==2.18.0
+        #   numpy<2.0             keeps pandas 1.x ABI on this cluster
+        # We deliberately do NOT install torch — the cluster's pre-installed
+        # torch is what ultralytics has been using successfully, and
+        # pip-installing a different torch+cu build kept breaking GPU
+        # detection.
+        pip_pkgs = [
+            "transformers==4.45.2",
+            "peft<0.11",
+            "accelerate==0.34.2",
+            "bitsandbytes==0.43.3",
+            "datasets==2.18.0",
+            "boto3>=1.34",
+            "Pillow",
+            "numpy<2.0",
+        ]
     elif engine == "Unsloth":
         pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
     elif engine == "HuggingFace":
@@ -3513,119 +3638,12 @@ def _run_on_ray_cluster(job: dict) -> None:
              "--force-reinstall", "numpy<2.0"],
             capture_output=True,
         )
-        # Special handling for unsloth: install with --no-deps so pip doesn't
-        # touch torch. The Ray cluster's pre-installed torch is the version
-        # ultralytics uses and matches the system CUDA driver. unsloth's
-        # default deps pin a different torch range; if pip upgrades torch
-        # to satisfy them, the new torch no longer sees the GPU and
-        # unsloth_zoo.device_type raises "Unsloth cannot find any torch
-        # accelerator? You need a GPU." even though ultralytics still
-        # works fine on the same cluster. Installing unsloth with --no-deps
-        # and letting the other deps (trl, peft, datasets, boto3) install
-        # normally keeps the existing torch in place. The other deps don't
-        # pull torch (they use it, but don't depend on it as a hard pin).
-        if any("unsloth" in p for p in _pip_pkgs_for_worker):
-            _sp.run(
-                [_sys.executable, "-m", "pip", "install", "-q",
-                 "--no-deps", "unsloth"],
-                capture_output=True,
-            )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
             _sp.run(
                 [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
                 capture_output=True,
             )
-        # Pre-flight: if unsloth is in the install list, verify that the
-        # worker's torch can see a GPU. unsloth_zoo raises "Unsloth cannot
-        # find any torch accelerator? You need a GPU." at import time if
-        # torch.cuda.is_available() is False. A previous run's pip install
-        # may have upgraded torch to a version that doesn't match the
-        # cluster's CUDA driver. Detect the driver version from nvidia-smi
-        # and install the matching torch +cu build, BEFORE the training
-        # script exec, so the script's first `import torch` loads the
-        # fresh version cleanly. Doing it here in the _run_training_inline
-        # process (where torch hasn't been imported yet) is essential —
-        # torch's C extension registers global state on first load and
-        # can't be reloaded in-process (causes "function '_has_torch_function'
-        # already has a docstring").
-        if any("unsloth" in p for p in _pip_pkgs_for_worker):
-            # Detect driver version from nvidia-smi. The driver supports
-            # CUDA up to a certain version (e.g. "CUDA Version: 12.1" means
-            # the driver can run CUDA 12.1 or older torch wheels). PyTorch
-            # wheels are tagged +cuXYZ (cu117, cu118, cu121, ...). Pick the
-            # highest cu wheel whose version is <= the driver's reported
-            # max CUDA.
-            import re as _re
-            _smi_out = _sp.run(
-                ["bash", "-lc",
-                 "nvidia-smi 2>&1 | head -20 || echo 'nvidia-smi not available'"],
-                capture_output=True, text=True, timeout=10,
-            )
-            _smi_text = (_smi_out.stdout or "") + (_smi_out.stderr or "")
-            print(f"[cluster] nvidia-smi:\n{_smi_text}",
-                  file=_sys.stderr)
-            _driver_match = _re.search(
-                r"CUDA Version:\s*(\d+)\.(\d+)", _smi_text)
-            if _driver_match:
-                _drv_major = int(_driver_match.group(1))
-                _drv_minor = int(_driver_match.group(2))
-            else:
-                # Fall back to a safe default — CUDA 11.8 covers most clusters
-                _drv_major, _drv_minor = 11, 8
-            # Map (major, minor) -> torch +cu tag. We pick the highest cu
-            # version that's <= the driver, capped at cu121 (newest 2.1.x).
-            # cu117 = CUDA 11.7, cu118 = CUDA 11.8, cu121 = CUDA 12.1.
-            if _drv_major >= 12 and _drv_minor >= 1:
-                _torch_cu = "cu121"
-            elif _drv_major >= 12:
-                _torch_cu = "cu118"  # 12.0 driver can still run cu118 wheels
-            elif _drv_major == 11 and _drv_minor >= 8:
-                _torch_cu = "cu118"
-            elif _drv_major == 11 and _drv_minor >= 7:
-                _torch_cu = "cu117"
-            else:
-                _torch_cu = "cu117"
-            _torch_ver = "2.1.2"
-            _torch_pin = f"torch=={_torch_ver}+{_torch_cu}"
-            print(f"[cluster] driver CUDA {_drv_major}.{_drv_minor} -> "
-                  f"installing {_torch_pin}",
-                  file=_sys.stderr)
-            _gpu_check = _sp.run(
-                [_sys.executable, "-c",
-                 "import torch; import sys; "
-                 "sys.exit(0 if torch.cuda.is_available() else 1)"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if _gpu_check.returncode != 0:
-                print(f"[cluster] ⚠ torch cannot see GPU — "
-                      f"force-reinstalling {_torch_pin} ...",
-                      file=_sys.stderr)
-                _sp.run(
-                    [_sys.executable, "-m", "pip", "install", "-q",
-                     "--force-reinstall", _torch_pin],
-                    capture_output=True, text=True, timeout=600,
-                )
-                # Sanity check the new torch in a fresh subprocess
-                _gpu_recheck = _sp.run(
-                    [_sys.executable, "-c",
-                     "import torch, sys; "
-                     "print(f\"torch={torch.__version__} cuda_avail={torch.cuda.is_available()} devices={torch.cuda.device_count()}\", file=sys.stderr); "
-                     "sys.exit(0 if torch.cuda.is_available() else 1)"],
-                    capture_output=True, text=True, timeout=60,
-                )
-                print(_gpu_recheck.stderr.strip() or "(no output)",
-                      file=_sys.stderr)
-                if _gpu_recheck.returncode != 0:
-                    raise RuntimeError(
-                        f"torch reinstall ({_torch_pin}) succeeded but GPU "
-                        f"still not visible. "
-                        f"stdout: {_gpu_recheck.stdout[:300]!r} "
-                        f"stderr: {_gpu_recheck.stderr[:300]!r}. "
-                        f"This Ray worker may not have a GPU, or its CUDA "
-                        f"driver is too old for the {_torch_cu} build of "
-                        f"torch {_torch_ver}. nvidia-smi output is above."
-                    )
         # Stub sklearn submodules BEFORE exec'ing the script. The transformers
         # Trainer import chain pulls sklearn -> pandas, and on this cluster
         # pandas._libs can fail with a numpy ABI mismatch
