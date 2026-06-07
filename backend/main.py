@@ -3686,77 +3686,72 @@ def _run_on_ray_cluster(job: dict) -> None:
         # others like `triton.ops.matmul_perf_model` and `triton.compiler`
         # missing). Each broken import path goes through
         # torch._inductor / torch._dynamo / bitsandbytes.triton_based_modules
-        # and crashes. Use a `__getattr__` on the triton root that
-        # lazy-creates any missing submodule stub on demand, so the
-        # next `import triton.X` is handled without us having to
-        # enumerate every possible X.
-        class _TritonRoot(_types.ModuleType):
-            """Stub for the triton package. Any `triton.X` access that
-            doesn't resolve to a real attribute or pre-stubbed submodule
-            creates an empty stub module and caches it in sys.modules.
+        # and crashes. Use a recursive `_TritonLazyPackage` class that
+        # lazy-creates any missing child submodule on attribute access
+        # — handles `triton.X`, `triton.X.Y`, `triton.X.Y.Z`, etc.
+        class _TritonLazyPackage(_types.ModuleType):
+            """Package stub whose children are created on demand.
+
+            `import triton.X` -> looks up triton in sys.modules, then
+            finds `X` attribute (or __getattr__ fallback). With this
+            class, any `triton.X` access that wasn't pre-stubbed creates
+            a fresh _TritonLazyPackage and caches it in sys.modules.
+            Same mechanism lets `triton.X.Y` work recursively.
             """
-            def __init__(self):
-                super().__init__("triton")
-                self.__path__ = []  # mark as package so `import triton.X` works
+            def __init__(self, name):
+                super().__init__(name)
+                self.__path__ = []
             def __getattr__(self, name):
                 if name.startswith("_") and name not in ("__path__",):
                     raise AttributeError(name)
-                full = f"triton.{name}"
+                full = f"{self.__name__}.{name}"
                 if full not in _sys.modules:
-                    sub = _types.ModuleType(full)
-                    sub.__path__ = []
+                    sub = _TritonLazyPackage(full)
                     _sys.modules[full] = sub
                 return _sys.modules[full]
 
         if "triton" not in _sys.modules:
-            _sys.modules["triton"] = _TritonRoot()
+            _sys.modules["triton"] = _TritonLazyPackage("triton")
         else:
             # triton is already imported but might be a bare module
-            # (no __path__); upgrade it to a package so submodule
-            # imports work. Don't replace the module object itself —
-            # something else might already hold a reference.
+            # (no __path__) or might be a real package that lacks some
+            # submodules. Best we can do without breaking the real one:
+            # ensure it has __path__ so submodule imports work, and
+            # ALSO install a _TritonLazyPackage alongside so attribute
+            # access on missing submodules works. (If `triton` is
+            # already a _TritonLazyPackage, this is a no-op.)
             _existing = _sys.modules["triton"]
             try:
                 _existing.__path__ = []
             except (AttributeError, TypeError):
                 pass
-            # Inject our __getattr__ for any missing submodule
-            if not isinstance(_existing, _TritonRoot):
-                _original_getattr = type(_existing).__getattr__
-                def _make_getattr(orig):
-                    def __getattr__(self, name):
-                        if name.startswith("_") and name not in ("__path__",):
-                            return orig(self, name)
+            if not isinstance(_existing, _TritonLazyPackage):
+                # Replace the triton entry with a lazy one that also
+                # has access to the real module's attributes. (We can't
+                # cleanly merge; the real triton is partially broken
+                # anyway, so a full replace is the simpler choice.)
+                _lazy_triton = _TritonLazyPackage("triton")
+                for _attr in dir(_existing):
+                    if not _attr.startswith("_") and not hasattr(_lazy_triton, _attr):
                         try:
-                            return orig(self, name)
-                        except AttributeError:
-                            full = f"triton.{name}"
-                            if full not in _sys.modules:
-                                sub = _types.ModuleType(full)
-                                sub.__path__ = []
-                                _sys.modules[full] = sub
-                            return _sys.modules[full]
-                    return __getattr__
-                try:
-                    type(_existing).__getattr__ = _make_getattr(_original_getattr)
-                except (AttributeError, TypeError):
-                    # Last resort: replace with our stub. We do this
-                    # only if we can't patch the class, because
-                    # replacing breaks any existing reference holders.
-                    _sys.modules["triton"] = _TritonRoot()
-        # Pre-stub the submodules that have known attribute requirements.
-        # The lazy __getattr__ above will also handle any other
-        # `triton.X` we haven't pre-listed, but pre-listing these
-        # is faster (no stub allocation on every access) and lets us
-        # set the specific attributes the callers need.
+                            setattr(_lazy_triton, _attr, getattr(_existing, _attr))
+                        except (AttributeError, TypeError):
+                            pass
+                _sys.modules["triton"] = _lazy_triton
+        # Pre-stub the submodules that have known attribute requirements
+        # (other submodules are handled by the lazy __getattr__ above).
+        # The early_config_prune / estimate_matmul_time names come from
+        # bitsandbytes.triton_based_modules; the dtype attr comes from
+        # torch._dynamo.utils. We attach the stubs directly to the
+        # _TritonLazyPackage instance for the affected modules so they're
+        # already there when callers access them.
         for _triton_pkg in ("triton.ops", "triton.ops.matmul_perf_model",
                             "triton.language", "triton.backends",
                             "triton.backends.compiler", "triton.compiler",
                             "triton.compiler.compiler",
                             "triton.runtime", "triton.testing"):
             if _triton_pkg not in _sys.modules:
-                _sys.modules[_triton_pkg] = _types.ModuleType(_triton_pkg)
-                _sys.modules[_triton_pkg].__path__ = []
+                _sys.modules[_triton_pkg] = _TritonLazyPackage(_triton_pkg)
         # Pre-set the names bitsandbytes tries to import
         _sys.modules["triton.ops.matmul_perf_model"].early_config_prune = lambda *a, **kw: None
         _sys.modules["triton.ops.matmul_perf_model"].estimate_matmul_time = lambda *a, **kw: 0.0
@@ -3766,11 +3761,12 @@ def _run_on_ray_cluster(job: dict) -> None:
             class _StubDtype:
                 def __repr__(self): return "<stub triton.language.dtype>"
             _sys.modules["triton.language"].dtype = _StubDtype()
-        # Pre-register submodule attrs on the triton package so attribute
-        # access (triton.ops, triton.backends) finds the stubs.
-        for _sub_name in ("ops", "language", "backends", "compiler", "runtime", "testing"):
-            if not hasattr(_sys.modules["triton"], _sub_name):
-                setattr(_sys.modules["triton"], _sub_name, _sys.modules[f"triton.{_sub_name}"])
+        # Pre-set `triton.backends.compiler.AttrsDescriptor` — torch._inductor
+        # does `if hasattr(triton.backends.compiler, "AttrsDescriptor")`.
+        if not hasattr(_sys.modules["triton.backends.compiler"], "AttrsDescriptor"):
+            _sys.modules["triton.backends.compiler"].AttrsDescriptor = type(
+                "AttrsDescriptor", (), {}
+            )
         for k, v in env_vars_arg.items():
             _os.environ[k] = v
         captured = _StringIO()
