@@ -2442,11 +2442,11 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     import requests as _req
 
     print(f"[train] Unsloth VLM — model: {model_name}  lora_r={lora_rank}  4bit={quantization in ('4bit','4-bit','bnb-4bit')}")
-    # Diagnostic: print torch + CUDA info BEFORE unsloth import. unsloth_zoo
-    # calls torch.cuda.is_available() (and friends) at import time and
-    # raises a hard error if it doesn't find a GPU. If this prints a
-    # version that does not see the GPU, the pip install above upgraded
-    # torch to one that doesn't match the cluster's CUDA driver.
+    # Diagnostic: print torch + CUDA + Ray worker info BEFORE unsloth import.
+    # unsloth_zoo calls torch.cuda.is_available() (and friends) at import
+    # time and raises a hard error if it doesn't find a GPU. If this prints
+    # a torch version that doesn't see the GPU, the pip install above
+    # upgraded torch to one that doesn't match the cluster's CUDA driver.
     try:
         import torch as _torch_diag
         print(f"[train]   torch={_torch_diag.__version__}  "
@@ -2454,9 +2454,25 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
               f"cuda_version={_torch_diag.version.cuda}  "
               f"device_count={_torch_diag.cuda.device_count()}")
         if _torch_diag.cuda.is_available():
-            print(f"[train]   device={_torch_diag.cuda.get_device_name(0)}")
+            for _di in range(_torch_diag.cuda.device_count()):
+                print(f"[train]   device[{_di}]={_torch_diag.cuda.get_device_name(_di)}")
     except Exception as _diag_err:
         print(f"[train]   torch diagnostic failed: {_diag_err}")
+    # Also print the worker's hostname + visible nvidia devices, so we can
+    # tell whether the Ray worker is the same host that ultralytics has
+    # been running on, and whether NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES
+    # are set to something unexpected.
+    import socket as _sock
+    print(f"[train]   hostname={_sock.gethostname()}  "
+          f"NVIDIA_VISIBLE_DEVICES={_os.environ.get('NVIDIA_VISIBLE_DEVICES', '(unset)')}  "
+          f"CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}")
+    _sp_diag = _sp.run(
+        ["bash", "-lc", "nvidia-smi -L 2>&1 | head -3 || echo 'nvidia-smi not available'"],
+        capture_output=True, text=True, timeout=10,
+    )
+    for _ln in (_sp_diag.stdout or "").splitlines():
+        if _ln.strip():
+            print(f"[train]   nvidia-smi: {_ln.strip()}")
     load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
 
     # Load model + processor. For VLMs, FastVisionModel returns (model, processor)
