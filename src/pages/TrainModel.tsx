@@ -5,7 +5,7 @@ import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, Message
 // ─── Training Types ───────────────────────────────────────────────────────────
 type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
 type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
-type TargetType  = 'prelabel' | 'finetune' | 'export'
+type TargetType  = 'finetune' | 'export'
 
 interface TrainOption {
   value: string
@@ -264,6 +264,13 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
   const [launching, setLaunching] = useState(false)
   const [jobId, setJobId] = useState('')
   const [showAllModels, setShowAllModels] = useState(false)
+  // Existing trained models — used when target='export' to let the
+  // user pick a previously-trained model to continue/export from.
+  const [existingModels, setExistingModels] = useState<Array<{
+    id: string; name: string; model_name?: string; engine?: string;
+    training_type?: string; epochs?: number; finished_at?: string;
+  }>>([])
+  const [existingModelsLoading, setExistingModelsLoading] = useState(false)
   const [clusterStatus, setClusterStatus] = useState<{
     ray:   { available: boolean; url: string; info: string }
     modal: { available: boolean; status: string; ray_url: string | null; creds_saved?: boolean; gpu_type?: string; num_workers?: number }
@@ -279,6 +286,34 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
       .then(setClusterStatus)
       .catch(() => {})
   }, [step])
+
+  // Fetch existing trained models when the user picks target='export' —
+  // step 2 then renders a list of these for the user to choose one
+  // to continue/export from. Triggered by target change, not step
+  // change, so the list is ready when the user advances to step 2.
+  useEffect(() => {
+    if (config.target !== 'export') {
+      setExistingModels([])
+      return
+    }
+    setExistingModelsLoading(true)
+    fetch('/api/jobs?view=models', { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => {
+        const jobs = Array.isArray(d) ? d : (d?.jobs ?? [])
+        setExistingModels(jobs.map((j: any) => ({
+          id: j.id,
+          name: j.name || j.id?.slice(0, 8) || 'unnamed',
+          model_name: j.model_name,
+          engine: j.engine,
+          training_type: j.training_type,
+          epochs: j.epochs,
+          finished_at: j.finished_at || j.updated_at,
+        })))
+      })
+      .catch(() => setExistingModels([]))
+      .finally(() => setExistingModelsLoading(false))
+  }, [config.target])
 
   // ── Modal Start-Cluster popup (shown when the user picks Modal but the
   //    cluster isn't running yet).  Lets them start inline rather than
@@ -464,6 +499,20 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
   const handleModelSelect = (opt: TrainOption) => {
     set('engine', opt.engine)
     set('model', opt.model)
+    setStep(3)
+  }
+
+  // When target='export', the model selection step shows previously-
+  // trained models from the existingModels list. Picking one
+  // continues with that model's engine / model_name (or a
+  // generic 'export-<id>' marker if the original model_name
+  // isn't available) and jumps to step 3 to configure the export.
+  const handleExistingModelSelect = (m: {
+    id: string; name: string; model_name?: string; engine?: string; training_type?: string;
+  }) => {
+    set('model', m.model_name || m.id)        // HF model id or our job id
+    set('engine', m.engine || 'Export')
+    if (m.training_type) set('trainingType', m.training_type as TrainingType)
     setStep(3)
   }
 
@@ -915,14 +964,12 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
                 onChange={e => set('target', e.target.value as TargetType)}
                 className="mt-1"
               >
-                <option value="prelabel">Pre-label (เตรียมข้อมูลก่อน label)</option>
                 <option value="finetune">Fine-tune (ปรับแต่งจาก pretrained)</option>
                 <option value="export">Export (export model ที่มีอยู่แล้ว)</option>
               </select>
               <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
-                {config.target === 'prelabel' && 'ใช้ AI ช่วย pre-label ก่อน เพื่อลดเวลาการ label ของ expert'}
                 {config.target === 'finetune' && 'Fine-tune จาก pretrained model เช่น ImageNet, MedCLIP'}
-                {config.target === 'export' && 'Export checkpoint ที่มีอยู่ไปเป็น format ที่ต้องการ'}
+                {config.target === 'export' && 'Export checkpoint ที่มีอยู่ไปเป็น format ที่ต้องการ — step ถัดไปจะให้เลือก existing model ที่จะ export'}
               </p>
             </div>
 
@@ -977,7 +1024,62 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
       {/* ── STEP 2: Model Selection ── */}
       {step === 2 && (
         <div>
-          <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
+          {config.target === 'export' ? (
+            <div>
+              <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Existing Model</h2>
+              <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>
+                เลือก model ที่ train เสร็จแล้ว — จะถูก export เป็น format ที่เลือกในขั้นถัดไป ({existingModels.length} model ที่ train เสร็จ)
+              </p>
+              {existingModelsLoading ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '20px', color: 'var(--text-muted)' }}>
+                  <Loader2 size={16} className="animate-spin" />
+                  กำลังโหลด existing models ...
+                </div>
+              ) : existingModels.length === 0 ? (
+                <div style={{ padding: '20px', borderRadius: 8, background: 'var(--bg-elevated)', textAlign: 'center' }}>
+                  <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 8 }}>
+                    ยังไม่มี model ที่ train เสร็จ — ไปที่ <a href="/models" style={{ color: 'var(--primary)' }}>Models</a> ดูผลงานที่ train เสร็จแล้ว
+                  </p>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    หรือกลับไปเลือก target = "Fine-tune" เพื่อ train model ใหม่จาก pretrained
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {existingModels.map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => handleExistingModelSelect(m)}
+                      className="card text-left"
+                    >
+                      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
+                        <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{m.name}</h3>
+                        {m.training_type && (
+                          <span className="badge badge-primary" style={{ fontSize: 10 }}>{m.training_type}</span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: 6 }}>
+                        <span style={{ color: 'var(--primary-hover)' }}>{m.engine || '—'}</span>
+                        <span>·</span>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.model_name || m.id}</span>
+                      </div>
+                      {m.epochs !== undefined && (
+                        <p style={{ fontSize: 11, color: 'var(--text-muted)' }}>epochs: {m.epochs}{m.finished_at ? ` · finished ${new Date(m.finished_at).toLocaleDateString()}` : ''}</p>
+                      )}
+                      <div style={{ marginTop: 8, fontSize: 12, color: 'var(--primary-hover)', fontWeight: 500 }}>
+                        เลือก model นี้ →
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="flex justify-between mt-6">
+                <button className="btn btn-secondary" onClick={prevStep}>← Back</button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 8 }}>
             <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
               {showAllModels
@@ -1110,6 +1212,8 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
           <div className="flex justify-between mt-6">
             <button className="btn btn-secondary" onClick={prevStep}>← Back</button>
           </div>
+            </div>
+          )}
         </div>
       )}
 
