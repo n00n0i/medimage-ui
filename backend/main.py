@@ -3665,24 +3665,28 @@ def _run_on_ray_cluster(job: dict) -> None:
                 _smi_text = (_smi.stdout or "") + (_smi.stderr or "")
                 print(f"[cluster] nvidia-smi (pre-flight):\n{_smi_text}",
                       file=_sys.stderr)
-                # Try multiple PyTorch cu indexes in order (newest
-                # first). cu118 wheels DID install but failed at
-                # runtime — the cluster's driver is too old to load
-                # CUDA 11.8. So include older cu indexes too:
+                # Try multiple PyTorch cu indexes in order. We saw
+                # the cluster has a 580.x driver supporting CUDA 13.0
+                # (and 2x NVIDIA H200 GPUs!), so the new cu12x/13x
+                # indexes are the right answer. Order newest-first:
+                #   cu128 — driver >= 580.x (CUDA 12.8)
+                #   cu126 — driver >= 555.x (CUDA 12.6)
+                #   cu124 — driver >= 550.x (CUDA 12.4)
+                #   cu121 — driver >= 530.x (CUDA 12.1)
                 #   cu118 — driver >= 470.x (CUDA 11.8)
-                #   cu117 — driver >= 460.x (CUDA 11.7)
-                #   cu116 — driver >= 450.x (CUDA 11.6)
-                #   cu115 — driver >= 450.x (CUDA 11.5)
-                #   cu113 — driver >= 450.x (CUDA 11.3)
-                # The cluster has been running ultralytics, so it
-                # almost certainly has CUDA 11.5+ — try cu117 first
-                # (most likely match) and fall back from there.
+                #   cu117 — driver >= 460.x (CUDA 11.7)  (fallback)
+                # cu12x wheels are forward-compatible with newer
+                # drivers, so cu124+ should all work on a CUDA 13
+                # driver. The 2.10.0+cu128 wheel that was pre-installed
+                # was apparently broken (couldn't see GPU) — that's
+                # why we override the pre-installed version.
                 _torch_attempts = [
-                    ("https://download.pytorch.org/whl/cu117", "torch==2.0.0+cu117"),
-                    ("https://download.pytorch.org/whl/cu117", "torch==1.13.1+cu117"),
-                    ("https://download.pytorch.org/whl/cu116", "torch==1.13.1+cu116"),
-                    ("https://download.pytorch.org/whl/cu115", "torch==1.13.1+cu115"),
+                    ("https://download.pytorch.org/whl/cu124", "torch==2.4.0+cu124"),
+                    ("https://download.pytorch.org/whl/cu124", "torch==2.5.0+cu124"),
+                    ("https://download.pytorch.org/whl/cu126", "torch==2.7.0+cu126"),
+                    ("https://download.pytorch.org/whl/cu121", "torch==2.1.0+cu121"),
                     ("https://download.pytorch.org/whl/cu118", "torch==2.0.0+cu118"),
+                    ("https://download.pytorch.org/whl/cu117", "torch==2.0.0+cu117"),
                 ]
                 _last_err = ""
                 for _pytorch_index, _torch_pin in _torch_attempts:
