@@ -2442,6 +2442,21 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     import requests as _req
 
     print(f"[train] Unsloth VLM — model: {model_name}  lora_r={lora_rank}  4bit={quantization in ('4bit','4-bit','bnb-4bit')}")
+    # Diagnostic: print torch + CUDA info BEFORE unsloth import. unsloth_zoo
+    # calls torch.cuda.is_available() (and friends) at import time and
+    # raises a hard error if it doesn't find a GPU. If this prints a
+    # version that does not see the GPU, the pip install above upgraded
+    # torch to one that doesn't match the cluster's CUDA driver.
+    try:
+        import torch as _torch_diag
+        print(f"[train]   torch={_torch_diag.__version__}  "
+              f"cuda_available={_torch_diag.cuda.is_available()}  "
+              f"cuda_version={_torch_diag.version.cuda}  "
+              f"device_count={_torch_diag.cuda.device_count()}")
+        if _torch_diag.cuda.is_available():
+            print(f"[train]   device={_torch_diag.cuda.get_device_name(0)}")
+    except Exception as _diag_err:
+        print(f"[train]   torch diagnostic failed: {_diag_err}")
     load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
 
     # Load model + processor. For VLMs, FastVisionModel returns (model, processor)
@@ -3475,6 +3490,23 @@ def _run_on_ray_cluster(job: dict) -> None:
              "--force-reinstall", "numpy<2.0"],
             capture_output=True,
         )
+        # Special handling for unsloth: install with --no-deps so pip doesn't
+        # touch torch. The Ray cluster's pre-installed torch is the version
+        # ultralytics uses and matches the system CUDA driver. unsloth's
+        # default deps pin a different torch range; if pip upgrades torch
+        # to satisfy them, the new torch no longer sees the GPU and
+        # unsloth_zoo.device_type raises "Unsloth cannot find any torch
+        # accelerator? You need a GPU." even though ultralytics still
+        # works fine on the same cluster. Installing unsloth with --no-deps
+        # and letting the other deps (trl, peft, datasets, boto3) install
+        # normally keeps the existing torch in place. The other deps don't
+        # pull torch (they use it, but don't depend on it as a hard pin).
+        if any("unsloth" in p for p in _pip_pkgs_for_worker):
+            _sp.run(
+                [_sys.executable, "-m", "pip", "install", "-q",
+                 "--no-deps", "unsloth"],
+                capture_output=True,
+            )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
             _sp.run(
