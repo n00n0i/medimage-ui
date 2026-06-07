@@ -2434,13 +2434,11 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     """
     print(f"[train] Unsloth VLM — model: {model_name}  lora_r={lora_rank}  4bit={quantization in ('4bit','4-bit','bnb-4bit')}")
     # Diagnostic: print torch + CUDA + Ray worker info BEFORE the unsloth
-    # import. unsloth_zoo calls torch.cuda.is_available() at import time
-    # and raises a hard error if it doesn't see a GPU. If this prints a
-    # torch that doesn't see the GPU, a previous run's pip install must
-    # have upgraded torch to a version that no longer matches the
-    # cluster's CUDA driver. The diagnostic runs *first* (before the
-    # unsloth import) so we always see the output even when the import
-    # itself fails.
+    # import. The pre-flight in _run_training_inline already verified
+    # torch.cuda.is_available() in a fresh subprocess and force-reinstalled
+    # torch==2.1.2 if not — so this is just a confirmation print, not the
+    # authoritative check. (We can't safely re-check + reinstall here
+    # because torch's C extension can't be reloaded in-process.)
     import os as _os
     import subprocess as _sp
     import sys as _sys
@@ -2463,40 +2461,17 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
     for _ln in (_sp_diag.stdout or "").splitlines():
         if _ln.strip():
             print(f"[train]   nvidia-smi: {_ln.strip()}")
-    # If torch can't see the GPU, a previous pip install (an early
-    # unsloth attempt without --no-deps) likely upgraded torch to a
-    # version that doesn't match the cluster's CUDA driver. Force-
-    # reinstall torch to a known-good version. We pick 2.1.2 because
-    # it's the latest 2.1.x and works with the CUDA 11.8 / 12.1 drivers
-    # the Ray cluster has been using for ultralytics.
     if not _torch_diag.cuda.is_available():
-        print(f"[train]   ⚠ torch cannot see GPU — force-reinstalling torch==2.1.2 ...")
-        _sp.run(
-            [_sys.executable, "-m", "pip", "install", "-q",
-             "--force-reinstall", "torch==2.1.2"],
-            capture_output=True,
+        raise RuntimeError(
+            f"torch {_torch_diag.__version__} cannot see a GPU on "
+            f"hostname={_sock.gethostname()} but the pre-flight in "
+            f"_run_training_inline said it could. Likely cause: a "
+            f"package installed AFTER the pre-flight (most likely "
+            f"unsloth itself, via its hard torch dep) upgraded torch "
+            f"again. Check the nvidia-smi output above — if the GPU "
+            f"is there but torch can't see it, the reinstall chain "
+            f"needs to also pin unsloth's hard torch dep away."
         )
-        # Clear torch from sys.modules so the next import loads the freshly-
-        # installed version. importlib.reload(torch) also works in principle
-        # but it triggers a "single TORCH_LIBRARY can be used to register
-        # the namespace triton" error because torch re-registers its
-        # internal namespaces on reload. Deleting the cached modules +
-        # a fresh import is the safe pattern.
-        for _k in list(_sys.modules.keys()):
-            if _k == "torch" or _k.startswith("torch."):
-                del _sys.modules[_k]
-        import torch as _torch_diag
-        print(f"[train]   after reinstall: torch={_torch_diag.__version__}  "
-              f"cuda_available={_torch_diag.cuda.is_available()}  "
-              f"device_count={_torch_diag.cuda.device_count()}")
-        if not _torch_diag.cuda.is_available():
-            raise RuntimeError(
-                f"torch {_torch_diag.__version__} still cannot see a GPU on "
-                f"hostname={_sock.gethostname()}. nvidia-smi output above shows "
-                f"what the kernel sees. This Ray worker is either on a different "
-                f"host than the GPU, or the cluster's CUDA driver is too old for "
-                f"torch 2.1.2. Check the diagnostic output above."
-            )
     from unsloth import FastVisionModel
     from trl import SFTTrainer, SFTConfig
     from datasets import load_dataset, Dataset as HFDataset
@@ -3555,12 +3530,59 @@ def _run_on_ray_cluster(job: dict) -> None:
                  "--no-deps", "unsloth"],
                 capture_output=True,
             )
-        # Install required packages directly — avoids the virtualenv requirement
-        if _pip_pkgs_for_worker:
+    # Install required packages directly — avoids the virtualenv requirement
+    if _pip_pkgs_for_worker:
+        _sp.run(
+            [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
+            capture_output=True,
+        )
+    # Pre-flight: if unsloth is in the install list, verify that the
+    # worker's torch can see a GPU. unsloth_zoo raises "Unsloth cannot
+    # find any torch accelerator? You need a GPU." at import time if
+    # torch.cuda.is_available() is False. A previous run's pip install
+    # may have upgraded torch to a version that doesn't match the
+    # cluster's CUDA driver. Force-reinstall torch==2.1.2 (matches the
+    # CUDA 11.8 / 12.1 drivers ultralytics has been using on this
+    # cluster) BEFORE the training script exec, so the script's first
+    # `import torch` loads the fresh version cleanly. Doing it here in
+    # the _run_training_inline process (where torch hasn't been
+    # imported yet) is essential — torch's C extension registers
+    # global state on first load and can't be reloaded in-process
+    # (causes "function '_has_torch_function' already has a docstring").
+    if any("unsloth" in p for p in _pip_pkgs_for_worker):
+        _gpu_check = _sp.run(
+            [_sys.executable, "-c",
+             "import torch; import sys; "
+             "sys.exit(0 if torch.cuda.is_available() else 1)"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if _gpu_check.returncode != 0:
+            print(f"[cluster] ⚠ torch cannot see GPU — "
+                  f"force-reinstalling torch==2.1.2 ...",
+                  file=_sys.stderr)
             _sp.run(
-                [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
-                capture_output=True,
+                [_sys.executable, "-m", "pip", "install", "-q",
+                 "--force-reinstall", "torch==2.1.2"],
+                capture_output=True, text=True, timeout=600,
             )
+            # Sanity check the new torch in a fresh subprocess
+            _gpu_recheck = _sp.run(
+                [_sys.executable, "-c",
+                 "import torch, sys; "
+                 "print(f\"torch={torch.__version__} cuda_avail={torch.cuda.is_available()} devices={torch.cuda.device_count()}\", file=sys.stderr); "
+                 "sys.exit(0 if torch.cuda.is_available() else 1)"],
+                capture_output=True, text=True, timeout=60,
+            )
+            print(_gpu_recheck.stderr.strip() or "(no output)",
+                  file=_sys.stderr)
+            if _gpu_recheck.returncode != 0:
+                raise RuntimeError(
+                    f"torch reinstall succeeded but GPU still not visible. "
+                    f"stdout: {_gpu_recheck.stdout[:300]!r} "
+                    f"stderr: {_gpu_recheck.stderr[:300]!r}. "
+                    f"This Ray worker may not have a GPU, or its CUDA driver "
+                    f"is too old for torch 2.1.2."
+                )
         # Stub sklearn submodules BEFORE exec'ing the script. The transformers
         # Trainer import chain pulls sklearn -> pandas, and on this cluster
         # pandas._libs can fail with a numpy ABI mismatch
