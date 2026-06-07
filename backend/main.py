@@ -3639,6 +3639,80 @@ def _run_on_ray_cluster(job: dict) -> None:
              "--force-reinstall", "numpy<2.0"],
             capture_output=True,
         )
+        # VLM pre-flight: ensure the worker's torch can see a GPU before
+        # the training script imports it. The cluster's pre-installed
+        # torch is sometimes a too-new +cu build (e.g. cu128) that
+        # doesn't match the cluster's CUDA driver, or a too-old build
+        # that's been superseded by a pip-resolved cu128 wheel. Force
+        # torch 2.0.0+cu118 (CUDA 11.8 build) — the most-compatible
+        # version that works across CUDA 11.7+ drivers. ultralytics
+        # has been using a similar torch on this cluster.
+        _is_vlm = env_vars_arg.get("TRAINING_TYPE") == "vlm-finetune"
+        if _is_vlm:
+            _gpu_check = _sp.run(
+                [_sys.executable, "-c",
+                 "import torch, sys; "
+                 "sys.exit(0 if torch.cuda.is_available() else 1)"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if _gpu_check.returncode != 0:
+                # Detect driver CUDA version
+                import re as _re
+                _smi = _sp.run(
+                    ["bash", "-lc", "nvidia-smi 2>&1 | head -20 || echo 'nvidia-smi not available'"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                _smi_text = (_smi.stdout or "") + (_smi.stderr or "")
+                print(f"[cluster] nvidia-smi (pre-flight):\n{_smi_text}",
+                      file=_sys.stderr)
+                _drv_match = _re.search(
+                    r"CUDA Version:\s*(\d+)\.(\d+)", _smi_text)
+                if _drv_match:
+                    _drv_major = int(_drv_match.group(1))
+                    _drv_minor = int(_drv_match.group(2))
+                else:
+                    _drv_major, _drv_minor = 11, 8  # safe default
+                # Default to cu118 (CUDA 11.8) for the broadest
+                # driver compatibility. The cluster's pre-existing
+                # torch (whatever ultralytics was using) is in
+                # /home/ray/anaconda3/ as part of anaconda3 — but
+                # pip install of VLM-related packages keeps
+                # upgrading it to cu128 wheels that don't load.
+                # cu118 has worked for ultralytics; reuse that.
+                if _drv_major >= 12 and _drv_minor >= 1:
+                    _torch_cu = "cu118"  # safer than cu121 for old drivers
+                else:
+                    _torch_cu = "cu118"
+                _torch_pin = f"torch==2.0.0+{_torch_cu}"
+                print(f"[cluster] ⚠ torch cannot see GPU — driver "
+                      f"CUDA {_drv_major}.{_drv_minor}, force-installing "
+                      f"{_torch_pin}",
+                      file=_sys.stderr)
+                _sp.run(
+                    [_sys.executable, "-m", "pip", "install", "-q",
+                     "--force-reinstall", _torch_pin],
+                    capture_output=True, text=True, timeout=600,
+                )
+                # Sanity check the new torch in a fresh subprocess
+                _gpu_recheck = _sp.run(
+                    [_sys.executable, "-c",
+                     "import torch, sys; "
+                     "print(f\"torch={torch.__version__} cuda_avail={torch.cuda.is_available()} devices={torch.cuda.device_count()}\", file=sys.stderr); "
+                     "sys.exit(0 if torch.cuda.is_available() else 1)"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                print(_gpu_recheck.stderr.strip() or "(no output)",
+                      file=_sys.stderr)
+                if _gpu_recheck.returncode != 0:
+                    raise RuntimeError(
+                        f"torch reinstall ({_torch_pin}) succeeded but "
+                        f"GPU still not visible. "
+                        f"stdout: {_gpu_recheck.stdout[:300]!r} "
+                        f"stderr: {_gpu_recheck.stderr[:300]!r}. "
+                        f"This Ray worker may not have a GPU, or its CUDA "
+                        f"driver is too old for the {_torch_cu} build of "
+                        f"torch 2.0.0. nvidia-smi output is above."
+                    )
         # Install required packages directly — avoids the virtualenv requirement
         if _pip_pkgs_for_worker:
             _sp.run(
