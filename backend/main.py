@@ -3697,6 +3697,12 @@ def _run_on_ray_cluster(job: dict) -> None:
             class, any `triton.X` access that wasn't pre-stubbed creates
             a fresh _TritonLazyPackage and caches it in sys.modules.
             Same mechanism lets `triton.X.Y` work recursively.
+
+            Every lazy package is also `__call__`-able as a no-op so
+            call patterns like `triton.Config(...)` (used in torchao
+            and bitsandbytes) succeed even when the actual
+            `triton.Config` class doesn't exist in the partial triton
+            install. The call returns the stub itself.
             """
             def __init__(self, name):
                 super().__init__(name)
@@ -3707,6 +3713,7 @@ def _run_on_ray_cluster(job: dict) -> None:
                 full = f"{self.__name__}.{name}"
                 if full not in _sys.modules:
                     sub = _TritonLazyPackage(full)
+                    sub.__call__ = lambda *a, **kw: sub  # triton.Config(...) -> sub
                     _sys.modules[full] = sub
                 return _sys.modules[full]
 
