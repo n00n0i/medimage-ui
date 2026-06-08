@@ -2877,6 +2877,8 @@ def _run_training_remote(script_b64: str, env_vars: dict) -> dict:
 def _run_on_ray_cluster(job: dict) -> None:
     """Export dataset, submit real YOLO training task to Ray cluster, poll until done."""
     import os as _os
+    _os.environ["RAY_ADDRESS"] = ""
+    _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
     import ray
 
     _os.environ["RAY_IGNORE_VERSION_MISMATCH"] = "1"
@@ -3004,38 +3006,57 @@ def _run_on_ray_cluster(job: dict) -> None:
         # is None, making ray.init(address="ray://...") crash with:
         #   TypeError: object of type 'NoneType' has no len()
         # The Jobs API (dashboard REST) works fine and doesn't need ray.init().
-        # We submit a job that runs vlm_llm_train.py on a GPU worker, then
-        # poll for completion.
+        #
+        # Shipping vlm_llm_train.py: runtime_env py_modules is validated on
+        # the dashboard node (which can't see /app/), so we embed the module
+        # as base64 in a wrapper script. The worker decodes, writes to /tmp,
+        # imports, and runs. Pip packages are specified via runtime_env["pip"].
         import requests as _ray_req
+        import base64 as _b64
 
         _ray_submit_url = f"{http_url}/api/jobs/"
-        _re_env = dict(_VLM_LLM_RUNTIME_ENV) if _VLM_LLM_RUNTIME_ENV else {}
-        # Ensure env_vars dict is plain str→str for JSON serialisation
-        _re_env["env_vars"] = dict(_re_env.get("env_vars", {}))
-        # Merge job-specific env vars into runtime_env for the worker
-        for _k, _v in env_vars.items():
-            _re_env["env_vars"][_k] = _v
 
-        # Build entrypoint: set env vars then call main() directly.
-        # Using main() instead of run() because run() redirects stdout to
-        # StringIO which hides output from the Ray Jobs log stream.
-        _env_lines = "\n".join(
-            f"os.environ[{_k!r}] = str({_v!r})"
-            for _k, _v in env_vars.items()
-        )
-        _entrypoint = (
-            "python3 -c \""
-            "import os, sys; "
-            + _env_lines.replace('"', '\\"').replace("'", "\\'") + "; "
-            "from vlm_llm_train import main; "
-            "main()\""
-        )
+        # Read vlm_llm_train.py and base64-encode for embedding in entrypoint
+        with open(_VLM_LLM_MODULE_PATH, "rb") as _f:
+            _module_b64 = _b64.b64encode(_f.read()).decode("ascii")
 
-        # Flatten all env vars into runtime_env env_vars (Ray will set them
-        # before the entrypoint runs; the inline os.environ lines above are a
-        # backup in case runtime_env env_vars don't propagate reliably).
-        _re_env = dict(_VLM_LLM_RUNTIME_ENV) if _VLM_LLM_RUNTIME_ENV else {}
-        _re_env["env_vars"] = dict(_re_env.get("env_vars", {}))
+        # The entrypoint is a self-contained Python script that:
+        #  1) Decodes vlm_llm_train.py from an inline base64 string
+        #  2) Writes it to /tmp
+        #  3) Imports and runs it, calling _vlm_setup_hook() then main()
+        #
+        # This avoids all working_dir / runtime_env shipping issues:
+        #   - data: URIs aren't supported by the Jobs REST API
+        #   - http:// URIs are rejected (only https:// is allowed)
+        #   - s3:// URIs fail because env_vars aren't set during working_dir download
+        # By embedding everything in the entrypoint command itself, we bypass
+        # all of Ray's runtime_env validation and file-shipping mechanisms.
+        _entrypoint_script = (
+            "import base64,os,sys,tempfile;"
+            "mod_b64=" + repr(_module_b64) + ";"
+            "mod_path=os.path.join(tempfile.gettempdir(),'vlm_llm_train.py');"
+            "open(mod_path,'wb').write(base64.b64decode(mod_b64));"
+            "sys.path.insert(0,tempfile.gettempdir());"
+            "from vlm_llm_train import _vlm_setup_hook,main;"
+            "_vlm_setup_hook();"
+            "main()"
+        )
+        _entrypoint = f"python3 -c {_entrypoint_script!r}"
+
+        # Build clean runtime_env: env_vars + pip packages only.
+        # No working_dir / py_modules / setup_hook — everything is
+        # embedded in the entrypoint command itself.
+        _re_env = {
+            "env_vars": {"RAY_ADDRESS": "", "RAY_RUNTIME_ENV_HOOK_DISABLED": "1", "RAY_ENABLE_AUTO_CONNECT": "0"},
+            "pip": [
+                "transformers>=4.40,<5.0", "peft>=0.10", "accelerate>=0.28",
+                "bitsandbytes>=0.43", "datasets>=2.18",
+                "boto3>=1.34", "Pillow", "numpy<2.0",
+            ],
+        }
+        if _VLM_LLM_RUNTIME_ENV and "env_vars" in _VLM_LLM_RUNTIME_ENV:
+            for _ek, _ev in _VLM_LLM_RUNTIME_ENV["env_vars"].items():
+                _re_env["env_vars"][_ek] = str(_ev)
         for _k, _v in env_vars.items():
             _re_env["env_vars"][_k] = str(_v)
 
@@ -3138,7 +3159,7 @@ def _run_on_ray_cluster(job: dict) -> None:
         # transformers/datasets deps pull numpy 2.x (size 88) and break
         # pandas._libs.interval import — which crashes Trainer import via the
         # transformers -> sklearn -> pandas chain before training can even start.
-        pip_pkgs = ["transformers>=4.40", "peft>=0.10", "accelerate>=0.28",
+        pip_pkgs = ["transformers>=4.40,<5.0", "peft>=0.10", "accelerate>=0.28",
                     "bitsandbytes>=0.43", "datasets>=2.18",
                     "boto3>=1.34", "Pillow", "numpy<2.0"]
     elif training_type == "self-supervised":
@@ -3683,6 +3704,9 @@ async def get_ray_status(job_id: str):
     if not row or not row["ray_serve_url"]:
         return {"online": False, "status": "no_url"}
     try:
+        import os as _os
+        _os.environ["RAY_ADDRESS"] = ""
+        _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
         import ray as _ray
         from ray import serve as _serve
         from urllib.parse import urlparse as _up
@@ -4082,7 +4106,7 @@ def _modal_script(req: ModalStartRequest) -> str:
             # container. Edits to the DL module are picked up on the
             # next job without rebuilding this image.
             .pip_install(
-                "transformers", "peft", "trl", "bitsandbytes",
+                "transformers<5.0", "peft", "trl", "bitsandbytes",
                 "accelerate", "datasets", "numpy<2.0",
                 "Pillow", "boto3", "requests",
             )
@@ -5195,10 +5219,13 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
             return pt
 
     # ── Init Ray and deploy ───────────────────────────────────────────────────
+    os.environ["RAY_ADDRESS"] = ""
+    os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
     import ray
     from ray import serve
 
-    _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
+    _ray_address = os.environ.get("RAY_URL", "ray://100.68.53.118:10001")
+    _ray_address = _ray_address.replace("http://", "ray://").replace(":8265", ":10001") if _ray_address else _ray_address
     if not ray.is_initialized():
         ray.init(address=_ray_address, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
 
@@ -5562,10 +5589,12 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
         else:
             pt = local_dir / "model.pt"
             raw.rename(pt)
-            return pt
+             return pt
 
+    os.environ["RAY_ADDRESS"] = ""
+    os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
     import ray
-    _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
+    _ray_address = os.environ.get("RAY_URL", "ray://100.68.53.118:10001")
     if not ray.is_initialized():
         ray.init(address=_ray_address, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
 
@@ -6006,7 +6035,7 @@ def _submit_model_deploy(ray_dashboard_url: str, payload: dict, serve_url: str, 
 
     remaining = max(60, int(deadline - time.time()))
     try:
-        proc_env = {**_os.environ, **env_vars, "RAY_ADDRESS": _ray_addr}
+        proc_env = {**_os.environ, **env_vars, "RAY_ADDRESS": "", "RAY_URL": _ray_addr, "RAY_ENABLE_AUTO_CONNECT": "0"}
         result = subprocess.run(
             [sys.executable, script_path],
             env=proc_env,
@@ -6279,9 +6308,10 @@ async def ray_infer_deploy(body: dict):
     import base64 as _b64
     # Embed serve_app.py inline so no working_dir fetch needed
     script = _SERVE_APP_PY + textwrap.dedent("""
+        import os; os.environ["RAY_ADDRESS"] = ""; os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
         import ray
         if not ray.is_initialized():
-            ray.init(address="auto", allow_multiple=True)
+            ray.init(address="auto", allow_multiple=True, log_to_driver=False)
         serve.run(InferenceApp.bind(), name="medimage-inference", route_prefix="/")
         print("medimage-inference deployed successfully")
         import time
@@ -6295,7 +6325,7 @@ async def ray_infer_deploy(body: dict):
         "entrypoint": "python -c \"import base64,os; exec(base64.b64decode(os.environ['_SCRIPT']).decode())\"",
         "runtime_env": {
             "pip": ["ray[serve]", "fastapi", "uvicorn", "python-multipart", "pillow"],
-            "env_vars": {"_SCRIPT": script_b64},
+            "env_vars": {"_SCRIPT": script_b64, "RAY_ADDRESS": "", "RAY_ENABLE_AUTO_CONNECT": "0"},
         },
     }
 
@@ -6425,6 +6455,7 @@ def model_deploy_stop(job_id: str):
     ray_client_addr = "ray://100.68.53.118:10001"
     logs = []
     try:
+        import os as _os; _os.environ["RAY_ADDRESS"] = ""; _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
         import ray as _ray
         if not _ray.is_initialized():
             _ray.init(address=ray_client_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
@@ -7087,6 +7118,7 @@ async def run_inference(
     # ── Universal external routing (Modal or Ray Serve) ──────────────────────
     async def _route_ray_client(serve_url: str, job_id_: str) -> dict:
         """Call model Ray Actor via Ray Client (no Ray Serve dependency)."""
+        import os as _os; _os.environ["RAY_ADDRESS"] = ""; _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
         import ray as _ray, asyncio as _asyncio
         _ray_addr = "ray://100.68.53.118:10001"
         if not _ray.is_initialized():

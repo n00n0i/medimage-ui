@@ -144,6 +144,7 @@ def setup_import_stubs():
     # Pre-set the names transformers actually tries to import
     sys.modules["sklearn.metrics"].f1_score = None
     sys.modules["sklearn.metrics"].matthews_corrcoef = None
+    sys.modules["sklearn.metrics"].roc_curve = None
     class _UndefinedMetricWarning(Warning):
         pass
     sys.modules["sklearn.exceptions"].UndefinedMetricWarning = _UndefinedMetricWarning
@@ -469,7 +470,7 @@ def preflight_bitsandbytes():
     # Probe: verify bitsandbytes loads with CUDA
     _probe = subprocess.run(
         [sys.executable, "-c",
-         "import torch, bitsandbytes as bnb; "
+         "import sys,torch,bitsandbytes as bnb; "
          "print(f'torch_cuda={torch.cuda.is_available()}', file=sys.stderr); "
          "print(f'bnb_ver={bnb.__version__}', file=sys.stderr); "
          "print(f'bnb_file={bnb.__file__}', file=sys.stderr)"
@@ -589,15 +590,22 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
     import zipfile as _zf
     import torch
     from transformers import (
-        AutoProcessor, AutoModelForVision2Seq,
-        BitsAndBytesConfig, TrainingArguments, Trainer,
+        AutoProcessor, BitsAndBytesConfig, TrainingArguments, Trainer,
     )
+    try:
+        from transformers import AutoModelForImageTextToText
+    except ImportError:
+        try:
+            from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
+        except ImportError:
+            from transformers import AutoModelForCausalLM as AutoModelForImageTextToText
     from peft import LoraConfig, get_peft_model
     from datasets import load_dataset, Dataset as HFDataset
     from PIL import Image as _Image
     import io as _io, base64 as _b64, glob as _glob, tempfile as _tf
 
     print(f"[train] VLM fine-tune (HF) -- model: {model_name}  lora_r={lora_rank}")
+    _is_qwen2_vl = "qwen2-vl" in model_name.lower() or "qwen2_vl" in model_name.lower()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
         raise RuntimeError(
@@ -607,17 +615,41 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
         )
 
     load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
-    bnb_cfg = BitsAndBytesConfig(
+    _model_name = model_name
+    if _is_qwen2_vl and load_in_4bit:
+        _bnb4_stem = "-bnb-4bit"
+        if _bnb4_stem in model_name:
+            _model_name = model_name.replace(_bnb4_stem, "")
+            print(f"[train] Qwen2-VL: using non-quantized checkpoint '{_model_name}' to avoid "
+                   "4-bit vision encoder corruption. Quantization will be applied at load time "
+                   "with vision modules skipped.")
+    bnb_kwargs = dict(
         load_in_4bit=load_in_4bit,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
-    ) if load_in_4bit else None
+    )
+    if _is_qwen2_vl and load_in_4bit:
+        bnb_kwargs["llm_int8_skip_modules"] = [
+            "visual", "merger",
+            "model.vision_tower", "model.multi_modal_projector",
+        ]
+    bnb_cfg = BitsAndBytesConfig(**bnb_kwargs) if load_in_4bit else None
 
     print(f"[train] Loading processor and model ...")
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, token=hf_token or True)
-    vlm = AutoModelForVision2Seq.from_pretrained(
-        model_name,
+    if _is_qwen2_vl:
+        from transformers.models.qwen2_vl import Qwen2VLImageProcessor, Qwen2VLProcessor
+        _min_pixels = 256 * 28 * 28
+        _max_pixels = 512 * 28 * 28
+        processor = Qwen2VLProcessor.from_pretrained(
+            _model_name,
+            min_pixels=_min_pixels, max_pixels=_max_pixels,
+            trust_remote_code=True, token=hf_token or True,
+        )
+    else:
+        processor = AutoProcessor.from_pretrained(_model_name, trust_remote_code=True, token=hf_token or True)
+    vlm = AutoModelForImageTextToText.from_pretrained(
+        _model_name,
         quantization_config=bnb_cfg,
         torch_dtype=torch.bfloat16 if not load_in_4bit else None,
         device_map="auto",
@@ -818,73 +850,174 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
                     return _Image.open(cand).convert("RGB")
         return None
 
-    def preprocess(examples):
-        texts, images = [], []
-        for i in range(len(examples.get("text", examples.get("instruction", [""]*len(examples))))):
-            instr_key = "text" if "text" in examples else "instruction"
-            output_key = "output" if "output" in examples else "response"
-            instruction = examples[instr_key][i] if instr_key in examples else ""
-            output = examples[output_key][i] if output_key in examples else ""
-            prompt = f"<|user|>\n{instruction}\n<|assistant|>\n{output}"
-            texts.append(prompt)
-            img = _resolve_image(examples.get("image", [None] * len(texts))[i] if "image" in examples else None)
-            if img is None:
-                img = _Image.new("RGB", (224, 224), (128, 128, 128))
-            images.append(img)
-        enc = processor(text=texts, images=images, return_tensors="pt",
-                        padding=True, truncation=True, max_length=max_seq_len)
-        enc["labels"] = enc["input_ids"].clone()
+    def _process_batch(batch_rows):
+        if _is_qwen2_vl:
+            all_encs = []
+            for r in batch_rows:
+                img = _resolve_image(r.get("image"))
+                if img is None:
+                    img = _Image.new("RGB", (224, 224), (128, 128, 128))
+                prompt = r.get("text", r.get("instruction", "Describe this image."))
+                response = r.get("output", r.get("response", ""))
+                messages = [
+                    {"role": "user", "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt},
+                    ]},
+                    {"role": "assistant", "content": response},
+                ]
+                text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                enc = processor(
+                    text=[text],
+                    images=[img],
+                    return_tensors="pt",
+                    padding=True, truncation=True,
+                    max_length=max_seq_len,
+                )
+                all_encs.append(enc)
+            enc = {}
+            _seq_keys = {"input_ids", "attention_mask", "labels"}
+            _max_len = max(e["input_ids"].shape[1] for e in all_encs)
+            for key in all_encs[0]:
+                if key in ("pixel_values", "image_grid_thw", "rope_deltas"):
+                    enc[key] = torch.cat([e[key] for e in all_encs], dim=0)
+                elif key in _seq_keys:
+                    padded = []
+                    for e in all_encs:
+                        diff = _max_len - e[key].shape[1]
+                        if diff > 0:
+                            pad_val = processor.tokenizer.pad_token_id if key == "input_ids" else (0 if key == "attention_mask" else -100)
+                            padded.append(torch.nn.functional.pad(e[key], (0, diff), value=pad_val))
+                        else:
+                            padded.append(e[key])
+                    enc[key] = torch.cat(padded, dim=0)
+                else:
+                    enc[key] = torch.cat([e[key] for e in all_encs], dim=0)
+            enc["labels"] = enc["input_ids"].clone()
+            enc["labels"][enc["labels"] == processor.image_token_id] = -100
+        else:
+            texts_for_processor = []
+            images_for_processor = []
+            for r in batch_rows:
+                text_input = f"USER:\n{r.get('text', r.get('instruction', ''))}\nASSISTANT:\n{r.get('output', r.get('response', ''))}"
+                texts_for_processor.append(text_input)
+                img = _resolve_image(r.get("image"))
+                if img is None:
+                    img = _Image.new("RGB", (224, 224), (128, 128, 128))
+                images_for_processor.append(img)
+            enc = processor(text=texts_for_processor, images=images_for_processor,
+                            return_tensors="pt", padding=True, truncation=True,
+                            max_length=max_seq_len)
+            enc["labels"] = enc["input_ids"].clone()
         return enc
 
     print(f"[train] Preprocessing {len(rows)} examples ...")
-    all_enc = {}
-    for start in range(0, len(rows), batch):
-        batch_rows = rows[start:start + batch]
-        texts, images = [], []
-        for r in batch_rows:
-            prompt = f"USER:\n{r['text']}\nASSISTANT:\n{r['output']}"
-            texts.append(prompt)
+    if _is_qwen2_vl:
+        sample_data = []
+        for r in rows:
             img = _resolve_image(r.get("image"))
             if img is None:
                 img = _Image.new("RGB", (224, 224), (128, 128, 128))
-            images.append(img)
-        enc = processor(text=texts, images=images, return_tensors="pt",
-                        padding=True, truncation=True, max_length=max_seq_len)
-        enc["labels"] = enc["input_ids"].clone()
-        for key in enc:
-            if key not in all_enc:
-                all_enc[key] = []
-            for i in range(enc[key].shape[0]):
-                all_enc[key].append(enc[key][i])
+            prompt = r.get("text", r.get("instruction", "Describe this image."))
+            response = r.get("output", r.get("response", ""))
+            messages = [
+                {"role": "user", "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ]},
+                {"role": "assistant", "content": response},
+            ]
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            enc = processor(
+                text=[text],
+                images=[img],
+                return_tensors="pt",
+                padding=True, truncation=True,
+                max_length=max_seq_len,
+            )
+            enc["labels"] = enc["input_ids"].clone()
+            enc["labels"][enc["labels"] == processor.image_token_id] = -100
+            sample = {k: v.squeeze(0) for k, v in enc.items()}
+            sample_data.append(sample)
+    else:
+        all_enc = {}
+        for start in range(0, len(rows), batch):
+            batch_rows = rows[start:start + batch]
+            enc = _process_batch(batch_rows)
+            for key in enc:
+                if key not in all_enc:
+                    all_enc[key] = []
+                for i in range(enc[key].shape[0]):
+                    all_enc[key].append(enc[key][i])
     import torch.utils.data as _tud
-    class _VLMDataset(_tud.Dataset):
-        def __init__(self, data):
-            self.data = data
-        def __len__(self):
-            return len(self.data["input_ids"])
-        def __getitem__(self, idx):
-            return {k: v[idx] for k, v in self.data.items()}
-    ds = _VLMDataset(all_enc)
+    if _is_qwen2_vl:
+        class _Qwen2VLDataset(_tud.Dataset):
+            def __init__(self, samples):
+                self.samples = samples
+            def __len__(self):
+                return len(self.samples)
+            def __getitem__(self, idx):
+                return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.samples[idx].items()}
+        ds = _Qwen2VLDataset(sample_data)
+    else:
+        class _VLMDataset(_tud.Dataset):
+            def __init__(self, data):
+                self.data = data
+            def __len__(self):
+                return len(self.data["input_ids"])
+            def __getitem__(self, idx):
+                return {k: v[idx] for k, v in self.data.items()}
+        ds = _VLMDataset(all_enc)
 
     os.environ["CLEARML_TASK_INITIALIZED"] = "1"
     os.environ.setdefault("CLEARML_API_ACCESS_KEY", "")
     os.environ.setdefault("CLEARML_API_SECRET_KEY", "")
     save_dir = f"/tmp/vlm_{job_id}"
-    train_args = TrainingArguments(
-        output_dir=save_dir,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        fp16=False, bf16=torch.cuda.is_bf16_supported(),
-        logging_steps=10,
-        save_strategy="no",
-        dataloader_num_workers=0,
-        remove_unused_columns=False,
-        report_to="none",
-    )
-    trainer = Trainer(model=vlm, args=train_args, train_dataset=ds)
-    trainer.train()
+
+    if _is_qwen2_vl:
+        print("[train] Using manual training loop for Qwen2-VL ...")
+        vlm.train()
+        _optimizer = torch.optim.AdamW([p for p in vlm.parameters() if p.requires_grad], lr=lr)
+        _n_samples = len(sample_data)
+        _global_step = 0
+        _grad_accum_steps = grad_accum * batch
+        for _epoch in range(epochs):
+            _indices = list(range(_n_samples))
+            import random as _random; _random.shuffle(_indices)
+            for _idx in _indices:
+                _sample = sample_data[_idx]
+                _batch = {k: v.unsqueeze(0).to(vlm.device) for k, v in _sample.items() if isinstance(v, torch.Tensor)}
+                _outputs = vlm(**{_k: _v for _k, _v in _batch.items() if _k != "labels" and _v is not None}, labels=_batch.get("labels"))
+                _loss = _outputs.loss / _grad_accum_steps
+                _loss.backward()
+                _global_step += 1
+                if _global_step % _grad_accum_steps == 0:
+                    _optimizer.step()
+                    _optimizer.zero_grad()
+                if _global_step % 10 == 0:
+                    print(f"[train] step {_global_step} loss={_loss.item() * _grad_accum_steps:.4f}", file=sys.stderr)
+        _optimizer.step()
+        _optimizer.zero_grad()
+    else:
+        train_args = TrainingArguments(
+            output_dir=save_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=lr,
+            fp16=False, bf16=torch.cuda.is_bf16_supported(),
+            logging_steps=10,
+            save_strategy="no",
+            dataloader_num_workers=0,
+            remove_unused_columns=False,
+            report_to="none",
+        )
+        trainer = Trainer(model=vlm, args=train_args, train_dataset=ds)
+        trainer.train()
     print("[train] VLM training complete. Saving LoRA adapter ...")
     vlm.save_pretrained(save_dir)
     processor.save_pretrained(save_dir)
@@ -1231,7 +1364,7 @@ def main():
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
         os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
     text_dataset  = os.environ.get("TEXT_DATASET", "")
     lora_rank     = int(os.environ.get("LORA_RANK", "16"))
