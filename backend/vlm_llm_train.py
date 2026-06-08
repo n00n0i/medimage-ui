@@ -190,6 +190,40 @@ def setup_import_stubs():
         )
 
 
+# ── Ray setup hook (runtime_env["setup_hook"]) ───────────────────────────
+#
+# This runs once on every Ray worker process at startup, before any task
+# body executes. Two jobs:
+#
+#   1. Alias the missing ctypes.RTLD_* flags onto the real os.RTLD_*
+#      constants. The baked /app/main.py on the worker image contains
+#      `import ctypes as _ct; mode=_ct.RTLD_NOW | _ct.RTLD_GLOBAL`,
+#      but those flags are on the os module (added in Python 3.3), not
+#      ctypes — so the lookup raises AttributeError. The hook installs
+#      the aliases so the baked code finds them. Lands without an image
+#      rebuild because py_modules ships this file to the worker.
+#
+#   2. Pre-load the real libcuda.so.1 with RTLD_NOW | RTLD_GLOBAL so its
+#      symbols win the global table even if a previous task on the same
+#      worker already loaded the conda stub from
+#      /home/ray/anaconda3/lib/stubs/.
+
+def _vlm_setup_hook():
+    import ctypes
+    import os
+    for _name in ("RTLD_LAZY", "RTLD_NOW", "RTLD_GLOBAL", "RTLD_LOCAL",
+                  "RTLD_NODELETE", "RTLD_DEEPBIND", "RTLD_MEMBER"):
+        if not hasattr(ctypes, _name) and hasattr(os, _name):
+            setattr(ctypes, _name, getattr(os, _name))
+    try:
+        ctypes.CDLL(
+            "/lib/x86_64-linux-gnu/libcuda.so.1",
+            mode=os.RTLD_NOW | os.RTLD_GLOBAL,
+        )
+    except OSError:
+        pass
+
+
 # ── torch pre-flight ──────────────────────────────────────────────────────
 #
 # The Ray image bakes a known-good torch wheel, but the host GPU's CUDA
@@ -203,10 +237,18 @@ def setup_import_stubs():
 def preflight_torch_for_vlm():
     """If the baked torch can't see a GPU, try multiple cu wheels in
     order. Surfaces every attempt's pip output on total failure so the
-    user can see what their driver supports."""
+    user can see what their driver supports.
+    
+    Installs torch AND torchvision together from the same PyTorch index
+    to guarantee version compatibility. A version mismatch between the
+    two causes ``module 'torch' has no attribute 'float4_e2m1fn_x2'``
+    or ``operator torchvision::nms does not exist`` at import time.
+    """
+    print(f"[vlm_train] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}", file=sys.stderr)
     _gpu_check = subprocess.run(
         [sys.executable, "-c",
-         "import torch, sys; "
+         "import torch, os, sys; "
+         "print(f'CVD={{os.environ.get(\"CUDA_VISIBLE_DEVICES\", \"(unset)\")}}', file=sys.stderr); "
          "sys.exit(0 if torch.cuda.is_available() else 1)"],
         capture_output=True, text=True, timeout=60,
     )
@@ -221,33 +263,71 @@ def preflight_torch_for_vlm():
     _smi_text = (_smi.stdout or "") + (_smi.stderr or "")
     print(f"[vlm_train] nvidia-smi (pre-flight):\n{_smi_text}", file=sys.stderr)
 
-    # Order newest-first so CUDA 12.x/13.x drivers pick the right wheel:
-    #   cu128 — driver >= 580.x (CUDA 12.8)
-    #   cu126 — driver >= 555.x (CUDA 12.6)
-    #   cu124 — driver >= 550.x (CUDA 12.4)
-    #   cu121 — driver >= 530.x (CUDA 12.1)
-    #   cu118 — driver >= 470.x (CUDA 11.8)
-    #   cu117 — driver >= 460.x (CUDA 11.7)  (fallback)
-    _torch_attempts = [
-        ("https://download.pytorch.org/whl/cu124", "torch==2.4.0+cu124"),
-        ("https://download.pytorch.org/whl/cu124", "torch==2.5.0+cu124"),
-        ("https://download.pytorch.org/whl/cu126", "torch==2.7.0+cu126"),
-        ("https://download.pytorch.org/whl/cu121", "torch==2.1.0+cu121"),
-        ("https://download.pytorch.org/whl/cu118", "torch==2.0.0+cu118"),
-        ("https://download.pytorch.org/whl/cu117", "torch==2.0.0+cu117"),
+    # The conda cuda-driver-dev package on the Ray worker puts no-op
+    # libcuda.so stubs in multiple directories under the conda prefix,
+    # and the PyTorch wheels we install have DT_RPATH baked into
+    # libtorch_cuda.so pointing at those stubs. DT_RPATH wins over
+    # LD_LIBRARY_PATH and LD_PRELOAD for direct-dependency loads, so
+    # the only reliable fix is to rename every stub out of the way.
+    # We glob for all libcuda.so under common conda prefixes and rename
+    # each to .disabled-by-preflight. Idempotent — no-op if already
+    # disabled or absent.
+    import glob as _glob
+    _conda_prefixes = ("/home/ray/anaconda3", "/opt/conda", "/usr/local/anaconda3")
+    for _prefix in _conda_prefixes:
+        if not os.path.isdir(_prefix):
+            continue
+        for _stub in _glob.glob(os.path.join(_prefix, "**", "stubs", "libcuda.so*"), recursive=True):
+            if _stub.endswith(".disabled-by-preflight"):
+                continue
+            if not os.path.isfile(_stub):
+                continue
+            _bak = _stub + ".disabled-by-preflight"
+            try:
+                os.replace(_stub, _bak)
+                print(f"[vlm_train] disabled conda stub: {_stub}", file=sys.stderr)
+            except OSError:
+                try:
+                    os.chmod(os.path.dirname(_stub), 0o755)
+                    os.chmod(_stub, 0o644)
+                    os.replace(_stub, _bak)
+                    print(f"[vlm_train] disabled conda stub (after chmod): {_stub}", file=sys.stderr)
+                except OSError as _e:
+                    print(f"[vlm_train] could not disable stub {_stub}: {_e}", file=sys.stderr)
+
+    _subproc_env = dict(os.environ)
+    _real_cuda_dir = "/lib/x86_64-linux-gnu"
+    _existing_ld = _subproc_env.get("LD_LIBRARY_PATH", "")
+    _subproc_env["LD_LIBRARY_PATH"] = f"{_real_cuda_dir}:{_existing_ld}" if _existing_ld else _real_cuda_dir
+    print(f"[vlm_train] using LD_LIBRARY_PATH={_subproc_env['LD_LIBRARY_PATH']}", file=sys.stderr)
+
+    # (torch, torchvision) pairs pinned from the same PyTorch wheel index.
+    # torchvision must match torch exactly; mismatched versions crash at
+    # import with missing dtype aliases or missing C extension operators.
+    _torch_tv_attempts = [
+        ("https://download.pytorch.org/whl/cu130", "torch==2.9.0+cu130",   "torchvision==0.22.0+cu130"),
+        ("https://download.pytorch.org/whl/cu128", "torch==2.7.0+cu128",   "torchvision==0.22.0+cu128"),
+        ("https://download.pytorch.org/whl/cu128", "torch==2.6.0+cu128",   "torchvision==0.21.0+cu128"),
+        ("https://download.pytorch.org/whl/cu126", "torch==2.7.0+cu126",   "torchvision==0.22.0+cu126"),
+        ("https://download.pytorch.org/whl/cu124", "torch==2.5.0+cu124",   "torchvision==0.20.0+cu124"),
+        ("https://download.pytorch.org/whl/cu124", "torch==2.4.0+cu124",   "torchvision==0.19.0+cu124"),
+        ("https://download.pytorch.org/whl/cu121", "torch==2.1.0+cu121",   "torchvision==0.16.0+cu121"),
+        ("https://download.pytorch.org/whl/cu118", "torch==2.0.0+cu118",   "torchvision==0.15.1+cu118"),
+        ("https://download.pytorch.org/whl/cu117", "torch==2.0.0+cu117",   "torchvision==0.15.1+cu117"),
     ]
     _attempt_logs = []
+    _probe_logs = []
     _last_err = ""
-    for _pytorch_index, _torch_pin in _torch_attempts:
-        print(f"[vlm_train] trying {_torch_pin} from {_pytorch_index} ...", file=sys.stderr)
+    for _pytorch_index, _torch_pin, _tv_pin in _torch_tv_attempts:
+        print(f"[vlm_train] trying {_torch_pin} + {_tv_pin} from {_pytorch_index} ...", file=sys.stderr)
         _pip_res = subprocess.run(
             [sys.executable, "-m", "pip", "install",
              "--force-reinstall", "--no-deps",
              "--index-url", _pytorch_index,
-             _torch_pin],
-            capture_output=True, text=True, timeout=600,
+             _torch_pin, _tv_pin],
+            capture_output=True, text=True, timeout=600, env=_subproc_env,
         )
-        _last_err = (f"  pin={_torch_pin}\n"
+        _last_err = (f"  torch={_torch_pin}  tv={_tv_pin}\n"
                      f"  index={_pytorch_index}\n"
                      f"  pip stdout: {_pip_res.stdout[:500]!r}\n"
                      f"  pip stderr: {_pip_res.stderr[:500]!r}\n"
@@ -256,9 +336,53 @@ def preflight_torch_for_vlm():
         if _pip_res.returncode != 0:
             print(f"[vlm_train] pip install {_torch_pin} failed:\n{_last_err}", file=sys.stderr)
             continue
+        # patchelf: prepend /lib/x86_64-linux-gnu to the RPATH of
+        # libtorch_cuda.so so the linker finds the real libcuda before
+        # any remaining conda stubs we couldn't rename. Install patchelf
+        # first if it's not on PATH.
+        try:
+            _has_patchelf = subprocess.run(
+                ["which", "patchelf"],
+                capture_output=True, text=True, timeout=5,
+            ).returncode == 0
+            if not _has_patchelf:
+                print("[vlm_train] installing patchelf ...", file=sys.stderr)
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "patchelf"],
+                    capture_output=True, text=True, timeout=60, env=_subproc_env,
+                )
+            _patchelf_probe = subprocess.run(
+                [sys.executable, "-c",
+                 "import torch, os, subprocess, glob, sys; "
+                 "_libdir = os.path.join(os.path.dirname(torch.__file__), 'lib'); "
+                 "_target = '/lib/x86_64-linux-gnu'; "
+                 "for _so in glob.glob(os.path.join(_libdir, 'libtorch_cuda*.so*')): "
+                 "  _rp = subprocess.run(['patchelf', '--print-rpath', _so], "
+                 "    capture_output=True, text=True, timeout=10).stdout.strip(); "
+                 "  if _rp and _target not in _rp: "
+                 "    _new = _target + ':' + _rp; "
+                 "    subprocess.run(['patchelf', '--force-rpath', '--set-rpath', _new, _so], "
+                 "      capture_output=True, text=True, timeout=10); "
+                 "    print(f'patchelf: {_so} rpath={_new}', file=sys.stderr); "
+                 "  else: "
+                 "    print(f'patchelf: {_so} rpath already ok ({_rp})', file=sys.stderr)"],
+                capture_output=True, text=True, timeout=30, env=_subproc_env,
+            )
+            if _patchelf_probe.stderr:
+                print(_patchelf_probe.stderr.strip(), file=sys.stderr)
+            if _patchelf_probe.returncode != 0:
+                print(f"[vlm_train] patchelf stdout: {_patchelf_probe.stdout!r}", file=sys.stderr)
+                print(f"[vlm_train] patchelf stderr: {_patchelf_probe.stderr!r}", file=sys.stderr)
+        except Exception as _e:
+            print(f"[vlm_train] patchelf step failed: {_e}", file=sys.stderr)
         _probe = subprocess.run(
             [sys.executable, "-c",
-             "import torch, sys, os, ctypes.util; "
+             "import sys, os, ctypes, ctypes.util\n"
+             # Pre-load the REAL libcuda with RTLD_GLOBAL so its symbols
+             # are in the global table BEFORE torch is imported.
+             "_rl = os.RTLD_NOW | os.RTLD_GLOBAL\n"
+             "_cdll = ctypes.CDLL('/lib/x86_64-linux-gnu/libcuda.so.1', mode=_rl)\n"
+             "import torch\n"
              "_t = torch; "
              "print(f'torch.__file__={_t.__file__}', file=sys.stderr); "
              "print(f'torch.__version__={_t.__version__}', file=sys.stderr); "
@@ -267,29 +391,20 @@ def preflight_torch_for_vlm():
              "_lc = ctypes.util.find_library('cuda'); "
              "print(f'ctypes.util.find_library(cuda)={_lc}', file=sys.stderr); "
              "print(f'LD_LIBRARY_PATH={os.environ.get(\"LD_LIBRARY_PATH\", \"(unset)\")}', file=sys.stderr); "
+             "print(f'LD_PRELOAD={os.environ.get(\"LD_PRELOAD\", \"(unset)\")}', file=sys.stderr); "
+             "_h = ctypes.CDLL('libcuda.so.1'); "
+             "print(f'ctypes.CDLL(libcuda.so.1)._name={_h._name}', file=sys.stderr); "
              "print(f'cuda_available={_t.cuda.is_available()}', file=sys.stderr); "
              "print(f'devices={_t.cuda.device_count() if _t.cuda.is_available() else 0}', file=sys.stderr); "
              "sys.exit(0 if _t.cuda.is_available() else 1)"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=_subproc_env,
         )
         print(_probe.stderr.strip() or "(no probe output)", file=sys.stderr)
+        _probe_logs.append(_probe.stderr.strip() or "(no probe output)")
         if _probe.returncode == 0:
-            print(f"[vlm_train] OK {_torch_pin} works", file=sys.stderr)
+            print(f"[vlm_train] OK {_torch_pin} + {_tv_pin} works", file=sys.stderr)
             return
-        print(f"[vlm_train] {_torch_pin} installed but GPU not visible", file=sys.stderr)
 
-    # All attempts failed
-    _drv_match = re.search(r"CUDA Version:\s*(\d+\.\d+)", _smi_text)
-    _driver_cuda = _drv_match.group(1) if _drv_match else "(not found)"
-    _all_attempts = "\n\n".join(
-        f"=== attempt {i+1}/{len(_torch_attempts)} ===\n{log}"
-        for i, log in enumerate(_attempt_logs))
-    _libcuda = subprocess.run(
-        ["bash", "-lc",
-         "ldconfig -p 2>/dev/null | grep -E 'libcuda\\.so' | head -5; "
-         "find / -name 'libcuda.so*' 2>/dev/null | head -5"],
-        capture_output=True, text=True, timeout=30,
-    )
     raise RuntimeError(
         f"All torch install attempts failed to produce a "
         f"GPU-visible build.\n\n"
@@ -297,12 +412,73 @@ def preflight_torch_for_vlm():
         f"=== nvidia-smi parsed ===\n"
         f"driver CUDA: {_driver_cuda}\n"
         f"\n"
-        f"=== every pip attempt ({len(_torch_attempts)}) ===\n"
+        f"=== every pip attempt ({len(_torch_tv_attempts)}) ===\n"
         f"{_all_attempts}\n"
+        f"\n"
+        f"=== last successful probe (most useful for diagnosis) ===\n"
+        f"{_last_probe}\n"
         f"\n"
         f"=== libcuda search ===\n"
         f"{_libcuda.stdout[:500] if _libcuda.stdout else '(not found)'}\n"
     )
+
+
+def preflight_bitsandbytes():
+    """Re-install bitsandbytes after torch is fixed so it links to
+    the CUDA build, not the CPU-only fallback. Without this,
+    bitsandbytes loads libbitsandbytes_cpu.so which crashes on
+    Qwen2-VL's 4-bit quantized attention layers with:
+      AttributeError: libbitsandbytes_cpu.so: undefined symbol: cdequantize_blockwise_fp32
+    """
+    print("[vlm_train] Pre-flight: ensuring bitsandbytes has CUDA support ...", file=sys.stderr)
+    import torch
+    if not torch.cuda.is_available():
+        print("[vlm_train] CUDA not available — skipping bitsandbytes CUDA fix", file=sys.stderr)
+        return
+
+    os.environ.setdefault("LD_LIBRARY_PATH", "")
+    _real_cuda_dir = "/lib/x86_64-linux-gnu"
+    os.environ["LD_LIBRARY_PATH"] = f"{_real_cuda_dir}:{os.environ['LD_LIBRARY_PATH']}"
+
+    # Force bitsandbytes to rebuild its CUDA kernel cache
+    _bnb_cache = os.path.join(os.path.expanduser("~"), ".cache", "bitsandbytes")
+    if os.path.isdir(_bnb_cache):
+        import shutil as _sh
+        try:
+            _sh.rmtree(_bnb_cache)
+            print(f"[vlm_train] cleared bitsandbytes cache: {_bnb_cache}", file=sys.stderr)
+        except OSError:
+            pass
+
+    # Reinstall bitsandbytes with --no-deps to avoid overwriting the
+    # carefully-matched torch+torchvision pair installed by preflight.
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
+    _res = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall",
+         "--no-deps", "bitsandbytes>=0.45.0"],
+        capture_output=True, text=True, timeout=300, env=dict(os.environ),
+    )
+    print(f"[vlm_train] bitsandbytes pip: rc={_res.returncode}", file=sys.stderr)
+    if _res.stdout:
+        for _line in _res.stdout.splitlines()[-5:]:
+            print(f"  {_line}", file=sys.stderr)
+    if _res.returncode != 0 and _res.stderr:
+        for _line in _res.stderr.splitlines()[-10:]:
+            print(f"  {_line}", file=sys.stderr)
+
+    # Probe: verify bitsandbytes loads with CUDA
+    _probe = subprocess.run(
+        [sys.executable, "-c",
+         "import torch, bitsandbytes as bnb; "
+         "print(f'torch_cuda={torch.cuda.is_available()}', file=sys.stderr); "
+         "print(f'bnb_ver={bnb.__version__}', file=sys.stderr); "
+         "print(f'bnb_file={bnb.__file__}', file=sys.stderr)"
+         ],
+        capture_output=True, text=True, timeout=30, env=dict(os.environ),
+    )
+    print(_probe.stderr.strip() or "(no bnb probe output)", file=sys.stderr)
+    if _probe.returncode != 0:
+        print(f"[vlm_train] WARNING: bitsandbytes probe failed", file=sys.stderr)
 
 
 # ── train functions ───────────────────────────────────────────────────────
@@ -396,7 +572,7 @@ def train_unsloth_llm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
 def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantization,
                         epochs, batch, grad_accum, lr, chat_template, job_id,
                         w_bucket, w_key, minio_url, minio_access, minio_secret,
-                        dataset_url=None, project_id=0, img_dir=None):
+                        dataset_url=None, project_id=0, img_dir=None, hf_token=""):
     """Fine-tune a Vision Language Model using bare HuggingFace transformers + PEFT.
 
     We use the bare-HF path (not Unsloth) because the Ray cluster bakes a
@@ -439,18 +615,20 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
     ) if load_in_4bit else None
 
     print(f"[train] Loading processor and model ...")
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, token=hf_token or True)
     vlm = AutoModelForVision2Seq.from_pretrained(
         model_name,
         quantization_config=bnb_cfg,
         torch_dtype=torch.bfloat16 if not load_in_4bit else None,
         device_map="auto",
         trust_remote_code=True,
+        token=hf_token or True,
     )
 
     lora_cfg = LoraConfig(
         r=lora_rank, lora_alpha=lora_rank * 2,
-        target_modules="all-linear",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                         "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.05, bias="none",
         task_type="CAUSAL_LM",
     )
@@ -494,12 +672,34 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
         with open(ann_path) as f:
             tasks = json.load(f)
         print(f"[train] Building VLM rows from {len(tasks)} LS tasks in project {project_id} ...")
+        import glob as _glob2
+        local_imgs = {}
+        if img_dir and os.path.isdir(img_dir):
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp", "*.gif", "*.tiff"):
+                for p in _glob2.glob(os.path.join(img_dir, "**", ext), recursive=True):
+                    local_imgs[os.path.basename(p).lower()] = p
+        print(f"[train] Found {len(local_imgs)} images in {img_dir}")
         rows = []
+        skipped_reasons = {"no_img": 0, "no_text": 0, "no_local_img": 0}
         for t in tasks:
             data = t.get("data") or {}
             anns = t.get("annotations") or t.get("predictions") or []
             img_ref = (data.get("image") or data.get("img")
                        or (data.get("upload") or {}).get("file") or "")
+            if img_ref.startswith("data:"):
+                try:
+                    _header, _b64data = img_ref.split(",", 1)
+                    _mime = _header.split(";")[0].split(":")[1] if ":" in _header else "image/png"
+                    _ext = _mime.split("/")[-1].replace("jpeg", "jpg")
+                    _img_bytes = base64.b64decode(_b64data)
+                    _img_path = os.path.join(img_dir or _tf.mkdtemp(prefix="vlm_b64_"), f"task_{t.get('id', len(rows))}.{_ext}")
+                    os.makedirs(os.path.dirname(_img_path), exist_ok=True)
+                    with open(_img_path, "wb") as _f:
+                        _f.write(_img_bytes)
+                    img_ref = _img_path
+                    print(f"[train] Decoded base64 image {_mime} -> {_img_path} ({len(_img_bytes)} bytes)")
+                except Exception as _e:
+                    print(f"[warn] Failed to decode base64 image: {_e}")
             text_out = ""
             for a in anns:
                 res = a.get("result") or []
@@ -510,6 +710,27 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
                     if isinstance(v, str) and v.strip():
                         text_out = v.strip()
                         break
+                    if isinstance(v, dict):
+                        vt = v.get("text")
+                        if isinstance(vt, str) and vt.strip():
+                            text_out = vt.strip()
+                        elif isinstance(vt, list):
+                            text_out = " ".join(str(x) for x in vt if x).strip()
+                        if text_out:
+                            break
+                        for k in ("choices", "_choices", "rectanglelabels",
+                                   "polygonlabels", "keypointlabels", "brushlabels"):
+                            if isinstance(v.get(k), list):
+                                parts = []
+                                for c in v[k]:
+                                    if isinstance(c, str):
+                                        parts.append(c)
+                                    elif isinstance(c, dict):
+                                        parts.append(c.get("text", c.get("value", "")))
+                                text_out = " ".join(parts).strip()
+                                if text_out:
+                                    break
+                                break
                     if isinstance(v, list):
                         for choice in v:
                             if isinstance(choice, dict):
@@ -517,19 +738,36 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
                                 if texts:
                                     text_out = " ".join(texts)
                                     break
+                            elif isinstance(choice, str) and choice.strip():
+                                text_out = choice.strip()
+                                break
                         if text_out:
                             break
                 if text_out:
                     break
-            if not img_ref or not text_out:
+            if not text_out:
+                skipped_reasons["no_text"] += 1
+                continue
+            if not img_ref:
+                skipped_reasons["no_img"] += 1
                 continue
             local_img = None
-            cand_paths = [img_ref, os.path.join(img_dir, os.path.basename(img_ref))]
+            img_basename = os.path.basename(img_ref)
+            cand_paths = [img_ref, os.path.join(img_dir, img_basename)]
             for c in cand_paths:
                 if os.path.isfile(c):
                     local_img = c
                     break
+            if not local_img and img_basename.lower() in local_imgs:
+                local_img = local_imgs[img_basename.lower()]
+            if not local_img and local_imgs:
+                img_lower = img_basename.lower()
+                for _bn, _fp in local_imgs.items():
+                    if _bn.startswith(img_lower[:img_lower.rfind('.')]) or img_lower.startswith(_bn[:_bn.rfind('.')]):
+                        local_img = _fp
+                        break
             if not local_img:
+                skipped_reasons["no_local_img"] += 1
                 continue
             rows.append({
                 "text": data.get("prompt", data.get("question", "Describe this image.")),
@@ -537,8 +775,15 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
                 "image": local_img,
             })
         if not rows:
+            _sample = tasks[0] if tasks else {}
+            _sample_img = ((_sample.get('data') or {}).get('image') or 'none')
             raise RuntimeError(
                 f"Built 0 VLM rows from {len(tasks)} tasks. "
+                f"Skipped: {skipped_reasons}. "
+                f"Sample img_ref: {_sample_img}. "
+                f"Images in dir ({len(local_imgs)}): {list(local_imgs.values())[:5]}. "
+                f"Sample task data keys: {list((_sample.get('data') or {}).keys())}. "
+                f"Sample annotation: {(_sample.get('annotations') or [{}])[0] if _sample.get('annotations') else 'none'}. "
                 f"Check that LS annotations have a 'text' value and images are in the zip."
             )
         print(f"[train] Built {len(rows)} VLM conversation rows from project {project_id}")
@@ -592,10 +837,38 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
         return enc
 
     print(f"[train] Preprocessing {len(rows)} examples ...")
-    ds = HFDataset.from_list(rows)
-    ds = ds.map(preprocess, batched=True, batch_size=4, remove_columns=ds.column_names)
-    ds.set_format("torch")
+    all_enc = {}
+    for start in range(0, len(rows), batch):
+        batch_rows = rows[start:start + batch]
+        texts, images = [], []
+        for r in batch_rows:
+            prompt = f"USER:\n{r['text']}\nASSISTANT:\n{r['output']}"
+            texts.append(prompt)
+            img = _resolve_image(r.get("image"))
+            if img is None:
+                img = _Image.new("RGB", (224, 224), (128, 128, 128))
+            images.append(img)
+        enc = processor(text=texts, images=images, return_tensors="pt",
+                        padding=True, truncation=True, max_length=max_seq_len)
+        enc["labels"] = enc["input_ids"].clone()
+        for key in enc:
+            if key not in all_enc:
+                all_enc[key] = []
+            for i in range(enc[key].shape[0]):
+                all_enc[key].append(enc[key][i])
+    import torch.utils.data as _tud
+    class _VLMDataset(_tud.Dataset):
+        def __init__(self, data):
+            self.data = data
+        def __len__(self):
+            return len(self.data["input_ids"])
+        def __getitem__(self, idx):
+            return {k: v[idx] for k, v in self.data.items()}
+    ds = _VLMDataset(all_enc)
 
+    os.environ["CLEARML_TASK_INITIALIZED"] = "1"
+    os.environ.setdefault("CLEARML_API_ACCESS_KEY", "")
+    os.environ.setdefault("CLEARML_API_SECRET_KEY", "")
     save_dir = f"/tmp/vlm_{job_id}"
     train_args = TrainingArguments(
         output_dir=save_dir,
@@ -608,6 +881,7 @@ def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantiz
         save_strategy="no",
         dataloader_num_workers=0,
         remove_unused_columns=False,
+        report_to="none",
     )
     trainer = Trainer(model=vlm, args=train_args, train_dataset=ds)
     trainer.train()
@@ -724,13 +998,35 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
             )
         with open(ann_path) as f:
             tasks = json.load(f)
+        import glob as _glob2
+        local_imgs = {}
+        if img_dir and os.path.isdir(img_dir):
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp", "*.gif", "*.tiff"):
+                for p in _glob2.glob(os.path.join(img_dir, "**", ext), recursive=True):
+                    local_imgs[os.path.basename(p).lower()] = p
+        print(f"[train] Found {len(local_imgs)} images in {img_dir} (unsloth)")
         print(f"[train] Building VLM rows from {len(tasks)} LS tasks in project {project_id} ...")
         rows = []
+        skipped_reasons = {"no_img": 0, "no_text": 0, "no_local_img": 0}
         for t in tasks:
             data = t.get("data") or {}
             anns = t.get("annotations") or t.get("predictions") or []
             img_ref = (data.get("image") or data.get("img")
                        or (data.get("upload") or {}).get("file") or "")
+            if img_ref.startswith("data:"):
+                try:
+                    _header, _b64data = img_ref.split(",", 1)
+                    _mime = _header.split(";")[0].split(":")[1] if ":" in _header else "image/png"
+                    _ext = _mime.split("/")[-1].replace("jpeg", "jpg")
+                    _img_bytes = base64.b64decode(_b64data)
+                    _img_path = os.path.join(img_dir or _tf.mkdtemp(prefix="vlm_b64_"), f"task_{t.get('id', len(rows))}.{_ext}")
+                    os.makedirs(os.path.dirname(_img_path), exist_ok=True)
+                    with open(_img_path, "wb") as _f:
+                        _f.write(_img_bytes)
+                    img_ref = _img_path
+                    print(f"[train] Decoded base64 image {_mime} -> {_img_path} ({len(_img_bytes)} bytes)")
+                except Exception as _e:
+                    print(f"[warn] Failed to decode base64 image: {_e}")
             text_out = ""
             for a in anns:
                 res = a.get("result") or []
@@ -741,6 +1037,27 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
                     if isinstance(v, str) and v.strip():
                         text_out = v.strip()
                         break
+                    if isinstance(v, dict):
+                        vt = v.get("text")
+                        if isinstance(vt, str) and vt.strip():
+                            text_out = vt.strip()
+                        elif isinstance(vt, list):
+                            text_out = " ".join(str(x) for x in vt if x).strip()
+                        if text_out:
+                            break
+                        for k in ("choices", "_choices", "rectanglelabels",
+                                   "polygonlabels", "keypointlabels", "brushlabels"):
+                            if isinstance(v.get(k), list):
+                                parts = []
+                                for c in v[k]:
+                                    if isinstance(c, str):
+                                        parts.append(c)
+                                    elif isinstance(c, dict):
+                                        parts.append(c.get("text", c.get("value", "")))
+                                text_out = " ".join(parts).strip()
+                                if text_out:
+                                    break
+                                break
                     if isinstance(v, list):
                         for choice in v:
                             if isinstance(choice, dict):
@@ -748,19 +1065,36 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
                                 if texts:
                                     text_out = " ".join(texts)
                                     break
+                            elif isinstance(choice, str) and choice.strip():
+                                text_out = choice.strip()
+                                break
                         if text_out:
                             break
                 if text_out:
                     break
-            if not img_ref or not text_out:
+            if not text_out:
+                skipped_reasons["no_text"] += 1
+                continue
+            if not img_ref:
+                skipped_reasons["no_img"] += 1
                 continue
             local_img = None
-            cand_paths = [img_ref, os.path.join(img_dir, os.path.basename(img_ref))]
+            img_basename = os.path.basename(img_ref)
+            cand_paths = [img_ref, os.path.join(img_dir, img_basename)]
             for c in cand_paths:
                 if os.path.isfile(c):
                     local_img = c
                     break
+            if not local_img and img_basename.lower() in local_imgs:
+                local_img = local_imgs[img_basename.lower()]
+            if not local_img and local_imgs:
+                img_lower = img_basename.lower()
+                for _bn, _fp in local_imgs.items():
+                    if _bn.startswith(img_lower[:img_lower.rfind('.')]) or img_lower.startswith(_bn[:_bn.rfind('.')]):
+                        local_img = _fp
+                        break
             if not local_img:
+                skipped_reasons["no_local_img"] += 1
                 continue
             rows.append({
                 "text": data.get("prompt", data.get("question", "Describe this image.")),
@@ -768,8 +1102,15 @@ def train_unsloth_vlm(model_name, text_dataset, max_seq_len, lora_rank, quantiza
                 "image": local_img,
             })
         if not rows:
+            _sample = tasks[0] if tasks else {}
+            _sample_img = ((_sample.get('data') or {}).get('image') or 'none')
             raise RuntimeError(
                 f"Built 0 VLM rows from {len(tasks)} tasks. "
+                f"Skipped: {skipped_reasons}. "
+                f"Sample img_ref: {_sample_img}. "
+                f"Images in dir ({len(local_imgs)}): {list(local_imgs.values())[:5]}. "
+                f"Sample task data keys: {list((_sample.get('data') or {}).keys())}. "
+                f"Sample annotation: {(_sample.get('annotations') or [{}])[0] if _sample.get('annotations') else 'none'}. "
                 f"Check that LS annotations have a 'text' value and images are in the zip."
             )
         print(f"[train] Built {len(rows)} VLM conversation rows from project {project_id}")
@@ -890,6 +1231,7 @@ def main():
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
         os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
     text_dataset  = os.environ.get("TEXT_DATASET", "")
     lora_rank     = int(os.environ.get("LORA_RANK", "16"))
@@ -900,10 +1242,26 @@ def main():
 
     print(f"[vlm_train] Job {job_id} -- engine={engine} type={training_type} model={model_name} epochs={epochs}")
 
-    # Torch pre-flight: only meaningful for VLM (which uses CUDA). The
-    # LLM path goes through Unsloth which has its own torch handling.
+    # Force-load the real libcuda.so.1 first via ctypes so its symbols
+    # win the global table even if a previous task on this worker
+    # already loaded the conda stub. The Modal Ray image ships
+    # cuda-driver-dev which puts no-op libcuda.so stubs in
+    # /home/ray/anaconda3/lib/stubs/, and libtorch_cuda.so has those
+    # paths in its DT_RPATH, so LD_LIBRARY_PATH / LD_PRELOAD are
+    # ignored. Loading the real libcuda here with RTLD_NOW |
+    # RTLD_GLOBAL puts its symbols into the global table before torch
+    # dlopens libcuda later. RTLD_* live on the os module, not ctypes.
     if training_type == "vlm-finetune":
+        try:
+            import ctypes
+            ctypes.CDLL(
+                "/lib/x86_64-linux-gnu/libcuda.so.1",
+                mode=os.RTLD_NOW | os.RTLD_GLOBAL,
+            )
+        except OSError:
+            pass
         preflight_torch_for_vlm()
+        preflight_bitsandbytes()
 
     # Install import stubs before any training code runs. The transformers
     # Trainer / bitsandbytes import chain pulls triton / sklearn, and the
@@ -934,6 +1292,7 @@ def main():
             epochs, batch, grad_accum, lr, chat_template,
             job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
             dataset_url=dataset_url, project_id=project_id,
+            hf_token=hf_token,
         )
         print("[vlm_train] Complete!")
         return

@@ -9,6 +9,8 @@ PyJWT>=2.8.0
 cryptography>=41.0.0
 httpx>=0.27.0
 numpy<2.0
+pyarrow>=14.0.0
+clearml>=1.16.0
 ray[default]==2.55.0
 pyotp>=2.9.0
 qrcode[pil]>=7.4.2

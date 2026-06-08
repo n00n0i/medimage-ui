@@ -927,47 +927,47 @@ def _diagnose_minio_for_ray() -> str:
         lines.append(f"  {'✓' if ok else '✗'} {host}:{port} {'reachable' if ok else 'UNREACHABLE'}")
     return "\n".join(lines)
 
-# ─── VLM/LLM source shipping ──────────────────────────────────────────────────
-#
-# The Modal Ray image bakes deps (transformers / peft / trl / bitsandbytes /
-# accelerate / datasets / numpy<2.0) but NOT vlm_llm_train.py itself, because
-# .add_local_python_source() only injects the module into the Modal function's
-# own Python process — Ray workers it spawns run in a fresh Python process
-# where that import is unavailable.
-#
-# Workaround: read vlm_llm_train.py at API startup, base64-encode it once,
-# cache it, and ship the base64 string as a Ray task argument. The Ray
-# worker decodes it, writes to /app/vlm_llm_train.py (idempotent — skip if
-# already there from a previous task or shared filesystem), adds /app to
-# sys.path, and then `import vlm_llm_train` works normally.
-#
-# The local Ray cluster case (worker shares the API container's filesystem)
-# also works — /app/vlm_llm_train.py is already on disk, the write is a
-# no-op, the import resolves against the file directly.
+# ─── VLM/LLM module shipping (Ray runtime_env) ───────────────────────────────
+# vlm_llm_train.py is shipped to workers via Ray's runtime_env["py_modules"].
+# Ray requires this to be set at job level (ray.init), not per-task, so we
+# resolve the path once at API startup and pass the same runtime_env to every
+# ray.init() call — the first one wins (ignore_reinit_error=True on the rest).
+# Workers cache the module, so edits to vlm_llm_train.py are picked up on the
+# next job without restarting the cluster.
+_VLM_LLM_MODULE_PATH: str = ""
+try:
+    _candidate = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "vlm_llm_train.py"
+    )
+    if os.path.isfile(_candidate):
+        _VLM_LLM_MODULE_PATH = _candidate
+except Exception:
+    pass
 
-_VLM_LLM_TRAIN_SOURCE_B64: str = ""
-_VLM_LLM_TRAIN_SOURCE_LOADED: bool = False
-
-def _load_vlm_llm_source_b64() -> str:
-    """Read vlm_llm_train.py from the same directory as main.py and
-    return its base64 encoding. Cached after first call. Returns "" if
-    the file is missing (caller will see the import fail with a clear
-    error)."""
-    global _VLM_LLM_TRAIN_SOURCE_B64, _VLM_LLM_TRAIN_SOURCE_LOADED
-    if _VLM_LLM_TRAIN_SOURCE_LOADED:
-        return _VLM_LLM_TRAIN_SOURCE_B64
-    # __file__ resolves to this module's path (main.py's location)
-    # whether the module is imported as `main` or run as `__main__`.
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _path = os.path.join(_here, "vlm_llm_train.py")
-    if not os.path.isfile(_path):
-        # Fallback: relative to CWD (Modal's default is /root/)
-        _path = os.path.join(os.getcwd(), "vlm_llm_train.py")
-    if os.path.isfile(_path):
-        with open(_path, "rb") as _f:
-            _VLM_LLM_TRAIN_SOURCE_B64 = base64.b64encode(_f.read()).decode()
-    _VLM_LLM_TRAIN_SOURCE_LOADED = True
-    return _VLM_LLM_TRAIN_SOURCE_B64
+_VLM_LLM_RUNTIME_ENV: dict = (
+    {
+        "py_modules": [_VLM_LLM_MODULE_PATH],
+        "env_vars": {
+            # The Modal Ray image ships conda's cuda-driver-dev package
+            # which puts no-op libcuda.so stubs in
+            # /home/ray/anaconda3/lib/stubs/. libtorch_cuda.so has these
+            # paths in its DT_RPATH, so LD_LIBRARY_PATH is ignored —
+            # torch always loads the stub and cuda.is_available() is
+            # False. LD_PRELOAD forces the real driver to be loaded
+            # first, ahead of any DT_RPATH lookup, and its symbols
+            # occupy the global table before the stub gets a chance.
+            "LD_PRELOAD": "/lib/x86_64-linux-gnu/libcuda.so.1",
+        },
+        # Ray runs this on every worker once, before any task body.
+        # It aliases ctypes.RTLD_* onto os.RTLD_* so the baked
+        # /app/main.py's `mode=_ct.RTLD_NOW | _ct.RTLD_GLOBAL` works
+        # without an image rebuild, and it pre-loads the real
+        # libcuda.so.1 to defeat the conda stub. Shipped per-task
+        # via py_modules above — main.py is baked into the image
+        # and only updates on rebuild.
+        "setup_hook": "vlm_llm_train._vlm_setup_hook",
+    } if _VLM_LLM_MODULE_PATH else {}
+)
 
 # ─── Real Training Helpers ────────────────────────────────────────────────────
 
@@ -2984,90 +2984,134 @@ def _run_on_ray_cluster(job: dict) -> None:
     # datasets / unsloth / numpy<2.0), so this path doesn't pip-install
     # anything per-job. Keeps the VLM/LLM code isolated from the DL path
     # below so changes to one don't affect the other.
+    #
+    # main.py is the dispatcher only — it does NOT import vlm_llm_train.
+    # The DL module is shipped to the worker via Ray's runtime_env
+    # (py_modules), so workers get the source without baking it into the
+    # image, and edits to vlm_llm_train.py are picked up on the next
+    # task without redeploying main.py.
     _is_vlm_llm = (engine == "Unsloth") or (training_type == "vlm-finetune")
     if _is_vlm_llm:
-        _vlm_llm_source_b64 = _load_vlm_llm_source_b64()
-        if not _vlm_llm_source_b64:
+        if not _VLM_LLM_MODULE_PATH:
             raise RuntimeError(
                 "vlm_llm_train.py not found next to main.py — the VLM/LLM "
                 "training module is required for this job. Make sure "
                 "vlm_llm_train.py is in the backend/ directory."
             )
-        def _run_vlm_llm_inline(env_vars_arg: dict, source_b64: str) -> dict:
-            """Ray-remote body for VLM/LLM jobs. Materialises
-            vlm_llm_train.py on the Ray worker (Modal's image bakes the
-            deps but not the source) and delegates to its run().
 
-            Modal's .add_local_python_source() only injects the module
-            into the Modal function's own Python process; Ray workers
-            it spawns run in a fresh Python process where that import
-            is unavailable. We work around it by shipping the source
-            code as a base64 string in the task arg, writing it to
-            /app/vlm_llm_train.py on the worker (idempotent), and
-            adding /app to sys.path before importing.
+        # ── Submit via Ray Jobs REST API ──────────────────────────────────
+        # Ray 2.55.0's client server has a bug where _runtime_env_agent_address
+        # is None, making ray.init(address="ray://...") crash with:
+        #   TypeError: object of type 'NoneType' has no len()
+        # The Jobs API (dashboard REST) works fine and doesn't need ray.init().
+        # We submit a job that runs vlm_llm_train.py on a GPU worker, then
+        # poll for completion.
+        import requests as _ray_req
 
-            On a local Ray cluster where the worker shares the API
-            container's filesystem, the file is already on disk and
-            the write is a no-op — the import resolves against the
-            real file. The 1-arg form (no source_b64) is supported
-            for the local case for backwards compatibility, falling
-            back to whatever /app/vlm_llm_train.py is already there.
-            """
-            import os as _os, sys as _sys, base64 as _b64
-            _target = "/app/vlm_llm_train.py"
-            if source_b64 and not _os.path.isfile(_target):
-                with open(_target, "wb") as _f:
-                    _f.write(_b64.b64decode(source_b64))
-            elif not source_b64 and not _os.path.isfile(_target):
-                raise RuntimeError(
-                    f"vlm_llm_train.py missing on worker and no source "
-                    f"supplied (looked at {_target})"
-                )
-            if "/app" not in _sys.path:
-                _sys.path.insert(0, "/app")
-            from vlm_llm_train import run as _run_vlm_llm
-            return _run_vlm_llm(env_vars_arg)
+        _ray_submit_url = f"{http_url}/api/jobs/"
+        _re_env = dict(_VLM_LLM_RUNTIME_ENV) if _VLM_LLM_RUNTIME_ENV else {}
+        # Ensure env_vars dict is plain str→str for JSON serialisation
+        _re_env["env_vars"] = dict(_re_env.get("env_vars", {}))
+        # Merge job-specific env vars into runtime_env for the worker
+        for _k, _v in env_vars.items():
+            _re_env["env_vars"][_k] = _v
 
-        with _run_on_ray_cluster._lock:
-            ray.init(address=ray_addr, ignore_reinit_error=True)
-            _append_log(job_id, f"[cluster] Connected ({len(ray.nodes())} node(s))")
-            _set_step(job_id, "submit")
-            remote_fn = ray.remote(_run_vlm_llm_inline)
-            future    = remote_fn.remote(env_vars, _vlm_llm_source_b64)
-            _append_log(job_id, "[cluster] VLM/LLM training task submitted, waiting ...")
+        # Build entrypoint: set env vars then call main() directly.
+        # Using main() instead of run() because run() redirects stdout to
+        # StringIO which hides output from the Ray Jobs log stream.
+        _env_lines = "\n".join(
+            f"os.environ[{_k!r}] = str({_v!r})"
+            for _k, _v in env_vars.items()
+        )
+        _entrypoint = (
+            "python3 -c \""
+            "import os, sys; "
+            + _env_lines.replace('"', '\\"').replace("'", "\\'") + "; "
+            "from vlm_llm_train import main; "
+            "main()\""
+        )
 
-            elapsed  = 0
-            poll_sec = 15
-            training_step_set = False
-            while True:
-                time.sleep(poll_sec)
-                elapsed += poll_sec
-                ready, _ = ray.wait([future], timeout=0)
-                if ready:
-                    break
-                if not training_step_set:
-                    _set_step(job_id, "training")
-                    training_step_set = True
-                _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s elapsed) ...")
+        # Flatten all env vars into runtime_env env_vars (Ray will set them
+        # before the entrypoint runs; the inline os.environ lines above are a
+        # backup in case runtime_env env_vars don't propagate reliably).
+        _re_env = dict(_VLM_LLM_RUNTIME_ENV) if _VLM_LLM_RUNTIME_ENV else {}
+        _re_env["env_vars"] = dict(_re_env.get("env_vars", {}))
+        for _k, _v in env_vars.items():
+            _re_env["env_vars"][_k] = str(_v)
 
-            result = ray.get(future)
+        _payload = {
+            "entrypoint": _entrypoint,
+            "runtime_env": _re_env,
+        }
 
-        # Save full stdout to log
-        stdout = result.get("stdout", "")
-        for line in stdout.splitlines():
-            if line.strip():
-                _append_log(job_id, line)
+        _set_step(job_id, "submit")
+        _append_log(job_id, f"[cluster] Submitting VLM/LLM job via Ray Jobs API ...")
+        try:
+            _resp = _ray_req.post(_ray_submit_url, json=_payload, timeout=30)
+            _resp.raise_for_status()
+            _job_data = _resp.json()
+            _ray_job_id = _job_data.get("submission_id") or _job_data.get("job_id")
+            _append_log(job_id, f"[cluster] Ray job submitted: {_ray_job_id}")
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Ray job submission failed: {_e}")
+            raise
+
+        # Poll for job completion via the dashboard REST API
+        _set_step(job_id, "training")
+        _last_status = ""
+        elapsed = 0
+        poll_sec = 15
+        while True:
+            time.sleep(poll_sec)
+            elapsed += poll_sec
+            try:
+                _status_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}", timeout=10)
+                _status_resp.raise_for_status()
+                _ray_status = _status_resp.json().get("status", "UNKNOWN")
+            except Exception as _e:
+                _append_log(job_id, f"[cluster] Status poll failed: {_e}")
+                _ray_status = _last_status
+
+            if _ray_status != _last_status:
+                _append_log(job_id, f"[cluster] Ray job status: {_ray_status}")
+                _last_status = _ray_status
+
+            if _ray_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+                break
+
+            _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s) ...")
+
+        # Fetch logs and parse weights path from WEIGHTS_UPLOADED lines
+        _weights_path = None
+        _all_log_lines = []
+        try:
+            _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
+            if _logs_resp.ok:
+                for _line in _logs_resp.text.splitlines():
+                    _line_s = _line.strip()
+                    if _line_s:
+                        _all_log_lines.append(_line_s)
+                        _append_log(job_id, _line_s)
+                        # Parse: WEIGHTS_UPLOADED: s3://bucket/key
+                        if "WEIGHTS_UPLOADED:" in _line_s:
+                            for _part in _line_s.split():
+                                if _part.startswith("s3://"):
+                                    _weights_path = _part
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Could not fetch logs: {_e}")
+
+        if _ray_status != "SUCCEEDED":
+            raise RuntimeError(f"Ray job {_ray_job_id} ended with status: {_ray_status}")
 
         _set_step(job_id, "saving")
-        weights_path = result.get("weights_path")
-        if weights_path:
+        if _weights_path:
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET s3_weights_path = ? WHERE id = ?",
-                    (weights_path, job_id),
+                    (_weights_path, job_id),
                 )
                 conn.commit()
-        _append_log(job_id, f"✓ Training complete — weights: {weights_path or '(not found)'}")
+        _append_log(job_id, f"✓ Training complete — weights: {_weights_path or '(not found)'}")
         _set_step(job_id, "done")
         _set_status(job_id, "completed")
         return
@@ -3159,7 +3203,12 @@ def _run_on_ray_cluster(job: dict) -> None:
     # Keep Ray connection alive after training (don't shutdown — other threads may
     # be using it for serve deployments concurrently)
     with _run_on_ray_cluster._lock:
-        ray.init(address=ray_addr, ignore_reinit_error=True)
+        ray.init(
+            address=ray_addr,
+            ignore_reinit_error=True,
+            allow_multiple=True,
+            runtime_env=_VLM_LLM_RUNTIME_ENV,
+        )
         _append_log(job_id, f"[cluster] Connected ({len(ray.nodes())} node(s))")
 
         _set_step(job_id, "submit")
@@ -3640,7 +3689,7 @@ async def get_ray_status(job_id: str):
         _host = _up(row["ray_serve_url"]).hostname or "100.68.53.118"
         _addr = f"ray://{_host}:10001"
         if not _ray.is_initialized():
-            _ray.init(address=_addr, ignore_reinit_error=True, log_to_driver=False)
+            _ray.init(address=_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
 
         # 1) Detached Ray actor (model-{job_id}) — preferred, since
         #    that's what the modal-model-deploy path creates and what
@@ -4028,13 +4077,10 @@ def _modal_script(req: ModalStartRequest) -> str:
             # force-reinstalls cu wheels if the pre-installed torch
             # can't see a GPU.
             #
-            # vlm_llm_train.py itself is NOT baked via
-            # .add_local_python_source() — that only makes the module
-            # importable in the Modal function's own Python process, not
-            # in Ray workers it spawns. We ship the source as a base64
-            # string from the API container at job-start time, and the
-            # Ray worker writes it to /app/vlm_llm_train.py before
-            # importing. See _run_vlm_llm_inline.
+            # vlm_llm_train.py is NOT baked into the image — it's shipped
+            # per-task via Ray's runtime_env["py_modules"] from the API
+            # container. Edits to the DL module are picked up on the
+            # next job without rebuilding this image.
             .pip_install(
                 "transformers", "peft", "trl", "bitsandbytes",
                 "accelerate", "datasets", "numpy<2.0",
@@ -5154,7 +5200,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
 
     _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
     if not ray.is_initialized():
-        ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
+        ray.init(address=_ray_address, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
 
     # Pin actors to the head node using the built-in internal head resource.
     # Ray always exposes node:__internal_head__ on the head node.
@@ -5521,7 +5567,7 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
     import ray
     _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
     if not ray.is_initialized():
-        ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
+        ray.init(address=_ray_address, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
 
     @ray.remote(num_cpus=1)
     class ModelInferenceActor:
@@ -6235,7 +6281,7 @@ async def ray_infer_deploy(body: dict):
     script = _SERVE_APP_PY + textwrap.dedent("""
         import ray
         if not ray.is_initialized():
-            ray.init(address="auto")
+            ray.init(address="auto", allow_multiple=True)
         serve.run(InferenceApp.bind(), name="medimage-inference", route_prefix="/")
         print("medimage-inference deployed successfully")
         import time
@@ -6381,7 +6427,7 @@ def model_deploy_stop(job_id: str):
     try:
         import ray as _ray
         if not _ray.is_initialized():
-            _ray.init(address=ray_client_addr, ignore_reinit_error=True, log_to_driver=False)
+            _ray.init(address=ray_client_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
         try:
             _actor = _ray.get_actor(actor_name, namespace="default")
             _ray.kill(_actor)
@@ -7044,7 +7090,7 @@ async def run_inference(
         import ray as _ray, asyncio as _asyncio
         _ray_addr = "ray://100.68.53.118:10001"
         if not _ray.is_initialized():
-            _ray.init(address=_ray_addr, ignore_reinit_error=True, log_to_driver=False)
+            _ray.init(address=_ray_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
         _actor_name = f"model-{job_id_}"
         try:
             _actor = _ray.get_actor(_actor_name, namespace="default")
