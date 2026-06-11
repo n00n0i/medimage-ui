@@ -104,7 +104,7 @@ function ensurePolling() {
 import {
   FlaskConical, Play, RefreshCw, Loader2, CheckCircle2, XCircle, Clock,
   Terminal, ChevronDown, ChevronUp, Search, Cpu, MessageSquare, Eye, EyeOff,
-  Database, AlertCircle, StopCircle, Filter,
+  Database, AlertCircle, StopCircle, Filter, Copy, Check, Download, X,
 } from 'lucide-react'
 import { TRAINING_MATRIX } from './TrainModel'
 
@@ -152,6 +152,30 @@ interface TestRun {
   finishedAt: number | null
   log: string
   datasetLabel: string
+}
+
+// Bulk run report — a snapshot of the last completed "Run all compatible"
+// pass so the user can see at a glance which models failed and why,
+// then export the failure list for follow-up fixes.
+interface BulkFailure {
+  key:          string   // row key, e.g. 'classification:medr1-3b'
+  label:        string   // human label, e.g. 'Med-R1-3B (GRPO Medical VLM)'
+  trainingType: TrainingType
+  engine:       string
+  model:        string
+  error:        string   // short error from backend (last 200 chars)
+  jobId:        string | null
+}
+
+interface BulkReport {
+  startedAt:   number          // unix seconds
+  finishedAt:  number          // unix seconds
+  total:       number          // models attempted
+  ok:          number          // completed
+  failed:      number          // error
+  stopped:     boolean         // user stopped early
+  failures:    BulkFailure[]
+  log:         string          // human-readable full run log (line per model)
 }
 
 // Module-level runs map. Components subscribe to changes via
@@ -320,6 +344,13 @@ export default function TestAllModels() {
   const [bulkRunning, setBulkRunning] = useState(false)
   const [bulkStopRequested, setBulkStopRequested] = useState(false)
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null)
+  // Snapshot of the last completed bulk run — surfaces failed models
+  // + a copyable/exportable log so the user can follow up on each error.
+  const [bulkReport, setBulkReport] = useState<BulkReport | null>(null)
+  // Live stream of failures + statuses while the run is in progress, so
+  // the user sees what's failing in real time instead of waiting for the
+  // whole pass to finish.
+  const [bulkStream, setBulkStream] = useState<{ label: string; status: 'ok' | 'err'; error?: string }[]>([])
 
   // Keep latest runs in a ref so the bulk loop always reads the current
   // state instead of the snapshot from when runAllCompatible was called.
@@ -545,10 +576,19 @@ export default function TestAllModels() {
     setBulkRunning(true)
     setBulkStopRequested(false)
     bulkStopRequestedRef.current = false
+    setBulkStream([])
+    setBulkReport(null)
+
     const targets = filteredRows.filter(r => isCompatible(r.option))
+    const startedAt = Date.now() / 1000
+    const failures: BulkFailure[] = []
+    let ok = 0
+    let stopped = false
+    const logLines: string[] = []
+
     let idx = 0
     for (const row of targets) {
-      if (bulkStopRequestedRef.current) break
+      if (bulkStopRequestedRef.current) { stopped = true; break }
       idx += 1
       setBulkProgress({ current: idx, total: targets.length, label: row.option.label })
 
@@ -561,15 +601,50 @@ export default function TestAllModels() {
         await waitForCompletion(row.key)
         continue
       }
-      if (existing && existing.status === 'completed') continue
+      if (existing && existing.status === 'completed') {
+        logLines.push(`[${idx}/${targets.length}]  ✓  ${row.option.label}  (cached)`)
+        ok += 1
+        setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
+        continue
+      }
 
       await submitTest(row)
-      // After submit, wait until this specific job reaches a terminal
-      // state before submitting the next one. This keeps the Ray
-      // cluster fed with one training job at a time and ensures error
-      // messages are attributed to the model that produced them.
       await waitForCompletion(row.key)
+
+      // Read the final state from the module store (the polling loop
+      // has already attributed the job's status to this row key).
+      const final = moduleRuns[row.key]
+      if (final?.status === 'completed') {
+        ok += 1
+        logLines.push(`[${idx}/${targets.length}]  ✓  ${row.option.label}`)
+        setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
+      } else {
+        const errMsg = (final?.error ?? 'Unknown error').slice(0, 500)
+        failures.push({
+          key:          row.key,
+          label:        row.option.label,
+          trainingType: row.trainingType,
+          engine:       row.option.engine,
+          model:        row.option.model,
+          error:        errMsg,
+          jobId:        final?.jobId ?? null,
+        })
+        logLines.push(`[${idx}/${targets.length}]  ✗  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
+        setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: errMsg }])
+      }
     }
+
+    const report: BulkReport = {
+      startedAt,
+      finishedAt: Date.now() / 1000,
+      total:      targets.length,
+      ok,
+      failed:     failures.length,
+      stopped,
+      failures,
+      log:        logLines.join('\n'),
+    }
+    setBulkReport(report)
     setBulkProgress(null)
     setBulkRunning(false)
     setBulkStopRequested(false)
@@ -626,6 +701,34 @@ export default function TestAllModels() {
               </div>
             </div>
           )}
+
+          {/* Live stream — surfaces each model's status as it completes
+              so the user sees failures in real time during long runs. */}
+          {bulkStream.length > 0 && bulkRunning && (
+            <div style={{ marginTop: 10, maxHeight: 140, overflowY: 'auto', padding: '8px 10px', borderRadius: 6, background: 'var(--bg-elevated)', fontSize: 11.5, fontFamily: 'var(--font-mono)' }}>
+              {bulkStream.slice(-20).map((s, i) => (
+                <div key={`${s.label}-${i}`} style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '1px 0' }}>
+                  {s.status === 'ok'
+                    ? <CheckCircle2 size={11} color="var(--success)" />
+                    : <XCircle      size={11} color="var(--danger)"  />}
+                  <span style={{ color: s.status === 'ok' ? 'var(--text-secondary)' : 'var(--danger)', flex: 1 }}>{s.label}</span>
+                  {s.error && (
+                    <span style={{ color: 'var(--text-muted)', fontSize: 10.5, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {s.error.slice(0, 80)}
+                    </span>
+                  )}
+                </div>
+              ))}
+              {bulkStream.length > 20 && (
+                <div style={{ color: 'var(--text-muted)', fontSize: 10, marginTop: 4 }}>
+                  … +{bulkStream.length - 20} earlier
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Post-run report — summary card + failed-list + export. */}
+          {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} runs={runs} setExpanded={setExpanded} onClose={() => setBulkReport(null)} />}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button
@@ -1025,5 +1128,185 @@ function StatusCell({ run }: { run: TestRun | undefined }) {
       <Icon size={12} className={isAnim ? 'animate-spin' : ''} />
       {c.label}
     </span>
+  )
+}
+
+// ─── Bulk report panel — surfaces per-model failures + a copyable log
+//      after a "Run all compatible" pass. Lets the user see what broke
+//      and export the failure list for follow-up fixes. ────────────────
+function BulkReportPanel({ report, runs, setExpanded, onClose }: {
+  report:     BulkReport
+  runs:       Record<string, TestRun>
+  setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>
+  onClose:    () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const [showLog, setShowLog] = useState(false)
+
+  // Build a single-line summary of each failed model for copy/export
+  const failureLines = report.failures.map(f =>
+    `[${f.trainingType}] ${f.label}  (${f.engine}/${f.model})  →  ${f.error}` +
+    (f.jobId ? `  [jobId=${f.jobId}]` : '')
+  )
+
+  function copyToClipboard() {
+    const text = report.failures.length === 0
+      ? `Bulk test run completed with no failures.\n${report.ok}/${report.total} models OK in ${Math.round(report.finishedAt - report.startedAt)}s`
+      : `Bulk test run: ${report.ok} OK, ${report.failed} failed, ${report.total} total\n` +
+        `Duration: ${Math.round(report.finishedAt - report.startedAt)}s\n\n` +
+        failureLines.join('\n')
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    }).catch(() => { /* clipboard blocked — fall back to textarea selection */ })
+  }
+
+  function downloadJson() {
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `bulk-test-${new Date(report.startedAt * 1000).toISOString().slice(0, 19).replace(/:/g, '-')}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const elapsedSec = Math.round(report.finishedAt - report.startedAt)
+  const okPct = report.total > 0 ? Math.round((report.ok / report.total) * 100) : 0
+
+  return (
+    <div style={{
+      marginTop: 14, padding: 16, borderRadius: 10,
+      border: `1px solid ${report.failed > 0 ? 'rgba(239,68,68,0.35)' : 'rgba(16,185,129,0.35)'}`,
+      background: report.failed > 0 ? 'rgba(239,68,68,0.04)' : 'rgba(16,185,129,0.04)',
+    }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+            {report.failed > 0
+              ? <XCircle size={18} color="var(--danger)" />
+              : <CheckCircle2 size={18} color="var(--success)" />}
+            <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>
+              {report.stopped
+                ? `Bulk run stopped · ${report.ok} OK, ${report.failed} failed (out of ${report.total} started)`
+                : report.failed > 0
+                  ? `Bulk run finished · ${report.failed} of ${report.total} failed`
+                  : `Bulk run finished · all ${report.ok} models OK`}
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+              ({elapsedSec}s)
+            </span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, fontSize: 12, color: 'var(--text-secondary)' }}>
+            <span><strong style={{ color: 'var(--success)' }}>{report.ok}</strong> OK</span>
+            <span><strong style={{ color: 'var(--danger)'  }}>{report.failed}</strong> failed</span>
+            <span style={{ color: 'var(--text-muted)' }}>{okPct}% success</span>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5 }}
+            onClick={copyToClipboard}
+            title="Copy failure list to clipboard (or full summary if no failures)"
+          >
+            {copied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy</>}
+          </button>
+          <button
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5 }}
+            onClick={downloadJson}
+            title="Download full report as JSON"
+          >
+            <Download size={12} /> JSON
+          </button>
+          <button
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5, padding: '4px 8px' }}
+            onClick={onClose}
+            title="Dismiss report"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      </div>
+
+      {/* Failed models list */}
+      {report.failures.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+            Failed models ({report.failures.length})
+          </div>
+          <div style={{
+            border: '1px solid var(--border-subtle)', borderRadius: 6,
+            maxHeight: 280, overflowY: 'auto',
+            background: 'var(--bg-base)',
+          }}>
+            {report.failures.map((f, i) => {
+              const run = runs[f.key]
+              return (
+                <div key={f.key} style={{
+                  padding: '10px 12px', borderBottom: i < report.failures.length - 1 ? '1px solid var(--border-subtle)' : 'none',
+                  display: 'flex', alignItems: 'flex-start', gap: 10,
+                }}>
+                  <XCircle size={14} color="var(--danger)" style={{ marginTop: 1, flexShrink: 0 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontWeight: 600, fontSize: 12.5, color: 'var(--text-primary)' }}>{f.label}</span>
+                      <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--bg-elevated)', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{f.trainingType}</span>
+                      {f.jobId && (
+                        <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>job={f.jobId.slice(0, 10)}…</span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 10.5, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {f.engine} · {f.model}
+                    </div>
+                    <div style={{
+                      fontSize: 11, color: 'var(--danger)', marginTop: 4, fontFamily: 'var(--font-mono)',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 72, overflowY: 'auto',
+                      padding: 6, borderRadius: 4, background: 'rgba(239,68,68,0.06)',
+                    }}>
+                      {f.error}
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    style={{ fontSize: 11, padding: '3px 8px', flexShrink: 0 }}
+                    onClick={() => setExpanded(prev => new Set(prev).add(f.key))}
+                    title="Open the row in the table below to see the full training log"
+                  >
+                    View log
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Full run log (collapsible) */}
+      <div style={{ marginTop: 10 }}>
+        <button
+          onClick={() => setShowLog(s => !s)}
+          style={{
+            background: 'transparent', border: 'none', color: 'var(--text-muted)',
+            fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4,
+            padding: 0,
+          }}
+        >
+          <Terminal size={11} />
+          {showLog ? 'Hide full run log' : 'Show full run log'}
+        </button>
+        {showLog && (
+          <pre style={{
+            marginTop: 6, padding: 10, borderRadius: 6,
+            background: 'var(--bg-base)', border: '1px solid var(--border-subtle)',
+            fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)',
+            maxHeight: 240, overflowY: 'auto', whiteSpace: 'pre-wrap',
+          }}>{report.log || '(no log lines)'}</pre>
+        )}
+      </div>
+    </div>
   )
 }
