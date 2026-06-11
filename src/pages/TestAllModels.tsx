@@ -268,7 +268,47 @@ export default function TestAllModels() {
   // Filter
   const [typeFilter, setTypeFilter] = useState<'all' | TrainingType>('all')
   const [search, setSearch]         = useState('')
-  const [showIncompatible, setShowIncompatible] = useState(false)
+  // Show incompatible by default — users typically want to see every
+  // catalog model in the bulk-test view. The "Run N Compatible" button
+  // already uses the same gpuFreeGb-aware isCompatible function below.
+  const [showIncompatible, setShowIncompatible] = useState(true)
+
+  // Mirror TrainModel's dynamic GPU check: pull available system RAM
+  // from the Ray cluster summary and use it as a proxy for free GPU
+  // memory. With 4×H200 @ 50% util (~282 GB free), this lets every
+  // catalog model with `hardware ≤ 282 GB` pass without a stale static
+  // `compatible: false` blocking it.
+  const [gpuFreeGb, setGpuFreeGb] = useState<number | null>(null)
+  useEffect(() => {
+    fetch('/api/ray/nodes?view=summary')
+      .then(r => r.json())
+      .then(data => {
+        const nodes: any[] = data?.data?.summary ?? []
+        let maxFreeGb = 0
+        for (const node of nodes) {
+          if (Array.isArray(node.mem) && node.mem.length >= 2) {
+            const availBytes = Number(node.mem[1] ?? 0)
+            if (availBytes > 0) {
+              const availGb = availBytes / (1024 ** 3)
+              if (availGb > maxFreeGb) maxFreeGb = availGb
+            }
+          }
+        }
+        if (maxFreeGb > 0) setGpuFreeGb(Math.floor(maxFreeGb))
+        else setGpuFreeGb(64)  // généreus fallback
+      })
+      .catch(() => setGpuFreeGb(64))
+  }, [])
+
+  function parseRequiredGb(hardware: string): number {
+    const m = hardware.match(/(\d+)\s*GB/i)
+    return m ? parseInt(m[1]) : 0
+  }
+
+  function isCompatible(opt: TrainOption): boolean {
+    if (gpuFreeGb !== null) return parseRequiredGb(opt.hardware) <= gpuFreeGb
+    return opt.compatible
+  }
 
   // Test runs (keyed by model row key) — backed by module store so the
   // poll loop keeps working even when the user navigates away.
@@ -356,7 +396,7 @@ export default function TestAllModels() {
   const filteredRows = useMemo(() => {
     let rows = allRows
     if (typeFilter !== 'all') rows = rows.filter(r => r.trainingType === typeFilter)
-    if (!showIncompatible) rows = rows.filter(r => r.option.compatible)
+    if (!showIncompatible) rows = rows.filter(r => isCompatible(r.option))
     if (search.trim()) {
       const q = search.toLowerCase()
       rows = rows.filter(r =>
@@ -366,7 +406,7 @@ export default function TestAllModels() {
       )
     }
     return rows
-  }, [allRows, typeFilter, search, showIncompatible])
+  }, [allRows, typeFilter, search, showIncompatible, gpuFreeGb])
 
   // ── Effective dataset for a row ──
   const effectiveDataset = (row: ModelRow): { id: number | string | null; label: string; source: 'default' | 'user' | 'none' } => {
@@ -505,7 +545,7 @@ export default function TestAllModels() {
     setBulkRunning(true)
     setBulkStopRequested(false)
     bulkStopRequestedRef.current = false
-    const targets = filteredRows.filter(r => r.option.compatible)
+    const targets = filteredRows.filter(r => isCompatible(r.option))
     let idx = 0
     for (const row of targets) {
       if (bulkStopRequestedRef.current) break
@@ -616,7 +656,7 @@ export default function TestAllModels() {
               onClick={runAllCompatible}
               disabled={datasetsLoading || filteredRows.length === 0}
             >
-              <Play size={14} /> Run {filteredRows.filter(r => r.option.compatible).length} Compatible
+              <Play size={14} /> Run {filteredRows.filter(r => isCompatible(r.option)).length} Compatible
             </button>
           )}
         </div>
@@ -676,7 +716,7 @@ export default function TestAllModels() {
         </div>
         <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' }}>
           <input type="checkbox" checked={showIncompatible} onChange={e => setShowIncompatible(e.target.checked)} />
-          Show incompatible ({allRows.length - allRows.filter(r => r.option.compatible).length})
+          Show incompatible ({allRows.length - allRows.filter(r => isCompatible(r.option)).length})
         </label>
       </div>
 
@@ -717,7 +757,7 @@ export default function TestAllModels() {
           const ds  = effectiveDataset(row)
           const isExpanded = expanded.has(row.key)
           const typeColor = TYPE_COLORS[row.trainingType]
-          const isIncompatible = !row.option.compatible
+          const isIncompatible = !isCompatible(row.option)
 
           return (
             <div key={row.key} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
