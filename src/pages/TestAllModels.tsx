@@ -728,7 +728,7 @@ export default function TestAllModels() {
           )}
 
           {/* Post-run report — summary card + failed-list + export. */}
-          {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} runs={runs} setExpanded={setExpanded} onClose={() => setBulkReport(null)} />}
+          {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} setExpanded={setExpanded} onClose={() => setBulkReport(null)} />}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button
@@ -1134,9 +1134,8 @@ function StatusCell({ run }: { run: TestRun | undefined }) {
 // ─── Bulk report panel — surfaces per-model failures + a copyable log
 //      after a "Run all compatible" pass. Lets the user see what broke
 //      and export the failure list for follow-up fixes. ────────────────
-function BulkReportPanel({ report, runs, setExpanded, onClose }: {
+function BulkReportPanel({ report, setExpanded, onClose }: {
   report:     BulkReport
-  runs:       Record<string, TestRun>
   setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>
   onClose:    () => void
 }) {
