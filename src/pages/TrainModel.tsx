@@ -64,6 +64,8 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'txrv-densenet', label: 'CheXNet DenseNet121',      engine: 'PyTorch',     model: 'densenet121-res224-all',        hardware: 'GPU 6GB+',     description: 'Pre-trained บน 800k+ chest X-ray (TorchXRayVision) — pneumonia, effusion, nodule', compatible: true  },
     { value: 'uni-pathology', label: 'UNI (Pathology ViT-L)',    engine: 'HuggingFace', model: 'MahmoodLab/UNI',               hardware: 'GPU 16GB+',    description: 'Pre-trained บน 100k+ pathology slides (TCGA) — tissue classification, cancer grading', compatible: false },
     { value: 'monai-densenet', label: 'MONAI DenseNet121',        engine: 'MONAI',       model: 'monai-densenet121',             hardware: 'GPU 8GB+',     description: 'MONAI medical classification — CT/MRI/X-ray, auto-handle DICOM & NIfTI format',  compatible: true  },
+    // ── COVID-Net (lindawangg) — research-only, TF 1.x EOL ────────────────────────
+    { value: 'covidnet-cxr-3', label: 'COVID-Net CXR-3 (Research)', engine: 'TensorFlow 1.15', model: 'covidnet-cxr-3',          hardware: 'GPU 6GB+',     description: 'DarwinAI COVID-Net CXR-3 (chest X-ray COVID-19 detection) — research-only, NOT production clinical, requires TensorFlow 1.13-1.15 (EOL), trained on COVIDx V8B (16,352 CXR / 51 countries), sens 99.0%/97.5% (neg/pos)', compatible: false },
   ],
 
   // ── Object Detection ─────────────────────────────────────────────────────────
@@ -87,6 +89,14 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'monai-unet', label: 'MONAI UNet (Medical)',        engine: 'MONAI',       model: 'monai-unet',                    hardware: 'GPU 8GB+',     description: 'MONAI UNet — organ/tumor segmentation, CT/MRI, handles DICOM & NIfTI automatically', compatible: true  },
     { value: 'medsam',     label: 'MedSAM (Fine-tune)',          engine: 'MedSAM',      model: 'medsam_vit_b',                  hardware: 'GPU 12GB+',    description: 'SAM fine-tuned บน medical images — segment อวัยวะ/tumor ด้วย bounding box prompt', compatible: false },
     { value: 'nnunet-2d',  label: 'nnU-Net 2D Auto',            engine: 'nnU-Net',     model: 'nnunet-2d',                     hardware: 'GPU 16GB+',    description: 'Auto-configure segmentation pipeline — MICCAI standard, organ/tumor, CT/MRI', compatible: false },
+    // ── nnU-Net 3D variants (MIC-DKFZ/nnUNet) ────────────────────────────────────
+    { value: 'nnunet-3d-lowres',  label: 'nnU-Net 3D Low-Res',   engine: 'nnU-Net',     model: 'nnunet-3d-lowres',              hardware: 'GPU 8GB+',     description: 'MICCAI standard 3D segmentation, low-resolution config (downsample then segment) — large organ/whole-body CT, MRI', compatible: false },
+    { value: 'nnunet-3d-fullres', label: 'nnU-Net 3D Full-Res',  engine: 'nnU-Net',     model: 'nnunet-3d-fullres',             hardware: 'GPU 16GB+',    description: 'MICCAI standard 3D segmentation, full-resolution — best Dice for tumor/organ CT/MRI; auto-preprocess + auto-configure', compatible: false },
+    { value: 'nnunet-3d-cascade', label: 'nnU-Net 3D Cascade',   engine: 'nnU-Net',     model: 'nnunet-3d-cascade',             hardware: 'GPU 24GB+',    description: '3D cascade — low-res first, then full-res on detected regions, SOTA on large anisotropic volumes (CT whole-body, MRI)',  compatible: false },
+    // ── MedicalNet 3D-ResNet (Tencent) — 3D backbone pretrains for transfer ──
+    { value: 'medicalnet-3d-r10', label: 'MedicalNet 3D-ResNet10',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet10',        hardware: 'GPU 8GB+',     description: 'Tencent MedicalNet 3D-ResNet10 (14M params) — pretrained on 23 medical datasets, transfer-learning backbone for CT/MRI volumetric classification/segmentation, MIT license', compatible: false },
+    { value: 'medicalnet-3d-r18', label: 'MedicalNet 3D-ResNet18',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet18',        hardware: 'GPU 12GB+',    description: 'Tencent MedicalNet 3D-ResNet18 (33M params) — 23-dataset pretrain, popular transfer backbone for 3D organ/lesion classification', compatible: false },
+    { value: 'medicalnet-3d-r50', label: 'MedicalNet 3D-ResNet50',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet50',        hardware: 'GPU 16GB+',    description: 'Tencent MedicalNet 3D-ResNet50 (46M params) — best Dice on lung seg (93.3%) + nodule cls (89.9%) in their paper, 23-dataset pretrain', compatible: false },
   ],
 
   // ── LLM Text Fine-tuning ─────────────────────────────────────────────────────
@@ -223,6 +233,13 @@ export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'monai-unet':        ['xray', 'microscopy', 'rgb'],
   'medsam':            ['xray', 'microscopy', 'rgb'],
   'nnunet-2d':         ['xray', 'microscopy', 'rgb'],
+  'nnunet-3d-lowres':  ['xray'],
+  'nnunet-3d-fullres': ['xray'],
+  'nnunet-3d-cascade': ['xray'],
+  'medicalnet-3d-r10': ['xray'],
+  'medicalnet-3d-r18': ['xray'],
+  'medicalnet-3d-r50': ['xray'],
+  'covidnet-cxr-3':    ['xray'],
   // Detection
   'yolov8-s':          _C,
   'yolov8-m':          _C,
