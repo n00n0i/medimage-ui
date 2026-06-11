@@ -774,25 +774,6 @@ export default function TestAllModels() {
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
             Smoke test every model in Train · 1 epoch · 8 batch · auto-paired with the best matching dataset
           </p>
-          {bulkProgress && (
-            <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Loader2 size={13} color="var(--primary)" className="animate-spin" />
-              <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                Running <strong style={{ color: 'var(--text-primary)' }}>{bulkProgress.label}</strong>
-                <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
-                  ({bulkProgress.current} / {bulkProgress.total})
-                </span>
-              </span>
-              <div style={{ flex: 1, maxWidth: 220, height: 4, background: 'var(--bg-elevated)', borderRadius: 2, overflow: 'hidden' }}>
-                <div style={{
-                  width: `${(bulkProgress.current / bulkProgress.total) * 100}%`,
-                  height: '100%',
-                  background: 'var(--primary)',
-                  transition: 'width 0.3s ease',
-                }} />
-              </div>
-            </div>
-          )}
 
           {/* Live stream — surfaces each model's status as it completes
               so the user sees failures in real time during long runs. */}
@@ -823,12 +804,13 @@ export default function TestAllModels() {
           {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} setExpanded={setExpanded} onClose={() => setBulkReport(null)} />}
         </div>
 
-        {/* Pre-run config — pick provider + toggle train→deploy chain. */}
+        {/* Pre-run config + actions — all in one card row:
+              [Provider: Ray/Modal] · [Train→Deploy checkbox] ··· [Reset] [Run N] */}
         {!bulkRunning && !bulkReport && (
           <div style={{
             marginTop: 14, padding: 12, borderRadius: 8,
             background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
-            display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+            display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap',
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
               <Server size={12} />
@@ -869,32 +851,21 @@ export default function TestAllModels() {
               <span style={{ fontWeight: 500 }}>Train → Deploy → Next</span>
               <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>(auto-deploy after each train OK)</span>
             </label>
-          </div>
-        )}
-
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button
-            className="btn btn-secondary"
-            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
-            onClick={() => {
-              for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
-              for (const jobId of [...activeJobs.keys()]) untrackJob(jobId)
-              notify()
-            }}
-            disabled={bulkRunning}
-            title="Clear all results"
-          >
-            <RefreshCw size={14} /> Reset
-          </button>
-          {bulkRunning ? (
+            {/* Push actions to the right */}
+            <div style={{ flex: 1 }} />
             <button
-              className="btn btn-sm"
-              style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
-              onClick={() => setBulkStopRequested(true)}
+              className="btn btn-secondary"
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+              onClick={() => {
+                for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
+                for (const jobId of [...activeJobs.keys()]) untrackJob(jobId)
+                notify()
+              }}
+              disabled={bulkRunning}
+              title="Clear all results"
             >
-              <StopCircle size={14} /> Stop Bulk
+              <RefreshCw size={14} /> Reset
             </button>
-          ) : (
             <button
               className="btn btn-primary"
               style={{ display: 'flex', alignItems: 'center', gap: 6 }}
@@ -903,8 +874,45 @@ export default function TestAllModels() {
             >
               <Play size={14} /> Run {filteredRows.filter(r => isCompatible(r.option)).length} Compatible
             </button>
-          )}
-        </div>
+          </div>
+        )}
+
+        {/* During-run banner: progress + Stop button. The pre-run config
+            card hides itself while a run is in progress. */}
+        {bulkRunning && (
+          <div style={{
+            marginTop: 14, padding: 12, borderRadius: 8,
+            background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
+            display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+          }}>
+            {bulkProgress && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 220 }}>
+                <Loader2 size={13} color="var(--primary)" className="animate-spin" />
+                <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  {bulkProgress.stage === 'deploy' ? 'Deploying' : 'Training'}{' '}
+                  <strong style={{ color: 'var(--text-primary)' }}>{bulkProgress.label}</strong>
+                  <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
+                    ({bulkProgress.current} / {bulkProgress.total})
+                  </span>
+                </span>
+                <div style={{ flex: 1, maxWidth: 220, height: 4, background: 'var(--bg-base)', borderRadius: 2, overflow: 'hidden' }}>
+                  <div style={{
+                    width: `${(bulkProgress.current / bulkProgress.total) * 100}%`,
+                    height: '100%', background: 'var(--primary)', transition: 'width 0.3s ease',
+                  }} />
+                </div>
+              </div>
+            )}
+            <div style={{ flex: 1 }} />
+            <button
+              className="btn btn-sm"
+              style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
+              onClick={() => setBulkStopRequested(true)}
+            >
+              <StopCircle size={14} /> Stop Bulk
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Stats strip */}
