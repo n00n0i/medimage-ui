@@ -66,6 +66,9 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'monai-densenet', label: 'MONAI DenseNet121',        engine: 'MONAI',       model: 'monai-densenet121',             hardware: 'GPU 8GB+',     description: 'MONAI medical classification — CT/MRI/X-ray, auto-handle DICOM & NIfTI format',  compatible: true  },
     // ── COVID-Net (lindawangg) — research-only, TF 1.x EOL ────────────────────────
     { value: 'covidnet-cxr-3', label: 'COVID-Net CXR-3 (Research)', engine: 'TensorFlow 1.15', model: 'covidnet-cxr-3',          hardware: 'GPU 6GB+',     description: 'DarwinAI COVID-Net CXR-3 (chest X-ray COVID-19 detection) — research-only, NOT production clinical, requires TensorFlow 1.13-1.15 (EOL), trained on COVIDx V8B (16,352 CXR / 51 countries), sens 99.0%/97.5% (neg/pos)', compatible: false },
+    // ── From Intel Geti catalog ────────────────────────────────────────────────────
+    { value: 'eff-v2-s',   label: 'EfficientNet-V2-S',          engine: 'TIMM',        model: 'tf_efficientnetv2_s',         hardware: 'GPU 8GB+',     description: 'EfficientNet-V2 (2021) — fused MBConv + progressive LR, faster training + better accuracy than V1, Geti default classifier', compatible: true  },
+    { value: 'deit-tiny',  label: 'DeiT-Tiny',                  engine: 'TIMM',        model: 'deit_tiny_patch16_224',      hardware: 'GPU 4GB+',     description: 'Data-efficient Image Transformer (tiny) — distillation-based ViT, smaller data requirement, Geti catalog default', compatible: true  },
   ],
 
   // ── Object Detection ─────────────────────────────────────────────────────────
@@ -78,6 +81,10 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: false },
     { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet-50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
     { value: 'rdd-yolov8s',label: 'YOLOv8 Road Damage',         engine: 'Ultralytics', model: 'road-damage-yolov8s.pt',        hardware: 'GPU 6GB+',     description: 'YOLOv8s fine-tuned on RDD2022 (Crowdsensing-based Road Damage Detection Challenge 2022) — 4 classes: Longitudinal Crack, Transverse Crack, Alligator Crack, Potholes, ดีสำหรับ road/infrastructure inspection (weights จาก oracl4/RoadDamageDetection)', compatible: true  },
+    // ── From Intel Geti catalog (open-edge-platform/geti) ─────────────────────────
+    { value: 'yolox-s',    label: 'YOLOX-S',                    engine: 'Ultralytics', model: 'yolox-s.pt',                    hardware: 'GPU 6GB+',     description: 'Anchor-free YOLO (2021) — decoupled head, strong AP on COCO, popular for edge deployment, Geti-catalog alternative to YOLOv8', compatible: true  },
+    { value: 'rtmdet-t',   label: 'RTMDet-Tiny',                engine: 'Ultralytics', model: 'rtmdet-t.pt',                   hardware: 'GPU 4GB+',     description: 'Real-time DETR (2022) — large-kernel depthwise conv + transformer, COCO mAP 41+, faster than YOLOv5 on CPU, edge-friendly', compatible: true  },
+    { value: 'd-fine-m',   label: 'D-FINE Medium (2024)',         engine: 'D-FINE',       model: 'd-fine-m.pt',                  hardware: 'GPU 10GB+',    description: 'D-FINE 2024 detection SOTA (replaces DINO/YOLOv9) — refine box via D-FINE head, COCO mAP 55+, Geti catalog default', compatible: true  },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
@@ -98,6 +105,9 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'medicalnet-3d-r10', label: 'MedicalNet 3D-ResNet10',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet10',        hardware: 'GPU 8GB+',     description: 'Tencent MedicalNet 3D-ResNet10 (14M params) — pretrained on 23 medical datasets, transfer-learning backbone for CT/MRI volumetric classification/segmentation, MIT license', compatible: false },
     { value: 'medicalnet-3d-r18', label: 'MedicalNet 3D-ResNet18',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet18',        hardware: 'GPU 12GB+',    description: 'Tencent MedicalNet 3D-ResNet18 (33M params) — 23-dataset pretrain, popular transfer backbone for 3D organ/lesion classification', compatible: false },
     { value: 'medicalnet-3d-r50', label: 'MedicalNet 3D-ResNet50',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet50',        hardware: 'GPU 16GB+',    description: 'Tencent MedicalNet 3D-ResNet50 (46M params) — best Dice on lung seg (93.3%) + nodule cls (89.9%) in their paper, 23-dataset pretrain', compatible: false },
+    // ── From Intel Geti catalog ────────────────────────────────────────────────────
+    { value: 'lite-hrnet', label: 'Lite-HRNet (Seg)',           engine: 'MMSegmentation', model: 'lite-hrnet-x',             hardware: 'GPU 6GB+',     description: 'Lite-HRNet (2021) — high-resolution backbone with shuffled blocks, efficient semantic segmentation, Geti catalog default', compatible: true  },
+    { value: 'segnext-s', label: 'SegNext Small',              engine: 'MMSegmentation', model: 'segnext-small',           hardware: 'GPU 8GB+',     description: 'SegNext (2022) — stacked convolutional attention decoder, mIoU 47+ on ADE20K, SOTA for industrial/defect segmentation, Geti default', compatible: true  },
   ],
 
   // ── LLM Text Fine-tuning ─────────────────────────────────────────────────────
@@ -150,6 +160,9 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'byol',       label: 'BYOL (ResNet50)',           engine: 'PyTorch', model: 'resnet50-byol',                  hardware: 'GPU 8GB+',    description: 'Bootstrap your own latent — no negative samples, stable training',           compatible: true  },
     { value: 'padim',      label: 'PaDiM (Anomaly Detection)', engine: 'Anomalib', model: 'padim_resnet18',               hardware: 'GPU 6GB+',    description: 'Unsupervised anomaly detection — zero defect sample needed for training',    compatible: true  },
     { value: 'patchcore',  label: 'PatchCore',                engine: 'Anomalib', model: 'patchcore_wide_resnet50',       hardware: 'GPU 8GB+',    description: 'Memory bank anomaly detection — MVTec-style industrial inspection',          compatible: true  },
+    // ── From Intel Geti catalog ────────────────────────────────────────────────────
+    { value: 'stfpm',      label: 'STFPM (Anomaly)',           engine: 'Anomalib', model: 'stfpm_resnet18',                hardware: 'GPU 6GB+',    description: 'Student-Teacher Feature Pyramid Matching (2021) — ResNet-18 teacher/student + multi-layer feature distillation, AUROC 92+ on MVTec, Geti default', compatible: true  },
+    { value: 'uflow',      label: 'U-Flow (Anomaly)',          engine: 'Anomalib', model: 'uflow_resnet18',                hardware: 'GPU 8GB+',    description: 'Unsupervised Flow (2022) — normalizing flow + multi-scale feature, AUROC 96+ on MVTec AD, Geti default anomaly',                compatible: true  },
   ],
 
   // ── Export ────────────────────────────────────────────────────────────────────
@@ -240,10 +253,17 @@ export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'medicalnet-3d-r10': ['xray'],
   'medicalnet-3d-r18': ['xray'],
   'medicalnet-3d-r50': ['xray'],
+  'lite-hrnet':       ['rgb', 'xray', 'microscopy', 'general'],
+  'segnext-s':        ['rgb', 'xray', 'microscopy', 'general'],
   'covidnet-cxr-3':    ['xray'],
+  'eff-v2-s':          _V,
+  'deit-tiny':         _V,
   // Detection
   'yolov8-s':          _C,
   'rdd-yolov8s':       _C,
+  'yolox-s':           _C,
+  'rtmdet-t':          _C,
+  'd-fine-m':          _C,
   'yolov8-m':          _C,
   'yolov8-l':          _C,
   'yolonano':          ['rgb', 'general'],
@@ -282,6 +302,8 @@ export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'byol':              _V,
   'padim':             _I,
   'patchcore':         _I,
+  'stfpm':             _I,
+  'uflow':             _I,
   // Export formats (data-type agnostic)
   'tflite':            _A,
   'onnx':              _A,
