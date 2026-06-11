@@ -1140,7 +1140,6 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
   onClose:    () => void
 }) {
   const [copied, setCopied] = useState(false)
-  const [showLog, setShowLog] = useState(false)
 
   // Build a single-line summary of each failed model for copy/export
   const failureLines = report.failures.map(f =>
@@ -1231,19 +1230,41 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
         </div>
       </div>
 
-      {/* Failed models list */}
-      {report.failures.length > 0 && (
-        <div style={{ marginTop: 12 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
-            Failed models ({report.failures.length})
-          </div>
+      {/* 2-column body: failed list (left) + run log (right).
+          Width matches the 4-card stat strip below (full container width
+          inside the maxWidth:1200 parent). */}
+      <div style={{
+        marginTop: 14,
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 12,
+      }}>
+        {/* LEFT — failed models list */}
+        <div style={{
+          border: '1px solid var(--border-subtle)', borderRadius: 6,
+          background: 'var(--bg-base)',
+          display: 'flex', flexDirection: 'column',
+          minHeight: 0, maxHeight: 380,
+        }}>
           <div style={{
-            border: '1px solid var(--border-subtle)', borderRadius: 6,
-            maxHeight: 280, overflowY: 'auto',
-            background: 'var(--bg-base)',
+            padding: '8px 12px', borderBottom: '1px solid var(--border-subtle)',
+            display: 'flex', alignItems: 'center', gap: 6,
+            fontSize: 11, fontWeight: 600, color: 'var(--text-muted)',
+            textTransform: 'uppercase', letterSpacing: '0.05em', flexShrink: 0,
           }}>
-            {report.failures.map((f, i) => {
-              return (
+            <XCircle size={11} color={report.failures.length > 0 ? 'var(--danger)' : 'var(--text-muted)'} />
+            Failed models
+            <span style={{ color: report.failures.length > 0 ? 'var(--danger)' : 'var(--text-muted)', fontWeight: 700 }}>
+              ({report.failures.length})
+            </span>
+          </div>
+          <div style={{ flex: 1, overflowY: 'auto' }}>
+            {report.failures.length === 0
+              ? <div style={{ padding: '20px 14px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
+                  <CheckCircle2 size={20} color="var(--success)" style={{ marginBottom: 6 }} />
+                  <div>No failures — every compatible model completed.</div>
+                </div>
+              : report.failures.map((f, i) => (
                 <div key={f.key} style={{
                   padding: '10px 12px', borderBottom: i < report.failures.length - 1 ? '1px solid var(--border-subtle)' : 'none',
                   display: 'flex', alignItems: 'flex-start', gap: 10,
@@ -1277,33 +1298,34 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
                     View log
                   </button>
                 </div>
-              )
-            })}
+              ))
+            }
           </div>
         </div>
-      )}
 
-      {/* Full run log (collapsible) */}
-      <div style={{ marginTop: 10 }}>
-        <button
-          onClick={() => setShowLog(s => !s)}
-          style={{
-            background: 'transparent', border: 'none', color: 'var(--text-muted)',
-            fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4,
-            padding: 0,
-          }}
-        >
-          <Terminal size={11} />
-          {showLog ? 'Hide full run log' : 'Show full run log'}
-        </button>
-        {showLog && (
+        {/* RIGHT — full run log (always visible) */}
+        <div style={{
+          border: '1px solid var(--border-subtle)', borderRadius: 6,
+          background: 'var(--bg-base)',
+          display: 'flex', flexDirection: 'column',
+          minHeight: 0, maxHeight: 380,
+        }}>
+          <div style={{
+            padding: '8px 12px', borderBottom: '1px solid var(--border-subtle)',
+            display: 'flex', alignItems: 'center', gap: 6,
+            fontSize: 11, fontWeight: 600, color: 'var(--text-muted)',
+            textTransform: 'uppercase', letterSpacing: '0.05em', flexShrink: 0,
+          }}>
+            <Terminal size={11} />
+            Run log
+            <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>({report.log.split('\n').filter(Boolean).length} lines)</span>
+          </div>
           <pre style={{
-            marginTop: 6, padding: 10, borderRadius: 6,
-            background: 'var(--bg-base)', border: '1px solid var(--border-subtle)',
+            margin: 0, padding: 10, flex: 1, overflowY: 'auto',
             fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)',
-            maxHeight: 240, overflowY: 'auto', whiteSpace: 'pre-wrap',
+            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           }}>{report.log || '(no log lines)'}</pre>
-        )}
+        </div>
       </div>
     </div>
   )
