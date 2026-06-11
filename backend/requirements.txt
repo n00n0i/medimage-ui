@@ -14,3 +14,5 @@ clearml>=1.16.0
 ray[default]==2.55.0
 pyotp>=2.9.0
 qrcode[pil]>=7.4.2
+transformers>=4.40,<5.0
+accelerate>=0.28

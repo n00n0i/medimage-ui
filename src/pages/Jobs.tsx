@@ -187,7 +187,13 @@ export default function Jobs() {
   const deleteJob = async (jobId: string) => {
     const job = jobs.find((j: Job) => j.id === jobId)
     if (!confirm(`ลบ job "${job?.name ?? jobId}"?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
-    await fetch(`/api/jobs/${jobId}?from_view=jobs`, { method: 'DELETE' })
+    const res = await fetch(`/api/jobs/${jobId}?from_view=jobs`, { method: 'DELETE' })
+    if (!res.ok) {
+      let body: any = null
+      try { body = await res.json() } catch { body = { detail: await res.text() } }
+      alert(`Cannot delete ${jobId}:\n\n${body?.detail || `HTTP ${res.status}`}`)
+      return
+    }
     setSelected(prev => { const s = new Set(prev); s.delete(jobId); return s })
     fetchJobs(true)
   }

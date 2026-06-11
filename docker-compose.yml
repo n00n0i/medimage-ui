@@ -5,6 +5,7 @@ services:
     build: .
     ports:
       - "8083:8083"
+      - "8888:80"
     environment:
       # ถ้า backend run บน host machine ให้ใช้ host.docker.internal
       # ถ้า backend อยู่ใน docker-compose เดียวกัน ให้ใช้ชื่อ service เช่น medimage-api

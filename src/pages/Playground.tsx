@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   FlaskConical, Upload, Play, X, Loader2, ImageIcon,
   Zap, CheckCircle2, AlertCircle, ChevronDown, MessageSquare, Eye,
-  Send, History, Trash2, Clock,
+  Send, History, Trash2, Clock, Copy, Check,
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -68,35 +68,29 @@ interface SegResult {
 
 type InferenceResult = ClsResult | DetResult | SegResult
 
-// ─── History ─────────────────────────────────────────────────────────────────
+// ─── History (server-side via /api/inference/history) ────────────────────────
 
 interface HistoryEntry {
   id: string
-  timestamp: number
+  created_at: number
   mode: 'image' | 'text' | 'vl'
-  modelId: string
-  modelName: string
-  modelType: string
+  model_id: string
+  model_name: string
+  model_type: string
   // image
-  imageName?: string
-  imageThumbnail?: string
-  imageResult?: InferenceResult
+  image_name?: string
+  thumbnail_key?: string
+  result?: any
   // text / vl
-  systemPrompt?: string
-  userPrompt?: string
-  vlImageThumbnail?: string
-  textResult?: TextResult
+  system_prompt?: string
+  user_prompt?: string
+  text_result?: TextResult
+  inference_time_ms?: number
 }
 
-const HISTORY_KEY = 'playground_history'
-const MAX_HISTORY = 50
-
-function loadHistory(): HistoryEntry[] {
-  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]') } catch { return [] }
-}
-
-function saveHistory(h: HistoryEntry[]) {
-  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, MAX_HISTORY))) } catch { /* quota */ }
+function fmtTime(ts: number): string {
+  const d = new Date(ts * 1000)
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString([], { month: 'short', day: 'numeric' })
 }
 
 async function makeThumbnail(file: File): Promise<string> {
@@ -118,9 +112,18 @@ async function makeThumbnail(file: File): Promise<string> {
   })
 }
 
-function fmtTime(ts: number): string {
-  const d = new Date(ts)
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+async function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      // Strip "data:mime;base64," prefix
+      const b64 = result.includes(',') ? result.split(',', 2)[1] : result
+      resolve(b64)
+    }
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
 }
 
 // ─── Colours per training type ────────────────────────────────────────────────
@@ -152,33 +155,42 @@ function barColor(conf: number) {
 // ─── Canvas drawing helpers ──────────────────────────────────────────────────
 
 function drawDetections(canvas: HTMLCanvasElement, img: HTMLImageElement, detections: Detection[], threshold: number) {
-  const ctx = canvas.getContext('2d')!
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
   canvas.width  = img.naturalWidth
   canvas.height = img.naturalHeight
   ctx.drawImage(img, 0, 0)
 
   const W = canvas.width
   const H = canvas.height
+  if (!W || !H) return
   const scale = Math.max(W, H)
+  if (!detections || detections.length === 0) return
 
-  for (const det of detections) {
-    if (det.confidence < threshold) continue
+  const palette = ['#8b5cf6', '#10b981', '#ef4444', '#f59e0b', '#3b82f6', '#ec4899', '#14b8a6']
+
+  for (let _i = 0; _i < detections.length; _i++) {
+    const det = detections[_i]
+    const confidence = det.confidence ?? 0
+    if (confidence < threshold) continue
+    if (!Array.isArray(det.bbox) || det.bbox.length < 4) continue
     const [x1, y1, x2, y2] = det.bbox
     const px = x1 * W, py = y1 * H
     const pw = (x2 - x1) * W, ph = (y2 - y1) * H
+    const color = (det.color && typeof det.color === 'string') ? det.color : palette[_i % palette.length]
 
     // Box
-    ctx.strokeStyle = det.color
+    ctx.strokeStyle = color
     ctx.lineWidth = Math.max(2, scale * 0.003)
     ctx.strokeRect(px, py, pw, ph)
 
     // Label background
-    const label = `${det.label} ${(det.confidence * 100).toFixed(0)}%`
+    const label = `${det.label ?? 'object'} ${(confidence * 100).toFixed(0)}%`
     const fs = Math.max(11, scale * 0.015)
     ctx.font = `bold ${fs}px Inter, sans-serif`
     const tw = ctx.measureText(label).width
     const pad = fs * 0.4
-    ctx.fillStyle = det.color
+    ctx.fillStyle = color
     ctx.fillRect(px - ctx.lineWidth / 2, py - fs - pad * 2, tw + pad * 2, fs + pad * 2)
 
     // Label text
@@ -188,21 +200,33 @@ function drawDetections(canvas: HTMLCanvasElement, img: HTMLImageElement, detect
 }
 
 function drawSegmentation(canvas: HTMLCanvasElement, img: HTMLImageElement, masks: SegMask[], threshold: number) {
-  const ctx = canvas.getContext('2d')!
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
   canvas.width  = img.naturalWidth
   canvas.height = img.naturalHeight
   ctx.drawImage(img, 0, 0)
 
   const W = canvas.width
   const H = canvas.height
+  if (!masks || masks.length === 0) return
 
-  for (const mask of masks) {
-    if (mask.confidence < threshold) continue
-    // Parse hex color + add alpha
-    const hex = mask.color.replace('#', '')
-    const r = parseInt(hex.slice(0,2), 16)
-    const g = parseInt(hex.slice(2,4), 16)
-    const b = parseInt(hex.slice(4,6), 16)
+  // Fixed color palette — assign by index to ensure consistency
+  const palette = ['#8b5cf6', '#10b981', '#ef4444', '#f59e0b', '#3b82f6', '#ec4899', '#14b8a6']
+
+  for (let _i = 0; _i < masks.length; _i++) {
+    const mask = masks[_i]
+    const confidence = mask.confidence ?? 0
+    if (confidence < threshold) continue
+    // Defensive color parsing
+    const color = (mask.color && typeof mask.color === 'string') ? mask.color : palette[_i % palette.length]
+    const hex = color.startsWith('#') ? color.slice(1) : color
+    if (hex.length < 6) continue
+    const r = parseInt(hex.slice(0, 2), 16)
+    const g = parseInt(hex.slice(2, 4), 16)
+    const b = parseInt(hex.slice(4, 6), 16)
+    if (isNaN(r) || isNaN(g) || isNaN(b)) continue
+    // Defensive polygon access
+    if (!Array.isArray(mask.polygon) || mask.polygon.length < 3) continue
 
     ctx.beginPath()
     mask.polygon.forEach(([px, py], i) => {
@@ -259,6 +283,8 @@ export default function Playground() {
   const [userPrompt, setUserPrompt] = useState('')
   const [textResult, setTextResult] = useState<TextResult | null>(null)
   const [textError, setTextError] = useState<string | null>(null)
+  const [copiedResponse, setCopiedResponse] = useState(false)
+  const [copiedError, setCopiedError] = useState(false)
   const [vlImageFile, setVlImageFile] = useState<File | null>(null)
   const [vlImageUrl, setVlImageUrl] = useState<string | null>(null)
   const [vlIsDragging, setVlIsDragging] = useState(false)
@@ -276,16 +302,90 @@ export default function Playground() {
   const [canvasImgReady, setCanvasImgReady] = useState(false)
 
   // History
-  const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
+  const [history, setHistory] = useState<HistoryEntry[]>([])
+  const [historyThumbs, setHistoryThumbs] = useState<Record<string, string>>({})
   const [historyOpen, setHistoryOpen] = useState(true)
 
-  const deleteHistoryEntry = (id: string) => {
-    setHistory(h => { const next = h.filter(e => e.id !== id); saveHistory(next); return next })
-  }
-  const clearHistory = () => { setHistory([]); saveHistory([]) }
+  const fetchHistory = useCallback(async () => {
+    try {
+      const r = await fetch('/api/inference/history?limit=50')
+      if (r.ok) {
+        const d = await r.json()
+        const items = d.history || []
+        setHistory(items)
+        // Pre-load thumbnails as blob URLs (works without auth cookies)
+        items.forEach((it: HistoryEntry) => {
+          if (it.thumbnail_key && !historyThumbs[it.id]) {
+            fetch(`/api/inference/thumbnail/${it.id}`)
+              .then(resp => resp.ok ? resp.blob() : null)
+              .then(blob => {
+                if (blob) {
+                  const url = URL.createObjectURL(blob)
+                  setHistoryThumbs(prev => ({ ...prev, [it.id]: url }))
+                }
+              })
+              .catch(() => {})
+          }
+        })
+      }
+    } catch { /* ignore */ }
+  }, [])
 
-  const pushHistory = (entry: HistoryEntry) => {
-    setHistory(h => { const next = [entry, ...h].slice(0, MAX_HISTORY); saveHistory(next); return next })
+  useEffect(() => { fetchHistory() }, [fetchHistory])
+
+  const deleteHistoryEntry = async (id: string) => {
+    setHistory(h => h.filter(e => e.id !== id))
+    try { await fetch(`/api/inference/history/${id}`, { method: 'DELETE' }) } catch {}
+  }
+  const clearHistory = async () => {
+    setHistory([])
+    try { await fetch('/api/inference/history', { method: 'DELETE' }) } catch {}
+  }
+
+  const pushHistory = async (params: {
+    mode: 'image' | 'text' | 'vl'
+    modelId: string
+    modelName: string
+    modelType: string
+    imageName?: string
+    imageFile?: File
+    vlImageFile?: File
+    userPrompt?: string
+    systemPrompt?: string
+    result: any
+    inferenceTimeMs?: number
+  }) => {
+    try {
+      const id = crypto.randomUUID()
+      let thumb = ''
+      let imageB64 = ''
+      if (params.mode === 'image' && params.imageFile) {
+        thumb = await makeThumbnail(params.imageFile)
+        imageB64 = await fileToBase64(params.imageFile)
+      } else if (params.mode === 'vl' && params.vlImageFile) {
+        thumb = await makeThumbnail(params.vlImageFile)
+        imageB64 = await fileToBase64(params.vlImageFile)
+      }
+      const res = await fetch('/api/inference/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id,
+          mode: params.mode,
+          model_id: params.modelId,
+          model_name: params.modelName,
+          model_type: params.modelType,
+          image_name: params.imageName,
+          user_prompt: params.userPrompt,
+          system_prompt: params.systemPrompt,
+          result: params.result,
+          inference_time_ms: params.inferenceTimeMs,
+          thumbnail_base64: thumb,
+          image_base64: imageB64,
+        }),
+      })
+      if (res.ok) fetchHistory()
+    } catch { /* ignore */ }
   }
 
   // Fetch completed models
@@ -362,12 +462,20 @@ export default function Playground() {
     return false  // no provider assigned — not deployable
   }
 
+  // For the model selector, prefer models that are deployable, but don't
+  // hide models that are simply not yet deployed. Empty inference_provider
+  // should be visible (greyed out if needed) so the user can pick & deploy.
+  const providerAvailable = (m: Model): boolean => {
+    if (!m.inference_provider) return false  // hide if no provider assigned at all
+    return providerOnline(m)
+  }
+
   const visibleModels = (playMode === 'text'
     ? models.filter(isLlmModel)
     : playMode === 'vl'
     ? models.filter(isVlmModel)
     : models.filter(isImageModel)
-  ).filter(providerOnline)
+  ).filter(providerAvailable)
 
   const runTextInference = async () => {
     if (!selectedModel || !userPrompt.trim()) return
@@ -388,18 +496,16 @@ export default function Playground() {
       const data = await res.json()
       setTextResult({ ...data, type: 'text' })
       // push to history
-      const vlThumb = (playMode === 'vl' && vlImageFile) ? await makeThumbnail(vlImageFile) : undefined
-      pushHistory({
-        id: crypto.randomUUID(),
-        timestamp: Date.now(),
+      await pushHistory({
         mode: playMode as 'text' | 'vl',
         modelId: selectedModel.id,
         modelName: selectedModel.name,
         modelType: selectedModel.training_type,
         systemPrompt,
         userPrompt,
-        vlImageThumbnail: vlThumb,
-        textResult: { ...data, type: 'text' },
+        vlImageFile: playMode === 'vl' ? vlImageFile || undefined : undefined,
+        result: { ...data, type: 'text' },
+        inferenceTimeMs: data.inference_time_ms,
       })
     } catch (e: any) {
       setTextError(e.message ?? 'Inference failed')
@@ -449,12 +555,21 @@ export default function Playground() {
     if (result.type !== 'detection' && result.type !== 'segmentation') return
     const canvas = canvasRef.current
     const img    = canvasImgRef.current
-    if (result.type === 'detection')   drawDetections(canvas, img, result.detections, threshold)
-    if (result.type === 'segmentation') drawSegmentation(canvas, img, result.masks, threshold)
+    if (result.type === 'detection')   try { drawDetections(canvas, img, result.detections, threshold) } catch (e) { console.error('drawDetections:', e) }
+    if (result.type === 'segmentation') {
+      // TorchVision returns `regions`; legacy SMP returns `masks`
+      const segs = (result as any).regions ?? (result as any).masks
+      if (segs) try { drawSegmentation(canvas, img, segs, threshold) } catch (e) { console.error('drawSegmentation:', e) }
+    }
   }, [result, threshold, canvasImgReady])
 
   const handleFile = useCallback((file: File) => {
-    if (!file.type.startsWith('image/')) return
+    // Accept all common medical image formats (PNG, JPG, WebP, TIFF, DICOM, NIfTI)
+    const name = (file.name || '').toLowerCase()
+    const allowedExts = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
+                         '.tif', '.tiff', '.dcm', '.dicom', '.nii', '.nii.gz']
+    const isAllowedExt = allowedExts.some(ext => name.endsWith(ext))
+    if (!file.type.startsWith('image/') && !isAllowedExt) return
     setImageFile(file)
     const url = URL.createObjectURL(file)
     setImageUrl(url)
@@ -486,17 +601,15 @@ export default function Playground() {
       const data: InferenceResult = await res.json()
       setResult(data)
       // push to history
-      const thumb = imageFile ? await makeThumbnail(imageFile) : ''
-      pushHistory({
-        id: crypto.randomUUID(),
-        timestamp: Date.now(),
+      await pushHistory({
         mode: 'image',
         modelId: selectedModel.id,
         modelName: selectedModel.name,
         modelType: selectedModel.training_type,
         imageName: imageFile?.name,
-        imageThumbnail: thumb,
-        imageResult: data,
+        imageFile,
+        result: data,
+        inferenceTimeMs: (data as any).inference_time_ms,
       })
     } catch (e: any) {
       setError(e.message ?? 'Inference failed')
@@ -815,10 +928,20 @@ export default function Playground() {
             )}
             {textError && (
               <div style={{ border: '1px solid #ef444440', borderRadius: 12, background: '#ef444408', padding: 24, display: 'flex', gap: 12 }}>
-                <AlertCircle size={18} color="#ef4444" style={{ flexShrink: 0 }} />
-                <div>
-                  <p style={{ margin: '0 0 4px', fontWeight: 600, fontSize: 14, color: '#ef4444' }}>Generation failed</p>
-                  <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)' }}>{textError}</p>
+                <AlertCircle size={18} color="#ef4444" style={{ flexShrink: 0, marginTop: 2 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <p style={{ margin: 0, fontWeight: 600, fontSize: 14, color: '#ef4444' }}>Generation failed</p>
+                    <button
+                      onClick={() => { navigator.clipboard.writeText(textError); setCopiedError(true); setTimeout(() => setCopiedError(false), 2000) }}
+                      style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'none', border: '1px solid #ef444440', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', color: copiedError ? '#10b981' : '#ef4444', fontSize: 11, fontFamily: 'inherit', flexShrink: 0 }}
+                      title="Copy error message"
+                    >
+                      {copiedError ? <Check size={12} /> : <Copy size={12} />}
+                      {copiedError ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)', wordBreak: 'break-word' }}>{textError}</p>
                 </div>
               </div>
             )}
@@ -829,13 +952,23 @@ export default function Playground() {
                     <CheckCircle2 size={16} color="#10b981" />
                     <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--text-primary)' }}>Response</span>
                   </div>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{textResult.tokens_generated} tokens · {textResult.tokens_per_second.toFixed(0)} tok/s · {textResult.inference_time_ms} ms</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{textResult.tokens_generated ?? 0} tokens · {(textResult.tokens_per_second ?? 0).toFixed?.(0) ?? 0} tok/s · {textResult.inference_time_ms ?? 0} ms</span>
+                    <button
+                      onClick={() => { navigator.clipboard.writeText(textResult.response); setCopiedResponse(true); setTimeout(() => setCopiedResponse(false), 2000) }}
+                      style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'none', border: '1px solid var(--border-default)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', color: copiedResponse ? '#10b981' : 'var(--text-muted)', fontSize: 11, fontFamily: 'inherit' }}
+                      title="Copy response"
+                    >
+                      {copiedResponse ? <Check size={12} /> : <Copy size={12} />}
+                      {copiedResponse ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
                 </div>
-                <div style={{ padding: '16px 18px', fontSize: 14, color: 'var(--text-primary)', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
+                <div style={{ padding: '16px 18px', fontSize: 14, color: 'var(--text-primary)', lineHeight: 1.7, whiteSpace: 'pre-wrap', maxHeight: 600, overflowY: 'auto', wordBreak: 'break-word' }}>
                   {textResult.response}
                 </div>
                 <div style={{ padding: '10px 18px', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-elevated)', display: 'flex', gap: 20 }}>
-                  {[['Model', textResult.model_name], ['Tokens', String(textResult.tokens_generated)], ['Speed', `${textResult.tokens_per_second.toFixed(0)} tok/s`], ['Latency', `${textResult.inference_time_ms} ms`]].map(([k, v]) => (
+                  {[['Model', textResult.model_name], ['Tokens', String(textResult.tokens_generated ?? 0)], ['Speed', `${(textResult.tokens_per_second ?? 0).toFixed?.(0) ?? 0} tok/s`], ['Latency', `${textResult.inference_time_ms ?? 0} ms`]].map(([k, v]) => (
                     <div key={k}>
                       <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>{k}</div>
                       <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 500 }}>{v}</div>
@@ -1138,11 +1271,11 @@ export default function Playground() {
                 <div style={{ padding: '14px 18px' }}>
                   <div style={{ marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
-                      <strong style={{ color: 'var(--text-primary)' }}>{result.detections.filter(d => d.confidence >= threshold).length}</strong> detection{result.detections.filter(d => d.confidence >= threshold).length !== 1 ? 's' : ''} above threshold
+                      <strong style={{ color: 'var(--text-primary)' }}>{(result.detections ?? []).filter(d => d.confidence >= threshold).length}</strong> detection{(result.detections ?? []).filter(d => d.confidence >= threshold).length !== 1 ? 's' : ''} above threshold
                     </span>
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {result.detections.map((d, i) => {
+                    {(result.detections ?? []).map((d, i) => {
                       const visible = d.confidence >= threshold
                       return (
                         <div key={i} style={{
@@ -1177,11 +1310,11 @@ export default function Playground() {
                 <div style={{ padding: '14px 18px' }}>
                   <div style={{ marginBottom: 14 }}>
                     <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
-                      <strong style={{ color: 'var(--text-primary)' }}>{result.masks.filter(m => m.confidence >= threshold).length}</strong> region{result.masks.filter(m => m.confidence >= threshold).length !== 1 ? 's' : ''} segmented
+                      <strong style={{ color: 'var(--text-primary)' }}>{(result.masks ?? []).filter(m => m.confidence >= threshold).length}</strong> region{(result.masks ?? []).filter(m => m.confidence >= threshold).length !== 1 ? 's' : ''} segmented
                     </span>
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {result.masks.map((m, i) => {
+                    {(result.masks ?? []).map((m, i) => {
                       const visible = m.confidence >= threshold
                       return (
                         <div key={i} style={{
@@ -1297,31 +1430,81 @@ export default function Playground() {
                     cursor: 'pointer',
                     transition: 'border-color 0.15s',
                   }}
-                  onClick={() => {
+                  onClick={async () => {
                     // Restore the run into main view
                     const m = entry.mode === 'image' ? 'image' : entry.mode === 'text' ? 'text' : 'vl'
                     setPlayMode(m)
-                    const matchedModel = models.find(mm => mm.id === entry.modelId)
+                    const matchedModel = models.find(mm => mm.id === entry.model_id)
                     if (matchedModel) setSelectedModel(matchedModel)
-                    if (entry.imageResult) { setResult(entry.imageResult); setError(null) }
-                    if (entry.textResult) { setTextResult(entry.textResult); setTextError(null) }
-                    if (entry.userPrompt !== undefined) setUserPrompt(entry.userPrompt)
-                    if (entry.systemPrompt !== undefined) setSystemPrompt(entry.systemPrompt)
+                    if (entry.mode === 'image' && entry.result) { setResult(entry.result); setError(null) }
+                    if ((entry.mode === 'text' || entry.mode === 'vl') && entry.result) { setTextResult(entry.result); setTextError(null) }
+                    if (entry.user_prompt !== undefined) setUserPrompt(entry.user_prompt)
+                    if (entry.system_prompt !== undefined) setSystemPrompt(entry.system_prompt)
+                    // Restore image: fetch ORIGINAL image blob and convert to File
+                    if ((entry.mode === 'image' || entry.mode === 'vl') && (entry as any).image_key) {
+                      try {
+                        const url = `/api/inference/image/${entry.id}?v=${entry.created_at}`
+                        const resp = await fetch(url)
+                        if (resp.ok) {
+                          const blob = await resp.blob()
+                          const ct = resp.headers.get('content-type') || 'image/jpeg'
+                          const extFromCt = ct.split('/')[1]?.split(';')[0] || 'jpg'
+                          const filename = entry.image_name || `restored-${entry.id}.${extFromCt}`
+                          const file = new File([blob], filename, { type: ct })
+                          const objUrl = URL.createObjectURL(blob)
+                          if (entry.mode === 'image') {
+                            setImageFile(file)
+                            setImageUrl(objUrl)
+                            setResult(null)  // clear old result so re-run is possible
+                          } else if (entry.mode === 'vl') {
+                            setVlImageFile(file)
+                            setVlImageUrl(objUrl)
+                          }
+                        }
+                      } catch { /* ignore */ }
+                    } else if ((entry.mode === 'image' || entry.mode === 'vl') && entry.thumbnail_key) {
+                      // Fallback: old history entries have only thumbnail (small + blurry)
+                      try {
+                        const url = `/api/inference/thumbnail/${entry.id}?v=${entry.created_at}`
+                        const resp = await fetch(url)
+                        if (resp.ok) {
+                          const blob = await resp.blob()
+                          const filename = entry.image_name || `restored-${entry.id}.jpg`
+                          const file = new File([blob], filename, { type: 'image/jpeg' })
+                          const objUrl = URL.createObjectURL(blob)
+                          if (entry.mode === 'image') {
+                            setImageFile(file)
+                            setImageUrl(objUrl)
+                            setResult(null)
+                          } else if (entry.mode === 'vl') {
+                            setVlImageFile(file)
+                            setVlImageUrl(objUrl)
+                          }
+                        }
+                      } catch { /* ignore */ }
+                    }
                     window.scrollTo({ top: 0, behavior: 'smooth' })
                   }}
                 >
                   {/* Thumbnail or icon */}
-                  {entry.imageThumbnail ? (
-                    <img src={entry.imageThumbnail} alt="" style={{ width: 56, height: 40, objectFit: 'cover', borderRadius: 6, flexShrink: 0, background: '#000' }} />
-                  ) : entry.vlImageThumbnail ? (
-                    <img src={entry.vlImageThumbnail} alt="" style={{ width: 56, height: 40, objectFit: 'cover', borderRadius: 6, flexShrink: 0, background: '#000' }} />
+                  {entry.thumbnail_key && historyThumbs[entry.id] ? (
+                    <img
+                      src={historyThumbs[entry.id]}
+                      alt=""
+                      style={{ width: 56, height: 40, objectFit: 'cover', borderRadius: 6, flexShrink: 0, background: '#000' }}
+                    />
+                  ) : entry.thumbnail_key ? (
+                    <div style={{
+                      width: 56, height: 40, borderRadius: 6, flexShrink: 0,
+                      background: '#000',
+                    }} />
                   ) : (
                     <div style={{
                       width: 56, height: 40, borderRadius: 6, flexShrink: 0,
-                      background: TYPE_COLOR[entry.modelType] + '18',
+                      background: TYPE_COLOR[entry.model_type] + '18',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                     }}>
-                      <MessageSquare size={16} style={{ color: TYPE_COLOR[entry.modelType] }} />
+                      <MessageSquare size={16} style={{ color: TYPE_COLOR[entry.model_type] }} />
                     </div>
                   )}
 
@@ -1330,21 +1513,21 @@ export default function Playground() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
                       <span style={{
                         fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 4,
-                        background: TYPE_COLOR[entry.modelType] + '20',
-                        color: TYPE_COLOR[entry.modelType],
+                        background: TYPE_COLOR[entry.model_type] + '20',
+                        color: TYPE_COLOR[entry.model_type],
                         flexShrink: 0,
                       }}>
-                        {TYPE_LABEL[entry.modelType] ?? entry.modelType}
+                        {TYPE_LABEL[entry.model_type] ?? entry.model_type}
                       </span>
                       <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {entry.modelName}
+                        {entry.model_name}
                       </span>
                     </div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {entry.mode === 'image'
-                        ? entry.imageName ?? 'Image inference'
-                        : entry.userPrompt
-                          ? `"${entry.userPrompt.slice(0, 80)}${entry.userPrompt.length > 80 ? '…' : ''}"`
+                        ? entry.image_name ?? 'Image inference'
+                        : entry.user_prompt
+                          ? `"${entry.user_prompt.slice(0, 80)}${entry.user_prompt.length > 80 ? '…' : ''}"`
                           : 'Text inference'
                       }
                     </div>
@@ -1352,35 +1535,35 @@ export default function Playground() {
 
                   {/* Result summary */}
                   <div style={{ flexShrink: 0, textAlign: 'right', minWidth: 90 }}>
-                    {entry.imageResult?.type === 'classification' && (
+                    {entry.result?.type === 'classification' && (
                       <div style={{ fontSize: 12, fontWeight: 700, color: '#10b981' }}>
-                        {entry.imageResult.top_label}
+                        {entry.result.top_label}
                         <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
-                          {(entry.imageResult.top_confidence * 100).toFixed(0)}%
+                          {(entry.result.top_confidence * 100).toFixed(0)}%
                         </div>
                       </div>
                     )}
-                    {entry.imageResult?.type === 'detection' && (
+                    {entry.result?.type === 'detection' && (
                       <div style={{ fontSize: 12, fontWeight: 700, color: '#f59e0b' }}>
-                        {entry.imageResult.count} detections
+                        {entry.result.count} detections
                         <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
-                          {entry.imageResult.inference_time_ms} ms
+                          {entry.result.inference_time_ms} ms
                         </div>
                       </div>
                     )}
-                    {entry.imageResult?.type === 'segmentation' && (
+                    {entry.result?.type === 'segmentation' && (
                       <div style={{ fontSize: 12, fontWeight: 700, color: '#10b981' }}>
-                        {entry.imageResult.masks.length} regions
+                        {entry.result.masks?.length ?? 0} regions
                         <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
-                          {entry.imageResult.inference_time_ms} ms
+                          {entry.result.inference_time_ms} ms
                         </div>
                       </div>
                     )}
-                    {entry.textResult && (
+                    {(entry.result?.type === 'llm-text' || entry.result?.type === 'vlm-finetune') && (
                       <div style={{ fontSize: 12, fontWeight: 700, color: '#8b5cf6' }}>
-                        {entry.textResult.tokens_generated} tokens
+                        {entry.result.tokens_generated ?? 0} tokens
                         <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 400 }}>
-                          {entry.textResult.tokens_per_second.toFixed(0)} tok/s
+                          {(entry.result.tokens_per_second ?? 0).toFixed?.(0) ?? 0} tok/s
                         </div>
                       </div>
                     )}
@@ -1388,7 +1571,7 @@ export default function Playground() {
 
                   {/* Timestamp */}
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', flexShrink: 0, minWidth: 90, textAlign: 'right' }}>
-                    {fmtTime(entry.timestamp)}
+                    {fmtTime(entry.created_at)}
                   </div>
 
                   {/* Delete */}

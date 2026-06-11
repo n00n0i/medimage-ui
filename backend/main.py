@@ -114,6 +114,33 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS inference_history (
+                id              TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL DEFAULT 'default',
+                created_at      REAL NOT NULL,
+                mode            TEXT NOT NULL,
+                model_id        TEXT,
+                model_name      TEXT,
+                model_type      TEXT,
+                image_name      TEXT,
+                thumbnail_key   TEXT,
+                image_key       TEXT,
+                user_prompt     TEXT,
+                system_prompt   TEXT,
+                result_json     TEXT NOT NULL,
+                inference_time_ms INTEGER
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inference_history_user_time "
+            "ON inference_history (user_id, created_at DESC)"
+        )
+        # Migration: add image_key column if missing (existing DBs from before)
+        try:
+            conn.execute("ALTER TABLE inference_history ADD COLUMN image_key TEXT")
+        except Exception:
+            pass  # column already exists
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS totp_credentials (
                 id          TEXT PRIMARY KEY,
                 user_id     TEXT NOT NULL,
@@ -183,7 +210,7 @@ def _sync_verify_token(token: str):
 
 # Paths excluded from JWT auth
 _KC_PUBLIC_PATHS = {"/api/health", "/api/diag/minio"}
-_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/")
+_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/", "/api/inference/thumbnail/", "/api/inference/image/")
 
 @app.middleware("http")
 async def jwt_auth_middleware(request: Request, call_next):
@@ -1352,6 +1379,29 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
 
     random.shuffle(samples)
     n_val = max(1, int(0.2 * len(samples)))
+    # Some models (e.g. efficientvit_m5) have a FIXED input size — they
+    # will hard-fail with feature-map mismatches if we feed the wrong
+    # resolution. Always honour the model's default in that case.
+    timm_name = model_name.replace("-", "_")
+    _model_default_input = None
+    _model_fixed = False
+    try:
+        import timm as _timm
+        _cfg = _timm.get_pretrained_cfg(timm_name)
+        if _cfg is not None:
+            _in = getattr(_cfg, "input_size", None)
+            if isinstance(_in, (list, tuple)) and len(_in) >= 3:
+                _model_default_input = _in[-1]  # H or W
+            _model_fixed = bool(getattr(_cfg, "fixed_input_size", False))
+    except Exception:
+        pass
+    if _model_fixed and _model_default_input:
+        if imgsz != _model_default_input:
+            print(f"[train] {timm_name} requires input_size={_model_default_input} (fixed) — overriding imgsz={imgsz}")
+            imgsz = _model_default_input
+    elif _model_default_input and abs(_model_default_input - imgsz) > 32:
+        print(f"[train] imgsz={imgsz} doesn't match {timm_name} default {_model_default_input} — using {_model_default_input}")
+        imgsz = _model_default_input
     tf_tr = transforms.Compose([
         transforms.Resize((imgsz, imgsz)),
         transforms.RandomHorizontalFlip(),
@@ -1364,13 +1414,11 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-    train_dl = DataLoader(ImgDS(samples[:-n_val], tf_tr), batch_size=batch, shuffle=True)
-    val_dl   = DataLoader(ImgDS(samples[-n_val:], tf_vl), batch_size=batch)
+    train_dl = DataLoader(ImgDS(samples[:-n_val], tf_tr), batch_size=batch, shuffle=True, drop_last=True)
+    val_dl   = DataLoader(ImgDS(samples[-n_val:], tf_vl), batch_size=batch, drop_last=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # TIMM uses underscores: efficientnet-b2 → efficientnet_b2
-    timm_name = model_name.replace("-", "_")
-    print(f"[train] Device: {device} | model: {timm_name}")
+    print(f"[train] Device: {device} | model: {timm_name} | imgsz={imgsz}")
     model = timm.create_model(timm_name, pretrained=True, num_classes=nc).to(device)
 
     crit = nn.CrossEntropyLoss()
@@ -2266,10 +2314,18 @@ def train_ultralytics(yaml_path, data_dir, model_name, training_type, epochs, im
         optimizer=optimizer, project="/tmp/yolo_runs", name=job_id,
         exist_ok=True, verbose=True,
     )
-    print(f"[train] Training done. Save dir: {results.save_dir}")
-    best_pt = Path(results.save_dir) / "weights" / "best.pt"
+    # ultralytics >= 8.x: model.train() returns the Results object on
+    # success, but on certain validation/edge cases it can return None.
+    # We always fall back to the on-disk save dir + best.pt path so the
+    # training pipeline can continue even when results is None.
+    save_dir = getattr(results, "save_dir", None) if results is not None else None
+    if save_dir is None:
+        save_dir = f"/tmp/yolo_runs/{job_id}"
+        print(f"[train] results.save_dir is None; falling back to {save_dir}")
+    print(f"[train] Training done. Save dir: {save_dir}")
+    best_pt = Path(save_dir) / "weights" / "best.pt"
     if not best_pt.exists():
-        best_pt = Path(results.save_dir) / "weights" / "last.pt"
+        best_pt = Path(save_dir) / "weights" / "last.pt"
     if not best_pt.exists():
         print("[train] ERROR: No weights file found after training!")
         sys.exit(1)
@@ -2925,9 +2981,11 @@ def _run_on_ray_cluster(job: dict) -> None:
         # SMP segmentation, self-supervised, HuggingFace vision, and VLM-without-
         # text-dataset all need JSON so we can download images from MinIO.
         _needs_json = (
-            engine in ("Segmentation Models PyTorch", "HuggingFace")
+            engine in ("Segmentation Models PyTorch", "HuggingFace", "PyTorch", "PyTorch+TIMM", "TorchVision", "TIMM", "MONAI")
             or training_type_for_export == "self-supervised"
             or training_type_for_export == "vlm-finetune"
+            or training_type_for_export == "segmentation"  # all segmentation needs JSON
+            or training_type_for_export == "classification"  # classification needs LS JSON for image + label lookup
         )
         _export_fmt = "JSON" if _needs_json else "YOLO"
         dataset_url = _export_ls_to_minio(project_id, job_id, preferred_fmt=_export_fmt)
@@ -2968,8 +3026,11 @@ def _run_on_ray_cluster(job: dict) -> None:
         "LS_TOKEN":        LS_TOKEN,
         "HF_TOKEN":        _hf_token,
         "HUGGING_FACE_HUB_TOKEN": _hf_token,
-        # LLM-specific
-        "TEXT_DATASET":    job.get("text_dataset", ""),
+        # LLM-specific — resolve the text_dataset id to a real local path
+        # so load_dataset() can read it. The training script first tries
+        # HF hub by that name and falls back to local JSONL if it fails,
+        # so passing the full path is the cleanest, most reliable option.
+        "TEXT_DATASET":    _resolve_text_dataset_path(job.get("text_dataset", "")),
         "LORA_RANK":       str(job.get("lora_rank", 16)),
         "QUANTIZATION":    job.get("quantization", "4bit"),
         "MAX_SEQ_LEN":     str(job.get("max_seq_len", 2048)),
@@ -3102,27 +3163,70 @@ def _run_on_ray_cluster(job: dict) -> None:
 
             _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s) ...")
 
-        # Fetch logs and parse weights path from WEIGHTS_UPLOADED lines
+        # Ray cluster: flush stdout/stderr of the finished job to the
+        # dashboard before we try to read it back. Without this gap
+        # the /logs endpoint returns an empty body even though the
+        # job is reported as SUCCEEDED.
+        if _ray_status == "SUCCEEDED":
+            time.sleep(8)
+
+        # Fetch logs and parse weights path from WEIGHTS_UPLOADED lines.
+        # The Ray dashboard can take a few seconds after status flips
+        # to SUCCEEDED before the job's stdout is queryable, so we
+        # retry a few times before giving up.
         _weights_path = None
         _all_log_lines = []
-        try:
-            _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
-            if _logs_resp.ok:
-                for _line in _logs_resp.text.splitlines():
-                    _line_s = _line.strip()
-                    if _line_s:
-                        _all_log_lines.append(_line_s)
-                        _append_log(job_id, _line_s)
-                        # Parse: WEIGHTS_UPLOADED: s3://bucket/key
-                        if "WEIGHTS_UPLOADED:" in _line_s:
-                            for _part in _line_s.split():
-                                if _part.startswith("s3://"):
-                                    _weights_path = _part
-        except Exception as _e:
-            _append_log(job_id, f"[cluster] Could not fetch logs: {_e}")
+        # Fallback: even if the dashboard log endpoint never returns
+        # the WEIGHTS_UPLOADED line (cluster-side buffering, or the
+        # log file was GC'd before the line made it through), the
+        # upload_to_minio() call always writes to the standard
+        # {WEIGHTS_BUCKET}/{WEIGHTS_KEY} pair, so we can construct the
+        # path directly.
+        _expected_weights = f"s3://{weights_bucket}/{weights_key}"
+        for _log_attempt in range(15):
+            try:
+                _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
+                _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} len={len(_logs_resp.text)}")
+                if _logs_resp.ok and _logs_resp.text:
+                    _all_log_lines = []
+                    for _line in _logs_resp.text.splitlines():
+                        _line_s = _line.strip()
+                        if _line_s:
+                            _all_log_lines.append(_line_s)
+                            _append_log(job_id, _line_s)
+                            # Parse three known log shapes:
+                            #   WEIGHTS_UPLOADED: s3://bucket/key
+                            #   WEIGHTS_UPLOADED: bucket/key
+                            #   WEIGHTS_UPLOADED:key
+                            if "WEIGHTS_UPLOADED" in _line_s:
+                                _payload = _line_s.split("WEIGHTS_UPLOADED", 1)[1].lstrip(":").strip()
+                                if not _payload:
+                                    continue
+                                if _payload.startswith("s3://"):
+                                    _weights_path = _payload
+                                elif "/" in _payload and _payload.count("/") == 1:
+                                    _weights_path = f"s3://{_payload}"
+                                else:
+                                    # Bare key — assume the standard bucket
+                                    _weights_path = f"s3://medimage-weights/{_payload}"
+                    if _weights_path:
+                        break
+                _append_log(job_id, f"[cluster] Log fetch attempt {_log_attempt+1}/15 empty, retrying...")
+                time.sleep(3)
+            except Exception as _e:
+                _append_log(job_id, f"[cluster] Could not fetch logs (attempt {_log_attempt+1}): {_e}")
+                time.sleep(3)
 
         if _ray_status != "SUCCEEDED":
             raise RuntimeError(f"Ray job {_ray_job_id} ended with status: {_ray_status}")
+
+        # If we couldn't parse the WEIGHTS_UPLOADED line, fall back to
+        # the bucket/key pair the worker was told to use. This is the
+        # correct path in the common case because upload_to_minio()
+        # always writes to exactly that S3 location.
+        if not _weights_path:
+            _append_log(job_id, f"[cluster] Falling back to expected weights path: {_expected_weights}")
+            _weights_path = _expected_weights
 
         _set_step(job_id, "saving")
         if _weights_path:
@@ -3166,12 +3270,145 @@ def _run_on_ray_cluster(job: dict) -> None:
         pip_pkgs = ["boto3>=1.34", "requests", "Pillow"]  # torch/torchvision pre-installed
     else:
         # ultralytics is pre-installed on Ray cluster — do NOT reinstall (causes numpy binary conflict)
-        pip_pkgs = ["boto3>=1.34", "pyyaml", "requests"]
+        # Pin numpy<2.0 — cluster has pandas compiled against numpy 1.x ABI
+        pip_pkgs = ["boto3>=1.34", "pyyaml", "requests", "ultralytics",
+                    "opencv-python-headless", "numpy<2.0"]
 
-    # Define the worker function inline so cloudpickle serializes the full body
-    # (not a reference to 'main' module which doesn't exist on the Ray worker).
-    # pip packages are installed inside the function via subprocess to avoid
-    # requiring virtualenv on the worker node (runtime_env pip needs virtualenv).
+    # ── Submit deep-learning job via Ray Jobs API (avoids Ray Client port) ──
+    # VLM/LLM jobs use the dispatch path above (line 2996+) — don't touch them.
+    # Only Mask R-CNN, YOLO, MONAI, etc. land here, and they now go through
+    # the dashboard REST API instead of ray.init(address="ray://...").
+    import base64 as _b64lib, requests as _ray_req
+    # Keep the wrapper script small (no inline base64) — pass training script
+    # via env var to avoid "Argument list too long" (Linux argv limit ~128KB).
+    _wrapper = (
+        "import os, sys, subprocess, base64\n"
+        f"_pip = {pip_pkgs!r}\n"
+        f"_env = {env_vars!r}\n"
+        "_b64 = os.environ.get('MEDIMAGE_TRAIN_SCRIPT_B64', '')\n"
+        "if not _b64:\n"
+        "    raise RuntimeError('_MEDIMAGE_TRAIN_SCRIPT_B64 env var not set')\n"
+        "_sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', 'numpy<2.0'], capture_output=True)\n"
+        "if _pip:\n"
+        "    _sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q'] + _pip, capture_output=True)\n"
+        "# Opencv fix: ultralytics's dep chain pulls opencv-python (needs libGL.so.1,\n"
+        "# missing on the cluster). Uninstall opencv-python entirely and force-\n"
+        "# reinstall opencv-python-headless so the headless .so files win on import.\n"
+        "print('[opencv-fix] uninstall opencv-python...', flush=True)\n"
+        "r = subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', '-q', 'opencv-python', 'opencv-contrib-python'], capture_output=True, text=True)\n"
+        "print(f'[opencv-fix] uninstall rc={r.returncode}', flush=True)\n"
+        "print('[opencv-fix] force-reinstall opencv-python-headless...', flush=True)\n"
+        "r = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', '--no-deps', 'opencv-python-headless'], capture_output=True, text=True)\n"
+        "print(f'[opencv-fix] install rc={r.returncode}', flush=True)\n"
+        "r = subprocess.run([sys.executable, '-c', 'import cv2; print(\"cv2 ok:\", cv2.__version__)'], capture_output=True, text=True)\n"
+        "print(f'[opencv-fix] cv2 check: {r.stdout.strip()} {r.stderr.strip()}', flush=True)\n"
+        "for k, v in _env.items(): os.environ[k] = v\n"
+        "from io import StringIO\n"
+        "_cap = StringIO()\n"
+        "_so, _se = sys.stdout, sys.stderr\n"
+        "sys.stdout = sys.stderr = _cap\n"
+        "try:\n"
+        "    exec(base64.b64decode(_b64).decode(), {'__name__': '__main__'})\n"
+        "except SystemExit as _e:\n"
+        "    if _e.code not in (None, 0):\n"
+        "        sys.stdout = _so; sys.stderr = _se\n"
+        "        raise RuntimeError(f'Script exited {_e.code}\\n{_cap.getvalue()}')\n"
+        "finally:\n"
+        "    sys.stdout, sys.stderr = _so, _se\n"
+        "print(_cap.getvalue())\n"
+    )
+    _wrapper_b64 = _b64lib.b64encode(_wrapper.encode()).decode()
+    # Send the actual training script via env var (no argv limit on env vars)
+    _env_for_job = dict(env_vars)
+    _env_for_job["MEDIMAGE_TRAIN_SCRIPT_B64"] = script_b64
+    _deploy_payload = {
+        "entrypoint": f"bash -c 'echo {_wrapper_b64} | base64 -d > /tmp/dl_train.py && python3 /tmp/dl_train.py'",
+        "runtime_env": {"env_vars": _env_for_job},
+    }
+    try:
+        _resp = _ray_req.post(f"{http_url}/api/jobs/", json=_deploy_payload, timeout=30)
+        _resp.raise_for_status()
+        _ray_job_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+        _append_log(job_id, f"[cluster] DL training job submitted: {_ray_job_id}")
+    except Exception as _e:
+        _append_log(job_id, f"[cluster] DL job submission failed: {_e}")
+        raise
+
+    _set_step(job_id, "training")
+    _last_status = ""
+    elapsed = 0
+    poll_sec = 15
+    while True:
+        time.sleep(poll_sec)
+        elapsed += poll_sec
+        try:
+            _status_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}", timeout=10)
+            _status_resp.raise_for_status()
+            _ray_status = _status_resp.json().get("status", "UNKNOWN")
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Status poll failed: {_e}")
+            _ray_status = _last_status
+        if _ray_status != _last_status:
+            _append_log(job_id, f"[cluster] Ray job status: {_ray_status}")
+            _last_status = _ray_status
+        if _ray_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+            break
+        _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s) ...")
+
+    if _ray_status == "SUCCEEDED":
+        time.sleep(8)
+
+    _weights_path = None
+    _expected_weights = f"s3://{weights_bucket}/{weights_key}"
+    for _log_attempt in range(15):
+        try:
+            _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
+            _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} len={len(_logs_resp.text)}")
+            if _logs_resp.ok and _logs_resp.text:
+                for _line in _logs_resp.text.splitlines():
+                    _line_s = _line.strip()
+                    if not _line_s: continue
+                    # Skip Ray's own log lines (timestamps, runtime env setup)
+                    if _line_s.startswith("Running entrypoint") or "Runtime env is" in _line_s or "Connecting to existing" in _line_s or "Connected to Ray" in _line_s or "Using address" in _line_s:
+                        continue
+                    _append_log(job_id, _line_s)
+                    if "WEIGHTS_UPLOADED" in _line_s:
+                        _payload = _line_s.split("WEIGHTS_UPLOADED", 1)[1].lstrip(":").strip()
+                        if not _payload:
+                            continue
+                        if _payload.startswith("s3://"):
+                            _weights_path = _payload
+                        elif "/" in _payload and _payload.count("/") == 1:
+                            _weights_path = f"s3://{_payload}"
+                        else:
+                            _weights_path = f"s3://medimage-weights/{_payload}"
+                if _weights_path:
+                    break
+            _append_log(job_id, f"[cluster] Log fetch attempt {_log_attempt+1}/15 empty, retrying...")
+            time.sleep(3)
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Could not fetch logs (attempt {_log_attempt+1}): {_e}")
+            time.sleep(3)
+
+    if _ray_status != "SUCCEEDED":
+        raise RuntimeError(f"DL training job {_ray_job_id} ended with status: {_ray_status}")
+
+    if not _weights_path:
+        _append_log(job_id, f"[cluster] Falling back to expected weights path: {_expected_weights}")
+        _weights_path = _expected_weights
+
+    # Save weights path to DB
+    if _weights_path:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET s3_weights_path = ? WHERE id = ?",
+                (_weights_path, job_id),
+            )
+            conn.commit()
+    _append_log(job_id, f"✓ Training complete — weights: {_weights_path or '(not found)'}")
+    _set_step(job_id, "done")
+    _set_status(job_id, "completed")
+    return
     _pip_pkgs_for_worker = pip_pkgs
     def _run_training_inline(script_b64_arg: str, env_vars_arg: dict) -> dict:
         """Inline runner for the deep-learning path (YOLO, MONAI, nnU-Net,
@@ -3194,32 +3431,58 @@ def _run_on_ray_cluster(job: dict) -> None:
         # pandas._libs will crash with "numpy.dtype size changed" until numpy
         # is back on 1.x. This explicit reinstall runs before the other
         # packages so its resolved version sticks.
+    # Force-reinstall numpy<2.0 LAST so it overrides ultralytics's pull.
+    # ultralytics requires opencv-python (not -headless) which needs libGL.so.1
+    # on the cluster. After ultralytics installs opencv-python, we swap it
+    # for opencv-python-headless to avoid the missing libGL dep.
+    _sp.run(
+        [_sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "numpy<2.0"],
+        capture_output=True,
+    )
+    # Install required packages directly — avoids the virtualenv requirement
+    if _pip_pkgs_for_worker:
         _sp.run(
-            [_sys.executable, "-m", "pip", "install", "-q",
-             "--force-reinstall", "numpy<2.0"],
+            [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
             capture_output=True,
         )
-        # Install required packages directly — avoids the virtualenv requirement
-        if _pip_pkgs_for_worker:
-            _sp.run(
-                [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
-                capture_output=True,
-            )
-        for k, v in env_vars_arg.items():
-            _os.environ[k] = v
-        captured = _StringIO()
-        _orig_out, _orig_err = _sys.stdout, _sys.stderr
-        _sys.stdout = _sys.stderr = captured
-        try:
-            exec(_b64.b64decode(script_b64_arg).decode(), {"__name__": "__main__"})  # noqa: S102
-        except SystemExit as e:
-            if e.code not in (None, 0):
-                raise RuntimeError(f"Script exited code {e.code}\n{captured.getvalue()}")
-        finally:
-            _sys.stdout, _sys.stderr = _orig_out, _orig_err
-        output = captured.getvalue()
-        wp = next((ln.split(":", 1)[1].strip() for ln in output.splitlines() if ln.startswith("WEIGHTS_UPLOADED:")), None)
-        return {"stdout": output, "weights_path": wp}
+    # Replace full opencv-python with headless variant to skip libGL dep.
+    # ultralytics pulls opencv-python (which needs libGL.so.1, missing on
+    # the cluster). We must uninstall opencv-python AND force-reinstall
+    # opencv-python-headless with --no-deps to ensure the headless .so
+    # files actually overwrite the non-headless ones on next import.
+    r_uninst = _sp.run(
+        [_sys.executable, "-m", "pip", "uninstall", "-y", "-q",
+         "opencv-python", "opencv-contrib-python"],
+        capture_output=True, text=True,
+    )
+    print(f"[opencv-fix] uninstall rc={r_uninst.returncode}", flush=True)
+    r_inst = _sp.run(
+        [_sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+         "--no-deps", "opencv-python-headless"],
+        capture_output=True, text=True,
+    )
+    print(f"[opencv-fix] headless install rc={r_inst.returncode}", flush=True)
+    # Verify cv2 import works without libGL dep
+    r_check = _sp.run(
+        [_sys.executable, "-c", "import cv2; print('cv2 ok:', cv2.__version__)", ],
+        capture_output=True, text=True,
+    )
+    print(f"[opencv-fix] cv2 check: {r_check.stdout.strip()} {r_check.stderr.strip()}", flush=True)
+    for k, v in env_vars_arg.items():
+        _os.environ[k] = v
+    captured = _StringIO()
+    _orig_out, _orig_err = _sys.stdout, _sys.stderr
+    _sys.stdout = _sys.stderr = captured
+    try:
+        exec(_b64.b64decode(script_b64_arg).decode(), {"__name__": "__main__"})  # noqa: S102
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            raise RuntimeError(f"Script exited code {e.code}\n{captured.getvalue()}")
+    finally:
+        _sys.stdout, _sys.stderr = _orig_out, _orig_err
+    output = captured.getvalue()
+    wp = next((ln.split(":", 1)[1].strip() for ln in output.splitlines() if ln.startswith("WEIGHTS_UPLOADED:")), None)
+    return {"stdout": output, "weights_path": wp}
 
     # Keep Ray connection alive after training (don't shutdown — other threads may
     # be using it for serve deployments concurrently)
@@ -3429,6 +3692,33 @@ _MODEL_ID_FIXES = {
 
 def _normalize_model_name(model_name: str) -> str:
     return _MODEL_ID_FIXES.get(model_name, model_name)
+
+
+def _resolve_text_dataset_path(ds_id_or_path: str) -> str:
+    """Resolve a text_dataset value (ds_id, basename, or full path) to an
+    absolute local path the Ray worker can read. Falls back to the input
+    unchanged so HF hub dataset names still work."""
+    if not ds_id_or_path:
+        return ""
+    # Already a path
+    if ds_id_or_path.startswith("/"):
+        return ds_id_or_path
+    # Try to look up by id in DB
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT path FROM text_datasets WHERE id = ?",
+                (ds_id_or_path,),
+            ).fetchone()
+        if row and row["path"]:
+            return row["path"]
+    except Exception:
+        pass
+    # Treat as relative path under /data/text-datasets/
+    candidate = f"/data/text-datasets/{ds_id_or_path}"
+    if os.path.isfile(candidate):
+        return candidate
+    return ds_id_or_path
 
 
 _EXPORT_ENGINES = {"TF-Lite", "ONNX", "NVIDIA", "Intel", "Apple"}
@@ -3764,24 +4054,58 @@ def delete_job(job_id: str, from_view: str = "jobs"):
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
-        # Safety net: refuse to delete (even hide-from-list) a model that
-        # is currently deployed. The user must explicitly clear the
-        # deployment via the Models → Deploy → Undeploy flow first.
+        # Verify the deployment is still actually live before refusing
+        # the delete. The DB column can be stale (Ray cluster restarted,
+        # Pod killed, network blip) — in that case there's nothing to
+        # protect, so we auto-clear the stale URL and proceed.
         provider = (row["inference_provider"] or "").strip()
-        if provider == "ray"   and (row["ray_serve_url"] or "").strip():
-            raise HTTPException(
-                status_code=409,
-                detail="Model is deployed on Ray Serve — undeploy first (Deploy tab → Undeploy).",
-            )
-        if provider == "modal" and (row["modal_url"] or "").strip():
-            raise HTTPException(
-                status_code=409,
-                detail="Model is deployed on Modal — undeploy first (Deploy tab → Stop).",
-            )
+        ray_url  = (row["ray_serve_url"] or "").strip()
+        modal_url = (row["modal_url"] or "").strip()
+        if provider == "ray" and ray_url:
+            try:
+                _ping = httpx.get(ray_url.rstrip("/") + "/health", timeout=4)
+                if _ping.status_code < 500:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Model is deployed on Ray Serve — undeploy first (Deploy tab → Undeploy).",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                # Endpoint unreachable → stale DB state. Clear it.
+                conn.execute(
+                    "UPDATE jobs SET ray_serve_url='', inference_provider='' WHERE id=?",
+                    (job_id,),
+                )
+                ray_url = ""
+                provider = ""
+        if provider == "modal" and modal_url:
+            _modal_health = modal_url.replace("inference", "health").rstrip("/")
+            try:
+                _ping = httpx.get(_modal_health, timeout=4)
+                if _ping.status_code < 500:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Model is deployed on Modal — undeploy first (Deploy tab → Stop).",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                conn.execute(
+                    "UPDATE jobs SET modal_url='', modal_api_key='', inference_provider='' WHERE id=?",
+                    (job_id,),
+                )
+                modal_url = ""
+                provider = ""
         if from_view == "models":
-            conn.execute("UPDATE jobs SET hidden_in_models = 1 WHERE id = ?", (job_id,))
+            # Deleting from the Models page removes the model entity
+            # entirely — hide it from both views.
+            conn.execute(
+                "UPDATE jobs SET hidden_in_models = 1, hidden_in_jobs = 1 WHERE id = ?",
+                (job_id,),
+            )
         else:
-            # Cancel if still active, then hide from jobs view
+            # Cancel if still active, then hide from jobs view only.
             if row["status"] in ("queued", "running"):
                 conn.execute("UPDATE jobs SET status = 'error', error = 'Cancelled by user' WHERE id = ?", (job_id,))
             conn.execute("UPDATE jobs SET hidden_in_jobs = 1 WHERE id = ?", (job_id,))
@@ -4074,7 +4398,7 @@ class ModalStartRequest(BaseModel):
 
 def _modal_script(req: ModalStartRequest) -> str:
     gpu_spec = f'gpu="{req.gpu_type}"' if req.gpu_type != "cpu" else "gpu=None"
-    return textwrap.dedent(f"""\
+    return textwrap.dedent(f"""
         import modal, subprocess, time, socket
 
         app = modal.App("medimage-ray")
@@ -4550,7 +4874,7 @@ def _modal_model_script(
         volumes_spec = ""
         run_bake = "\n            .run_function(_bake_weights)"
 
-    return textwrap.dedent(f"""\
+    return textwrap.dedent(f"""
         import modal, os, io, zipfile, json, time
         from pathlib import Path
         from fastapi import Request
@@ -4735,10 +5059,16 @@ def _modal_model_script(
                     _model = UNet(spatial_dims=2, in_channels=in_ch, out_channels=NUM_CLASSES, channels=(16,32,64,128,256), strides=(2,2,2,2)).eval()
             elif tt in ("llm-text", "vlm-finetune"):
                 import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                from peft import PeftModel
-                _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-                _model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if tt == "vlm-finetune":
+                    from transformers import AutoProcessor, AutoModelForVision2Seq
+                    from peft import PeftModel
+                    _hf_processor = AutoProcessor.from_pretrained(MODEL_NAME)
+                    _model = AutoModelForVision2Seq.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                else:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    from peft import PeftModel
+                    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                    _model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
                 if wp is not None:
                     _model = PeftModel.from_pretrained(_model, str(wp))
             else:
@@ -5134,7 +5464,7 @@ _ray_serve_state: dict = {
     "logs": [],
 }
 
-_SERVE_APP_PY = textwrap.dedent("""\
+_SERVE_APP_PY = textwrap.dedent("""
     from ray import serve
     from fastapi import FastAPI, File, Form, UploadFile
     from typing import Optional
@@ -5167,7 +5497,7 @@ _SERVE_APP_PY = textwrap.dedent("""\
 """)
 
 # ─── Per-model Ray Serve script ───────────────────────────────────────────────
-_SERVE_MODEL_PY = textwrap.dedent("""\
+_SERVE_MODEL_PY = textwrap.dedent("""
     import os, io, zipfile, json, time
     from pathlib import Path
 
@@ -5219,23 +5549,14 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
             return pt
 
     # ── Init Ray and deploy ───────────────────────────────────────────────────
-    os.environ["RAY_ADDRESS"] = ""
-    os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
     import ray
     from ray import serve
 
     _ray_address = os.environ.get("RAY_URL", "ray://100.68.53.118:10001")
     _ray_address = _ray_address.replace("http://", "ray://").replace(":8265", ":10001") if _ray_address else _ray_address
-    if not ray.is_initialized():
-        ray.init(address=_ray_address, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
-
-    # Pin actors to the head node using the built-in internal head resource.
-    # Ray always exposes node:__internal_head__ on the head node.
-    _node_resource = {"node:__internal_head__": 0.001}
+    ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
 
     # ── Deployment class — plain __call__, NO @serve.ingress(FastAPI()) ───────
-    # NOTE: runtime_env pip is intentionally NOT used here because Ray cluster
-    # nodes may not have virtualenv. All required packages must be pre-installed.
     @serve.deployment(
         num_replicas=1,
         ray_actor_options={
@@ -5255,7 +5576,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
             self._load_error = None
             try:
                 weights = _download_weights()
-                self._load(weights)  # None → load pretrained from MODEL_NAME
+                self._load(weights)
                 print(f"[serve] Model {MODEL_ID} ({TRAINING_TYPE}/{ENGINE}) loaded (fine-tuned={weights is not None})")
             except Exception as _e:
                 self._load_error = str(_e)
@@ -5334,10 +5655,16 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     self._smp_engine = True
             elif tt in ("llm-text", "vlm-finetune"):
                 import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                from peft import PeftModel
-                self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-                self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if tt == "vlm-finetune":
+                    from transformers import AutoProcessor, AutoModelForVision2Seq
+                    from peft import PeftModel
+                    self._hf_processor = AutoProcessor.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForVision2Seq.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                else:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    from peft import PeftModel
+                    self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
                 if wp is not None:
                     self.model = PeftModel.from_pretrained(self.model, str(wp))
             else:
@@ -5352,10 +5679,42 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                 return {"error": self._load_error or "Model not loaded"}
             tt = TRAINING_TYPE
             try:
-                # ── 1. HuggingFace transformers (detection / classification / segmentation) ──
+                # ── 1. LLM / VLM text generation (must be before HF image check) ──
+                if tt in ("llm-text", "vlm-finetune"):
+                    import torch
+                    if not prompt:
+                        return {"error": "Prompt required for LLM inference"}
+                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
+                    if tt == "vlm-finetune" and self._hf_processor is not None:
+                        from PIL import Image as _PILImage
+                        import io as _io
+                        img_obj = None
+                        if image_bytes:
+                            img_obj = _PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+                            messages = [{"role": "user", "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": full_prompt},
+                            ]}]
+                        else:
+                            messages = [{"role": "user", "content": [{"type": "text", "text": full_prompt}]}]
+                        chat_text = self._hf_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self._hf_processor(text=[chat_text], images=[img_obj] if img_obj else None, return_tensors="pt").to(self.model.device)
+                    else:
+                        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
+                    t0 = time.time()
+                    with torch.no_grad():
+                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
+                    ms = int((time.time() - t0) * 1000)
+                    n_tok = out.shape[1] - inputs.input_ids.shape[1] if hasattr(inputs, "input_ids") else 0
+                    processor = self._hf_processor if (tt == "vlm-finetune" and self._hf_processor) else self.tokenizer
+                    resp = processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True) if hasattr(inputs, "input_ids") else processor.decode(out[0], skip_special_tokens=True)
+                    return {"type": tt, "response": resp, "tokens_generated": n_tok,
+                            "inference_time_ms": ms, "model_name": MODEL_NAME}
+
+                # ── 2. HuggingFace image models (detection / classification / segmentation) ──
                 if self._hf_processor is not None:
                     if not image_bytes:
-                        return {"error": "Image required for this model type"}
+                        return {"error": "Image required"}
                     from PIL import Image as _Img
                     import torch
                     img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -5381,7 +5740,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                         return {"type": "classification", "predictions": preds[:5],
                                 "top_label": preds[0]["label"]}
                     elif tt == "segmentation":
-                        logits = outputs.logits  # (1, C, H, W)
+                        logits = outputs.logits
                         up = torch.nn.functional.interpolate(
                             logits, size=img.size[::-1], mode="bilinear", align_corners=False)
                         mask = up.argmax(dim=1)[0]
@@ -5398,7 +5757,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     else:
                         return {"error": f"HuggingFace inference not implemented for type={tt}"}
 
-                # ── 2. Ultralytics YOLO (detection + instance segmentation) ─────────────
+                # ── 3. Ultralytics YOLO (detection + instance segmentation) ──
                 if tt in ("detection", "segmentation") and hasattr(self.model, "predict"):
                     if not image_bytes:
                         return {"error": "Image required"}
@@ -5425,7 +5784,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                                 masks.append({"class_name": name, "confidence": float(r.boxes.conf[i])})
                         return {"type": "segmentation", "masks": masks, "num_masks": len(masks)}
 
-                # ── 3. Segmentation Models PyTorch (semantic segmentation) ───────────────
+                # ── 4. Segmentation Models PyTorch (semantic segmentation) ──
                 if tt == "segmentation" and self._smp_engine:
                     import torch
                     import torchvision.transforms as T
@@ -5437,7 +5796,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     tfm = T.Compose([T.Resize((256, 256)), T.ToTensor(),
                                      T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
                     with torch.no_grad():
-                        logits = self.model(tfm(img).unsqueeze(0))  # (1, C, H, W)
+                        logits = self.model(tfm(img).unsqueeze(0))
                     mask = logits.argmax(dim=1)[0]
                     total_px = mask.numel()
                     segs = []
@@ -5450,7 +5809,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     return {"type": "segmentation", "segments": segs,
                             "num_classes": len(segs), "image_size": [orig_w, orig_h]}
 
-                # ── 4. PyTorch / TIMM classification ─────────────────────────────────────
+                # ── 5. PyTorch / TIMM classification ──
                 if tt == "classification":
                     import torch
                     import torchvision.transforms as T
@@ -5467,22 +5826,6 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                                      "confidence": p} for i, p in enumerate(probs)],
                                    key=lambda x: -x["confidence"])
                     return {"type": "classification", "predictions": preds, "top_label": preds[0]["label"]}
-
-                # ── 5. LLM / VLM text generation ─────────────────────────────────────────
-                if tt in ("llm-text", "vlm-finetune"):
-                    import torch
-                    if not prompt:
-                        return {"error": "Prompt required for LLM inference"}
-                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
-                    inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
-                    t0 = time.time()
-                    with torch.no_grad():
-                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
-                    ms = int((time.time() - t0) * 1000)
-                    n_tok = out.shape[1] - inputs.input_ids.shape[1]
-                    resp = self.tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                    return {"type": tt, "response": resp, "tokens_generated": n_tok,
-                            "inference_time_ms": ms, "model_name": MODEL_NAME}
 
                 return {"error": f"No inference handler for engine={ENGINE}, type={tt}"}
             except Exception as exc:
@@ -5542,7 +5885,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
 # ── Ray Actor deployment script (avoids Ray Serve + Job Agent issues) ────────
 # Uses @ray.remote named detached actor instead of Ray Serve.
 # No pandas/numpy ABI issue since we don't import ray.serve.
-_RAY_ACTOR_PY = textwrap.dedent("""\
+_RAY_ACTOR_PY = textwrap.dedent("""
     import os, io, zipfile, json, time
     from pathlib import Path
 
@@ -5559,48 +5902,94 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
     CLASS_NAMES    = json.loads(os.environ.get("CLASS_NAMES", "[]")) or [f"class_{i}" for i in range(NUM_CLASSES)]
 
     def _download_weights():
-        import boto3
+        '''Download weights via presigned HTTPS URL (more compatible than boto3 on
+        heterogeneous Ray worker nodes).'''
+        import requests as _req
         from botocore.exceptions import ClientError
         if not WEIGHTS_KEY:
             return None
-        s3 = boto3.client("s3", endpoint_url=MINIO_URL,
-                          aws_access_key_id=MINIO_ACCESS, aws_secret_access_key=MINIO_SECRET,
-                          region_name="us-east-1",
-                          config=boto3.session.Config(s3={"addressing_style": "path"}))
-        local_dir = Path(f"/tmp/mweights/{MODEL_ID}")
+        # Use unique path per actor instance to avoid conflicts with stale state
+        import uuid as _uuid
+        _unique = _uuid.uuid4().hex[:12]
+        local_dir = Path(f"/tmp/mweights/{MODEL_ID}_{_unique}")
         local_dir.mkdir(parents=True, exist_ok=True)
         raw = local_dir / "raw_weights"
+        # Get presigned URL from the API server (which is on the docker network
+        # and has boto3 working correctly)
         try:
-            s3.download_file(WEIGHTS_BUCKET, WEIGHTS_KEY, str(raw))
-        except ClientError as _ce:
-            _code = _ce.response.get("Error", {}).get("Code", "")
-            if _code in ("404", "NoSuchKey", "400", "BadRequest"):
-                print(f"[actor] No weights at {WEIGHTS_KEY} — loading pretrained")
-                return None
-            raise
+            _api_resp = _req.get(
+                f"http://medimage-api:8000/api/internal/weights-url",
+                params={"bucket": WEIGHTS_BUCKET, "key": WEIGHTS_KEY},
+                timeout=15,
+            )
+            _api_resp.raise_for_status()
+            _presigned = _api_resp.json()["url"]
+        except Exception as _e:
+            print(f"[actor] Failed to get presigned URL: {_e}", flush=True)
+            return None
+        try:
+            with _req.get(_presigned, stream=True, timeout=300) as _resp:
+                _resp.raise_for_status()
+                with open(raw, "wb") as _f:
+                    for _chunk in _resp.iter_content(1024 * 1024):
+                        _f.write(_chunk)
+        except Exception as _e:
+            print(f"[actor] download failed: {_e}", flush=True)
+            return None
+        if not raw.is_file():
+            print(f"[actor] weights at {WEIGHTS_KEY} is not a file — loading pretrained", flush=True)
+            return None
         with open(raw, "rb") as f:
             magic = f.read(4)
         if magic[:2] == b"PK":
             out = local_dir / "extracted"
             out.mkdir(exist_ok=True)
+            import zipfile
             with zipfile.ZipFile(raw) as z:
                 z.extractall(out)
             return out
         else:
             pt = local_dir / "model.pt"
             raw.rename(pt)
-             return pt
+            return pt
 
-    os.environ["RAY_ADDRESS"] = ""
-    os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
     import ray
-    _ray_address = os.environ.get("RAY_URL", "ray://100.68.53.118:10001")
-    if not ray.is_initialized():
-        ray.init(address=_ray_address, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
+    _ray_address = os.environ.get("RAY_ADDRESS", "")
+    if not _ray_address:
+        _ray_address = "auto"
+    ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
 
-    @ray.remote(num_cpus=1)
+    # Base packages needed by all inference paths
+    _actor_pip = ["transformers>=4.40,<5.0", "accelerate>=0.28", "Pillow"]
+    if ENGINE in ("PyTorch", "HuggingFace", "Segmentation Models PyTorch", "MONAI"):
+        _actor_pip.append("torch")
+    if TRAINING_TYPE in ("llm-text", "vlm-finetune"):
+        _actor_pip += ["torch", "peft>=0.10"]
+
+    _needs_gpu = TRAINING_TYPE in ("llm-text", "vlm-finetune") or ENGINE in ("HuggingFace", "PyTorch", "MONAI", "Segmentation Models PyTorch")
+    _actor_opts = {"num_cpus": 1}
+    if _needs_gpu:
+        _actor_opts["num_gpus"] = 1
+
+    @ray.remote(**_actor_opts)
     class ModelInferenceActor:
         def __init__(self):
+            import subprocess as _sp, sys as _sys
+            # Install packages needed by the actor — may run on a node where
+            # they're not pre-installed. Keep this minimal and silent.
+            _pkgs = ["transformers>=4.40,<5.0", "accelerate>=0.28", "Pillow",
+                      "boto3", "numpy<2.0", "opencv-python-headless"]
+            if ENGINE in ("HuggingFace", "PyTorch", "MONAI", "Segmentation Models PyTorch"):
+                _pkgs.append("torch")
+                _pkgs.append("torchvision")
+            if ENGINE == "Segmentation Models PyTorch":
+                _pkgs.append("segmentation-models-pytorch")
+            if ENGINE == "Ultralytics":
+                _pkgs.append("ultralytics")
+            if TRAINING_TYPE in ("llm-text", "vlm-finetune"):
+                _pkgs += ["peft>=0.10"]
+            _sp.run([_sys.executable, "-m", "pip", "install", "-q"] + _pkgs,
+                    capture_output=True, timeout=600)
             self.model = None
             self.tokenizer = None
             self._hf_processor = None
@@ -5653,6 +6042,30 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
             if tt in ("detection", "segmentation") and eng == "Ultralytics":
                 from ultralytics import YOLO
                 self.model = YOLO(str(wp) if wp is not None else (MODEL_NAME or "yolov8n.pt"))
+            elif tt in ("detection", "segmentation") and eng == "TorchVision":
+                # Use SMP (segmentation-models-pytorch) — training code wrote SMP weights
+                # (encoder.conv1.weight keys match SMP UNet with ResNet backbone).
+                # NOTE: TorchVision's native Mask R-CNN is a different model family.
+                import torch
+                if "mask" in MODEL_NAME.lower() or "maskrcnn" in MODEL_NAME.lower():
+                    # Allow explicit Mask R-CNN via MODEL_NAME
+                    import torchvision
+                    from torchvision.models.detection import maskrcnn_resnet50_fpn
+                    m = maskrcnn_resnet50_fpn(weights=None, num_classes=NUM_CLASSES)
+                else:
+                    # Default: SMP UNet (matches what training produced)
+                    import segmentation_models_pytorch as smp
+                    arch = "Unet"  # SMP default
+                    enc = "resnet34"  # matches training pipeline default
+                    if "resnet50" in MODEL_NAME.lower(): enc = "resnet50"
+                    elif "efficientnet" in MODEL_NAME.lower(): enc = "efficientnet-b0"
+                    m = smp.Unet(encoder_name=enc, encoder_weights=None,
+                                 in_channels=3, classes=NUM_CLASSES)
+                if wp is not None:
+                    ckpt = torch.load(str(wp), map_location="cpu", weights_only=False)
+                    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    m.load_state_dict(state, strict=False)
+                self.model = m.eval()
             elif tt == "classification" and eng != "MONAI":
                 import torch, timm
                 arch = MODEL_NAME.replace("-", "_")
@@ -5727,10 +6140,16 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                                      channels=(16,32,64,128,256), strides=(2,2,2,2)).eval()
             elif tt in ("llm-text", "vlm-finetune"):
                 import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                from peft import PeftModel
-                self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-                self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if tt == "vlm-finetune":
+                    from transformers import AutoProcessor, AutoModelForVision2Seq
+                    from peft import PeftModel
+                    self._hf_processor = AutoProcessor.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForVision2Seq.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                else:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    from peft import PeftModel
+                    self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
                 if wp is not None:
                     self.model = PeftModel.from_pretrained(self.model, str(wp))
             else:
@@ -5741,45 +6160,50 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                         self.model = torch.load(str(pt), map_location="cpu", weights_only=False)
 
         def infer(self, image_bytes=None, conf=0.5, prompt="", system_prompt=""):
+            import base64 as _b64
+            if isinstance(image_bytes, str) and len(image_bytes) > 20:
+                try:
+                    image_bytes = _b64.b64decode(image_bytes)
+                except Exception:
+                    pass
             if self.model is None:
                 return {"error": self._load_error or "Model not loaded"}
             tt = TRAINING_TYPE
             try:
-                if self._hf_processor is not None:
-                    if not image_bytes:
-                        return {"error": "Image required"}
-                    from PIL import Image as _Img
+                # ── 1. LLM / VLM text generation (must be before HF image check) ──
+                if tt in ("llm-text", "vlm-finetune"):
                     import torch
-                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
-                    inputs = self._hf_processor(images=img, return_tensors="pt")
+                    if not prompt:
+                        return {"error": "Prompt required for LLM inference"}
+                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
+                    if tt == "vlm-finetune" and self._hf_processor is not None:
+                        from PIL import Image as _PILImage
+                        import io as _io
+                        img_obj = None
+                        if image_bytes:
+                            img_obj = _PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+                            messages = [{"role": "user", "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": full_prompt},
+                            ]}]
+                        else:
+                            messages = [{"role": "user", "content": [{"type": "text", "text": full_prompt}]}]
+                        chat_text = self._hf_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self._hf_processor(text=[chat_text], images=[img_obj] if img_obj else None, return_tensors="pt").to(self.model.device)
+                    else:
+                        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
+                    t0 = time.time()
                     with torch.no_grad():
-                        outputs = self.model(**inputs)
-                    if tt == "detection":
-                        target_sizes = torch.tensor([img.size[::-1]])
-                        res = self._hf_processor.post_process_object_detection(outputs, threshold=conf, target_sizes=target_sizes)[0]
-                        dets = []
-                        for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
-                            name = (self._hf_id2label or {}).get(label.item(), f"class_{label.item()}")
-                            x1, y1, x2, y2 = box.tolist()
-                            dets.append({"class_name": name, "confidence": round(float(score), 4), "bbox": [x1, y1, x2 - x1, y2 - y1]})
-                        return {"type": "detection", "detections": dets}
-                    elif tt == "classification":
-                        probs = torch.softmax(outputs.logits, dim=-1)[0].tolist()
-                        id2label = self._hf_id2label or {}
-                        preds = sorted([{"label": id2label.get(i, f"class_{i}"), "confidence": p} for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
-                        return {"type": "classification", "predictions": preds[:5], "top_label": preds[0]["label"]}
-                    elif tt == "segmentation":
-                        logits = outputs.logits
-                        up = torch.nn.functional.interpolate(logits, size=img.size[::-1], mode="bilinear", align_corners=False)
-                        mask = up.argmax(dim=1)[0]
-                        total_px = mask.numel()
-                        id2label = self._hf_id2label or {}
-                        segs = [{"class_name": id2label.get(ci, f"class_{ci}"), "class_id": ci, "pixel_count": int((mask == ci).sum()), "coverage": round(int((mask == ci).sum()) / total_px, 4)} for ci in mask.unique().tolist()]
-                        segs.sort(key=lambda x: -x["pixel_count"])
-                        return {"type": "segmentation", "segments": segs, "num_classes": len(segs)}
-                    return {"error": f"HuggingFace inference not implemented for type={tt}"}
+                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
+                    ms = int((time.time() - t0) * 1000)
+                    n_tok = out.shape[1] - inputs.input_ids.shape[1] if hasattr(inputs, "input_ids") else 0
+                    tps = round(n_tok / (ms / 1000), 2) if ms > 0 else 0
+                    processor = self._hf_processor if (tt == "vlm-finetune" and self._hf_processor) else self.tokenizer
+                    resp = processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True) if hasattr(inputs, "input_ids") else processor.decode(out[0], skip_special_tokens=True)
+                    return {"type": tt, "response": resp, "tokens_generated": n_tok, "tokens_per_second": tps, "inference_time_ms": ms, "model_name": MODEL_NAME}
 
-                if tt in ("detection", "segmentation") and hasattr(self.model, "predict"):
+                # ── 2. HuggingFace image models (detection / classification / segmentation) ──
+                if self._hf_processor is not None:
                     if not image_bytes:
                         return {"error": "Image required"}
                     from PIL import Image as _Img
@@ -5821,6 +6245,81 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                     segs.sort(key=lambda x: -x["pixel_count"])
                     return {"type": "segmentation", "segments": segs, "num_classes": len(segs), "image_size": [orig_w, orig_h]}
 
+                # ── TorchVision detection / segmentation (Mask R-CNN, Faster R-CNN) ──
+                if tt in ("detection", "segmentation") and ENGINE == "TorchVision":
+                    import torch
+                    from PIL import Image as _Img
+                    import numpy as _np
+                    if not image_bytes:
+                        return {"error": "Image required"}
+                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
+                    orig_w, orig_h = img.size
+                    t0 = time.time()
+                    # SMP UNet: input is a normalized [0,1] tensor, shape (1, 3, H, W)
+                    img_t = T.functional.to_tensor(img).unsqueeze(0)
+                    # ImageNet normalization (SMP default for ResNet encoders)
+                    img_t = T.functional.normalize(img_t, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                    with torch.no_grad():
+                        logits = self.model(img_t)
+                    ms = int((time.time() - t0) * 1000)
+                    # logits shape: (1, num_classes, H, W)
+                    probs = logits.softmax(dim=1)[0]
+                    pred = probs.argmax(dim=0).cpu().numpy()  # (H, W)
+                    total_px = int(pred.size)
+                    # Collect unique classes
+                    unique_classes = _np.unique(pred).tolist()
+                    masks_out = []
+                    # Background class is 0; skip it
+                    for ci in unique_classes:
+                        if ci == 0:
+                            continue
+                        name = self.labels[ci] if ci < len(self.labels) else f"class_{ci}"
+                        binmask = (pred == ci).astype(_np.uint8)
+                        pixel_count = int(binmask.sum())
+                        coverage = round(pixel_count / total_px, 4)
+                        # Extract polygon outline (simplified) for frontend draw
+                        polygon = []
+                        try:
+                            import cv2 as _cv2  # type: ignore
+                            contours, _ = _cv2.findContours(
+                                binmask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE
+                            )
+                            if contours:
+                                c = max(contours, key=_cv2.contourArea)
+                                if len(c) > 60:
+                                    step = max(1, len(c) // 60)
+                                    c = c[::step]
+                                polygon = [
+                                    [float(p[0][0]) / orig_w, float(p[0][1]) / orig_h]
+                                    for p in c
+                                ]
+                        except ImportError:
+                            pass
+                        if not polygon:
+                            # Fallback: bounding box of the mask
+                            ys, xs = _np.where(binmask > 0)
+                            if len(xs) > 0:
+                                x1, x2 = int(xs.min()), int(xs.max())
+                                y1, y2 = int(ys.min()), int(ys.max())
+                                polygon = [
+                                    [x1 / orig_w, y1 / orig_h],
+                                    [x2 / orig_w, y1 / orig_h],
+                                    [x2 / orig_w, y2 / orig_h],
+                                    [x1 / orig_w, y2 / orig_h],
+                                ]
+                        masks_out.append({
+                            "label": name,
+                            "class_id": ci,
+                            "confidence": 1.0,  # SMP doesn't have per-region confidence
+                            "color": "#8b5cf6",
+                            "polygon": polygon,
+                            "mask_pixels": pixel_count,
+                            "coverage": coverage,
+                        })
+                    return {"type": "segmentation", "masks": masks_out,
+                            "count": len(masks_out), "inference_time_ms": ms,
+                            "image_size": [orig_w, orig_h]}
+
                 if tt == "classification":
                     import torch
                     import torchvision.transforms as T
@@ -5859,20 +6358,6 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                             probs = torch.softmax(logits, dim=1)[0].tolist()
                     preds = sorted([{"label": self.labels[i] if i < len(self.labels) else f"class_{i}", "confidence": p} for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
                     return {"type": "classification", "predictions": preds, "top_label": preds[0]["label"]}
-
-                if tt in ("llm-text", "vlm-finetune"):
-                    import torch
-                    if not prompt:
-                        return {"error": "Prompt required for LLM inference"}
-                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
-                    inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
-                    t0 = time.time()
-                    with torch.no_grad():
-                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
-                    ms = int((time.time() - t0) * 1000)
-                    n_tok = out.shape[1] - inputs.input_ids.shape[1]
-                    resp = self.tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                    return {"type": tt, "response": resp, "tokens_generated": n_tok, "inference_time_ms": ms, "model_name": MODEL_NAME}
 
                 return {"error": f"No inference handler for engine={ENGINE}, type={tt}"}
             except Exception as exc:
@@ -5998,18 +6483,16 @@ def _poll_model_job(ray_dashboard_url: str, submission_id: str, serve_url: str, 
 
 
 def _submit_model_deploy(ray_dashboard_url: str, payload: dict, serve_url: str, job_id: str, max_wait: int = 600) -> None:
-    """Deploy model as a named Ray Actor via Ray Client subprocess.
-    Avoids Ray Serve (numpy ABI mismatch) and Job Agent (not running on this cluster).
-    Named detached actors persist on the cluster after the subprocess exits.
+    """Deploy model as a named Ray Actor via Ray Jobs API.
+    Named detached actors persist on the cluster after the job exits.
     """
-    import subprocess, sys, tempfile, os as _os
+    import subprocess, sys, tempfile, os as _os, requests as _req, json as _json
     state = _get_model_deploy_state(job_id)
     env_vars = payload.get("runtime_env", {}).get("env_vars", {})
 
-    # Derive ray:// address from dashboard URL
     from urllib.parse import urlparse as _urlparse
     _p = _urlparse(ray_dashboard_url)
-    _ray_addr = f"ray://{_p.hostname}:10001"
+    _dashboard = f"{_p.scheme}://{_p.netloc}"
 
     # Phase 1: wait for at least one worker
     state["logs"] = ["Checking Ray cluster for available workers…"]
@@ -6027,56 +6510,85 @@ def _submit_model_deploy(ray_dashboard_url: str, payload: dict, serve_url: str, 
         state.update(status="error", logs=["Timed out — no Ray workers came online."])
         return
 
-    # Phase 2: run actor deployment script in a subprocess (Ray Client, no Ray Serve)
-    state["logs"] = ["Loading model weights and creating Ray actor (this may take several minutes)…"]
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+    # Phase 2: write actor script and submit via Ray Jobs API
+    state["logs"] = ["Submitting model deploy via Ray Jobs API…"]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir="/tmp") as f:
         f.write(_RAY_ACTOR_PY)
         script_path = f.name
+    # Read the script and embed as base64 in the entrypoint to avoid working_dir
+    import base64 as _b64lib
+    with open(script_path, "rb") as _f:
+        _script_b64 = _b64lib.b64encode(_f.read()).decode()
 
-    remaining = max(60, int(deadline - time.time()))
+    remaining = max(600, int(deadline - time.time()))
     try:
-        proc_env = {**_os.environ, **env_vars, "RAY_ADDRESS": "", "RAY_URL": _ray_addr, "RAY_ENABLE_AUTO_CONNECT": "0"}
-        result = subprocess.run(
-            [sys.executable, script_path],
-            env=proc_env,
-            capture_output=True,
-            text=True,
-            timeout=remaining,
-        )
+        # Send the script via env var to avoid "Argument list too long" (argv limit).
+        _deploy_env = dict(env_vars)
+        _deploy_env["MEDIMAGE_DEPLOY_SCRIPT_B64"] = _script_b64
+        _deploy_payload = {
+            "entrypoint": "bash -c 'echo $MEDIMAGE_DEPLOY_SCRIPT_B64 | base64 -d > /tmp/deploy_script.py && python3 /tmp/deploy_script.py'",
+            "runtime_env": {
+                "env_vars": _deploy_env,
+                "pip": ["transformers>=4.40,<5.0", "accelerate>=0.28", "Pillow",
+                        "boto3", "numpy<2.0", "torch", "peft>=0.10", "bitsandbytes>=0.43"],
+            },
+        }
+        _resp = _req.post(f"{_dashboard}/api/jobs/", json=_deploy_payload, timeout=30)
+        _resp.raise_for_status()
+        _submit_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+        state["logs"] = [f"Deploy job submitted: {_submit_id}. Waiting for completion…"]
+    except Exception as _e:
         try:
             _os.unlink(script_path)
         except Exception:
             pass
-
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-
-        if result.returncode != 0:
-            err = stderr[-600:] if stderr else stdout[-600:] or "Unknown error"
-            state.update(status="error", logs=[f"Deploy failed (exit {result.returncode}): {err}"])
-            return
-
-        if "ACTOR_READY:" not in stdout:
-            msg = stdout[-400:] if stdout else (stderr[-400:] if stderr else "No output from deploy script")
-            state.update(status="error", logs=[f"Deploy script completed but actor not ready: {msg}"])
-            return
-
-    except subprocess.TimeoutExpired:
-        try:
-            _os.unlink(script_path)
-        except Exception:
-            pass
-        state.update(status="error", logs=[f"Deploy timed out after {remaining}s — model weights may be too large to load"])
-        return
-    except Exception as exc:
-        try:
-            _os.unlink(script_path)
-        except Exception:
-            pass
-        state.update(status="error", logs=[f"Deploy subprocess error: {exc}"])
+        state.update(status="error", logs=[f"Deploy job submit failed: {_e}"])
         return
 
-    # Phase 3: actor is ready — update state and DB
+    # Phase 3: poll job status until done
+    _last_status = ""
+    while time.time() < deadline:
+        try:
+            _st = _req.get(f"{_dashboard}/api/jobs/{_submit_id}", timeout=10).json()
+            _ray_status = _st.get("status", "UNKNOWN")
+        except Exception:
+            _ray_status = _last_status
+        if _ray_status != _last_status:
+            state["logs"].append(f"Job status: {_ray_status}")
+            _last_status = _ray_status
+        if _ray_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+            break
+        time.sleep(5)
+    else:
+        try:
+            _os.unlink(script_path)
+        except Exception:
+            pass
+        state.update(status="error", logs=[f"Deploy timed out after {remaining}s"])
+        return
+
+    # Get logs
+    try:
+        _logs_resp = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=30)
+        _logs = _logs_resp.json().get("logs", "") if _logs_resp.ok else ""
+    except Exception:
+        _logs = ""
+    try:
+        _os.unlink(script_path)
+    except Exception:
+        pass
+
+    if _ray_status != "SUCCEEDED":
+        _tail = _logs[-500:] if _logs else "no logs"
+        state.update(status="error", logs=[f"Deploy failed ({_ray_status}): {_tail}"])
+        return
+
+    if "ACTOR_READY:" not in _logs:
+        _tail = _logs[-400:] if _logs else "no output"
+        state.update(status="error", logs=[f"Deploy completed but actor not ready: {_tail}"])
+        return
+
+    # Phase 4: actor is ready — update state and DB
     _actor_name = f"model-{job_id}"
     state.update(status="running", url=serve_url, logs=[f"Model actor '{_actor_name}' is running on Ray cluster!"])
     with get_db() as conn:
@@ -6308,10 +6820,8 @@ async def ray_infer_deploy(body: dict):
     import base64 as _b64
     # Embed serve_app.py inline so no working_dir fetch needed
     script = _SERVE_APP_PY + textwrap.dedent("""
-        import os; os.environ["RAY_ADDRESS"] = ""; os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
         import ray
-        if not ray.is_initialized():
-            ray.init(address="auto", allow_multiple=True, log_to_driver=False)
+        ray.init(address="auto", log_to_driver=False)
         serve.run(InferenceApp.bind(), name="medimage-inference", route_prefix="/")
         print("medimage-inference deployed successfully")
         import time
@@ -6399,6 +6909,8 @@ async def deploy_model_to_ray(job_id: str, body: dict = {}):
         pip_base += ["ultralytics"]
     elif engine == "MONAI":
         pip_base += ["torch", "torchvision", "monai"]
+    elif engine == "HuggingFace":
+        pip_base += ["torch", "torchvision", "transformers", "accelerate"]
     elif tt == "classification":
         pip_base += ["torch", "torchvision", "timm"]
     elif tt == "segmentation" and engine == "Segmentation Models PyTorch":
@@ -6441,30 +6953,86 @@ async def deploy_model_to_ray(job_id: str, body: dict = {}):
 @app.get("/api/jobs/{job_id}/deploy-ray/status")
 def model_deploy_status(job_id: str):
     state = _get_model_deploy_state(job_id)
-    return {
-        "status": state["status"],
-        "url": state["url"],
-        "logs": state["logs"][-20:],
-    }
+    # If in-memory state shows we're working (deploying) or done (running)
+    # and we've already resolved a URL, trust it.
+    if state["status"] in ("deploying", "running") and state.get("url"):
+        return {
+            "status": state["status"],
+            "url": state["url"],
+            "logs": state["logs"][-20:],
+        }
+    # Fallback: in-memory state was reset (e.g. after API restart). Read
+    # the persisted deployment from the DB so the UI can offer Stop /
+    # Undeploy on already-deployed models.
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT inference_provider, ray_serve_url, modal_url FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return {"status": "idle", "url": None, "logs": []}
+    provider = (row["inference_provider"] or "").strip()
+    ray_url  = (row["ray_serve_url"] or "").strip()
+    if provider == "ray" and ray_url:
+        return {
+            "status": "running",
+            "url":    ray_url,
+            "logs":   ["Recovered from DB after API restart"],
+        }
+    return {"status": "idle", "url": None, "logs": []}
 
 
 @app.post("/api/jobs/{job_id}/deploy-ray/stop")
 def model_deploy_stop(job_id: str):
-    """Kill the named Ray Actor for this model."""
+    """Kill the named Ray Actor for this model via Ray Jobs API (no Ray Client)."""
     actor_name = f"model-{job_id}"
-    ray_client_addr = "ray://100.68.53.118:10001"
     logs = []
     try:
-        import os as _os; _os.environ["RAY_ADDRESS"] = ""; _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
-        import ray as _ray
-        if not _ray.is_initialized():
-            _ray.init(address=ray_client_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
+        import requests as _req
+        import base64 as _b64lib
+        _kill_script = (
+            "import ray, sys\n"
+            "ray.init(address='auto', ignore_reinit_error=True, log_to_driver=False)\n"
+            f"actor_name = {_actor_name!r}\n"
+            "try:\n"
+            "    actor = ray.get_actor(actor_name, namespace='default')\n"
+            "    ray.kill(actor)\n"
+            "    print('KILLED:' + actor_name, flush=True)\n"
+            "except Exception as e:\n"
+            "    print(f'NOT_FOUND:{e}', flush=True)\n"
+        )
+        _b64 = _b64lib.b64encode(_kill_script.encode()).decode()
+        _payload = {
+            "entrypoint": f"bash -c 'echo {_b64} | base64 -d > /tmp/kill_actor.py && python3 /tmp/kill_actor.py'",
+            "runtime_env": {},
+        }
+        # Use the same dashboard URL as deploy
+        _dashboard = "http://100.68.53.118:8265"
+        _resp = _req.post(f"{_dashboard}/api/jobs/", json=_payload, timeout=15)
+        _resp.raise_for_status()
+        _submit_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+        # Wait for completion (kill should be fast)
+        for _ in range(20):
+            time.sleep(1)
+            try:
+                _st = _req.get(f"{_dashboard}/api/jobs/{_submit_id}", timeout=5).json()
+                if _st.get("status") in ("SUCCEEDED", "FAILED", "STOPPED"):
+                    break
+            except Exception:
+                pass
+        # Fetch result from logs
         try:
-            _actor = _ray.get_actor(actor_name, namespace="default")
-            _ray.kill(_actor)
-            logs.append(f"[stop] Actor '{actor_name}' killed successfully")
-        except ValueError:
-            logs.append(f"[stop] Actor '{actor_name}' not found (already stopped)")
+            _lr = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=10)
+            if _lr.ok:
+                _lt = _lr.json().get("logs", "")
+                if "KILLED:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' killed successfully")
+                elif "NOT_FOUND:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' not found (already stopped)")
+                else:
+                    logs.append(f"[stop] Job exited: {_lt[-200:]}")
+        except Exception as _e:
+            logs.append(f"[stop] Could not fetch kill job logs: {_e}")
     except Exception as e:
         logs.append(f"[stop] warning: {e}")
     # Clear DB state
@@ -6571,6 +7139,100 @@ def delete_text_dataset(ds_id: str):
         conn.execute("DELETE FROM text_datasets WHERE id = ?", (ds_id,))
         conn.commit()
     return {"ok": True}
+
+
+@app.post("/api/text-datasets/create-sample")
+def create_sample_text_dataset(body: dict | None = None):
+    """Create a small sample text dataset for smoke-testing LLM/VLM training.
+
+    Writes a JSONL file with the requested format (alpaca | sharegpt |
+    plain) and registers it in the text_datasets table. If a sample
+    already exists, the existing id is returned.
+    """
+    body = body or {}
+    fmt = (body.get("format") or "alpaca").lower()
+    if fmt not in ("alpaca", "sharegpt", "plain"):
+        raise HTTPException(status_code=400, detail=f"Unknown format: {fmt}")
+    n_rows = int(body.get("rows") or 20)
+    n_rows = max(1, min(n_rows, 200))
+    name = (body.get("name") or f"sample-{fmt}").strip() or f"sample-{fmt}"
+
+    # If a sample with this name already exists, just return it.
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM text_datasets WHERE name = ?", (name,)
+        ).fetchone()
+    if existing:
+        d = dict(existing)
+        d.pop("preview", None)
+        return {"created": False, **d}
+
+    ds_id = str(uuid.uuid4())[:8]
+    save_dir = "/data/text-datasets"
+    _os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/{ds_id}.jsonl"
+
+    # Generate sample rows. Use small medical-industrial seed to make the
+    # smoke test reflect what the platform will actually fine-tune.
+    if fmt == "alpaca":
+        topics = [
+            ("What is the recommended torque for an M8 bolt?",
+             "For a standard M8 bolt (grade 8.8), apply 25 Nm of torque with a light oil film."),
+            ("How do I identify a defective PCB solder joint?",
+             "Look for: dull grainy surface, insufficient fillet, exposed copper pad, or a tombstone shape."),
+            ("What causes a YOLOv8 model to overfit on small datasets?",
+             "Insufficient data augmentation, too many epochs, batch size too small, or a backbone too large for the dataset size."),
+            ("How do I read a bearing fault vibration spectrum?",
+             "Identify the rotating frequency (1× RPM), then check for harmonics and sidebands; outer race defects appear at BPFO frequencies."),
+        ]
+        rows = [
+            {"instruction": inst, "input": "", "output": out}
+            for inst, out in (topics * ((n_rows // len(topics)) + 1))[:n_rows]
+        ]
+    elif fmt == "sharegpt":
+        topics = [
+            ("What is the difference between spot welding and projection welding?",
+             "Spot welding concentrates current at a single point via electrode tips; projection welding uses pre-formed projections on one workpiece to localize current without precision electrode alignment."),
+            ("How can I detect surface cracks in metal castings?",
+             "Use magnetic particle inspection for ferromagnetic alloys, or dye-penetrant testing for non-magnetic materials. Visual inspection under oblique lighting catches >0.5mm cracks."),
+            ("What is the optimal learning rate for fine-tuning a 7B LLM with LoRA?",
+             "For Unsloth 4-bit + LoRA r=16, start at 2e-4 with cosine schedule; reduce to 5e-5 if loss diverges in the first 50 steps."),
+        ]
+        rows = [
+            {"conversations": [
+                {"from": "human", "value": q},
+                {"from": "gpt",   "value": a},
+            ]}
+            for q, a in (topics * ((n_rows // len(topics)) + 1))[:n_rows]
+        ]
+    else:  # plain
+        topics = [
+            "Edge inference on Jetson Orin Nano achieves 25 FPS with quantized YOLOv8n at 320×320 input.",
+            "Defect recall improved from 0.78 to 0.91 after augmenting the training set with synthetic weld spatter overlays.",
+            "Ray cluster auto-scales from 1 to 8 workers based on queued job depth; the dashboard exposes live worker count.",
+        ]
+        rows = [{"text": t} for t in (topics * ((n_rows // len(topics)) + 1))[:n_rows]]
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    size_bytes = _os.path.getsize(save_path)
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO text_datasets (id, name, format, path, row_count, size_bytes, created_at) VALUES (?,?,?,?,?,?,?)",
+            (ds_id, name, fmt, save_path, len(rows), size_bytes, time.time()),
+        )
+        conn.commit()
+    return {
+        "created":   True,
+        "id":        ds_id,
+        "name":      name,
+        "format":    fmt,
+        "row_count": len(rows),
+        "size_bytes": size_bytes,
+        "path":      save_path,
+    }
 
 
 # ─── HuggingFace Dataset Import ──────────────────────────────────────────────
@@ -7091,6 +7753,257 @@ def _normalize_inference_response(data: dict, training_type: str, model_name: st
     return data
 
 
+@app.get("/api/inference/history")
+async def list_inference_history(limit: int = 50, before: float = 0):
+    """List inference history, newest first. Pass `before` (timestamp) to paginate."""
+    limit = max(1, min(200, limit))
+    with get_db() as conn:
+        if before > 0:
+            rows = conn.execute(
+                "SELECT id, created_at, mode, model_id, model_name, model_type, "
+                "image_name, thumbnail_key, image_key, user_prompt, system_prompt, result_json, "
+                "inference_time_ms "
+                "FROM inference_history WHERE created_at < ? ORDER BY created_at DESC LIMIT ?",
+                (before, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, created_at, mode, model_id, model_name, model_type, "
+                "image_name, thumbnail_key, image_key, user_prompt, system_prompt, result_json, "
+                "inference_time_ms "
+                "FROM inference_history ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["result"] = json.loads(d.pop("result_json") or "{}")
+        except Exception:
+            d["result"] = {}
+        out.append(d)
+    return {"history": out}
+
+
+@app.get("/api/inference/thumbnail/{history_id}")
+async def get_inference_thumbnail(history_id: str):
+    """Stream the thumbnail image bytes from MinIO (no auth, no presign — internal only)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT thumbnail_key FROM inference_history WHERE id = ?",
+            (history_id,),
+        ).fetchone()
+    if not row or not row["thumbnail_key"]:
+        raise HTTPException(404, "Thumbnail not found")
+    key = row["thumbnail_key"]
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        from fastapi.responses import Response
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        obj = s3.get_object(Bucket="medimage-thumbnails", Key=key)
+        data = obj["Body"].read()
+        return Response(content=data, media_type="image/jpeg",
+                      headers={"Cache-Control": "private, max-age=3600"})
+    except HTTPException:
+        raise
+    except Exception as _e:
+        raise HTTPException(502, f"Could not fetch thumbnail: {_e}")
+
+
+@app.get("/api/inference/image/{history_id}")
+async def get_inference_image(history_id: str):
+    """Stream the ORIGINAL (full-res) image bytes from MinIO."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT image_key, image_name FROM inference_history WHERE id = ?",
+            (history_id,),
+        ).fetchone()
+    if not row or not row["image_key"]:
+        raise HTTPException(404, "Image not found")
+    key = row["image_key"]
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        from fastapi.responses import Response
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        obj = s3.get_object(Bucket="medimage-thumbnails", Key=key)
+        data = obj["Body"].read()
+        # Detect content type from extension
+        ext = key.rsplit(".", 1)[-1].lower() if "." in key else "jpg"
+        ct = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+              "webp": "image/webp", "bmp": "image/bmp", "gif": "image/gif",
+              "tif": "image/tiff", "tiff": "image/tiff", "dcm": "application/dicom"}.get(ext, "image/jpeg")
+        return Response(content=data, media_type=ct,
+                      headers={"Cache-Control": "private, max-age=3600"})
+    except HTTPException:
+        raise
+    except Exception as _e:
+        raise HTTPException(502, f"Could not fetch image: {_e}")
+
+
+@app.delete("/api/inference/history/{history_id}")
+async def delete_inference_history(history_id: str):
+    """Delete one history entry + its thumbnail."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT thumbnail_key FROM inference_history WHERE id = ?",
+            (history_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Not found")
+        conn.execute("DELETE FROM inference_history WHERE id = ?", (history_id,))
+        conn.commit()
+    if row["thumbnail_key"]:
+        try:
+            import boto3 as _boto3
+            from botocore.config import Config as _BConfig
+            s3 = _boto3.client(
+                "s3", endpoint_url=MINIO_URL,
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY,
+                config=_BConfig(signature_version="s3v4"),
+            )
+            s3.delete_object(Bucket="medimage-thumbnails", Key=row["thumbnail_key"])
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@app.delete("/api/inference/history")
+async def clear_inference_history():
+    """Delete ALL history entries + their thumbnails."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT thumbnail_key FROM inference_history").fetchall()
+        conn.execute("DELETE FROM inference_history")
+        conn.commit()
+    if rows:
+        try:
+            import boto3 as _boto3
+            from botocore.config import Config as _BConfig
+            s3 = _boto3.client(
+                "s3", endpoint_url=MINIO_URL,
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY,
+                config=_BConfig(signature_version="s3v4"),
+            )
+            keys = [{"Key": r["thumbnail_key"]} for r in rows if r["thumbnail_key"]]
+            if keys:
+                for i in range(0, len(keys), 1000):
+                    s3.delete_objects(Bucket="medimage-thumbnails", Delete={"Objects": keys[i:i+1000]})
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@app.get("/api/internal/weights-url")
+async def get_presigned_weights_url(bucket: str, key: str, expires: int = 600):
+    """Generate a presigned S3 URL for a weights object. Used by Ray actors
+    to download model weights via plain HTTP (avoids boto3 incompatibilities
+    on heterogeneous worker nodes)."""
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        url = s3.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires,
+        )
+        return {"url": url}
+    except Exception as _e:
+        raise HTTPException(502, f"Could not generate presigned URL: {_e}")
+
+
+@app.post("/api/inference/history")
+async def save_inference_history(req: Request):
+    """Save a new history entry. `thumbnail_base64` (optional) is decoded and uploaded to MinIO."""
+    import base64 as _b64, time as _time, uuid as _uuid
+    body = await req.json()
+    hist_id = body.get("id") or str(_uuid.uuid4())
+    user_id = body.get("user_id", "default")
+    mode = body.get("mode", "text")
+    model_id = body.get("model_id", "")
+    model_name = body.get("model_name", "")
+    model_type = body.get("model_type", "")
+    image_name = body.get("image_name", "")
+    user_prompt = body.get("user_prompt", "")
+    system_prompt = body.get("system_prompt", "")
+    result = body.get("result", {})
+    inference_time_ms = body.get("inference_time_ms", 0)
+    thumb_b64 = body.get("thumbnail_base64", "")
+    image_b64_input = body.get("image_base64", "")
+    thumbnail_key = ""
+    image_key = ""
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        try:
+            s3.head_bucket(Bucket="medimage-thumbnails")
+        except Exception:
+            s3.create_bucket(Bucket="medimage-thumbnails")
+        # Thumbnail (small, used in history list)
+        if thumb_b64:
+            if "," in thumb_b64:
+                thumb_b64 = thumb_b64.split(",", 1)[1]
+            img_bytes = _b64.b64decode(thumb_b64)
+            if len(img_bytes) > 0:
+                thumbnail_key = f"{hist_id}_thumb.jpg"
+                s3.put_object(
+                    Bucket="medimage-thumbnails", Key=thumbnail_key,
+                    Body=img_bytes, ContentType="image/jpeg",
+                )
+        # Original image (full resolution, used to restore the drop box)
+        if image_b64_input:
+            if "," in image_b64_input:
+                image_b64_input = image_b64_input.split(",", 1)[1]
+            orig_bytes = _b64.b64decode(image_b64_input)
+            if len(orig_bytes) > 0:
+                ext = (image_name or "").split(".")[-1] if "." in (image_name or "") else "jpg"
+                # Cap at 25 MB to avoid quota bloat
+                if len(orig_bytes) <= 25 * 1024 * 1024:
+                    image_key = f"{hist_id}_orig.{ext}"
+                    s3.put_object(
+                        Bucket="medimage-thumbnails", Key=image_key,
+                        Body=orig_bytes,
+                        ContentType="image/jpeg" if ext == "jpg" else f"image/{ext}",
+                    )
+    except Exception as _e:
+        print(f"[history] upload failed: {_e}", flush=True)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO inference_history "
+            "(id, user_id, created_at, mode, model_id, model_name, model_type, "
+            " image_name, thumbnail_key, image_key, user_prompt, system_prompt, result_json, "
+            " inference_time_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hist_id, user_id, _time.time(), mode, model_id, model_name, model_type,
+             image_name, thumbnail_key, image_key, user_prompt, system_prompt,
+             json.dumps(result), inference_time_ms),
+        )
+        conn.commit()
+    return {"id": hist_id, "thumbnail_key": thumbnail_key, "image_key": image_key}
+
+
 @app.post("/api/inference")
 async def run_inference(
     model_id: str = FForm(...),
@@ -7117,30 +8030,114 @@ async def run_inference(
 
     # ── Universal external routing (Modal or Ray Serve) ──────────────────────
     async def _route_ray_client(serve_url: str, job_id_: str) -> dict:
-        """Call model Ray Actor via Ray Client (no Ray Serve dependency)."""
-        import os as _os; _os.environ["RAY_ADDRESS"] = ""; _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
-        import ray as _ray, asyncio as _asyncio
-        _ray_addr = "ray://100.68.53.118:10001"
-        if not _ray.is_initialized():
-            _ray.init(address=_ray_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
+        """Call model Ray Actor via Ray Jobs API (avoids Ray Client port issues)."""
+        import requests as _req, json as _json, logging as _logging, asyncio as _asyncio
+        import base64 as _b64, tempfile, os as _os
+        _log = _logging.getLogger("ray_infer")
+        _dashboard = "http://100.68.53.118:8265"
         _actor_name = f"model-{job_id_}"
-        try:
-            _actor = _ray.get_actor(_actor_name, namespace="default")
-        except Exception:
-            raise RuntimeError(f"Model actor '{_actor_name}' is not running. Please deploy the model first.")
+        _log.warning(f"[infer] Calling actor {_actor_name} via Ray Jobs API...")
+
         _img_bytes = None
         if image:
             _img_bytes = await image.read()
-        # ray.get() is blocking — run in executor to avoid blocking the async loop
-        _result = await _asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _ray.get(_actor.infer.remote(
-                _img_bytes, conf_threshold, prompt, system_prompt
-            ), timeout=120),
+
+        _img_b64 = _b64.b64encode(_img_bytes).decode() if _img_bytes else ""
+        _infer_timeout = (
+            600 if training_type in ("llm-text", "vlm-finetune")
+            else 600 if training_type == "segmentation"  # Mask R-CNN on CPU can be slow
+            else 120
         )
-        if isinstance(_result, dict) and _result.get("error"):
-            raise RuntimeError(_result["error"])
-        return _result
+
+        _script = textwrap.dedent("""\
+            import ray, json, sys, base64, time, os
+            ray.init(address="auto", ignore_reinit_error=True)
+            actor_name = os.environ.get("MEDIMAGE_ACTOR_NAME", "")
+            img_b64 = os.environ.get("MEDIMAGE_IMG_B64", "")
+            prompt = os.environ.get("MEDIMAGE_PROMPT", "")
+            sys_prompt = os.environ.get("MEDIMAGE_SYSTEM_PROMPT", "")
+            conf = float(os.environ.get("MEDIMAGE_CONF", "0.5"))
+            infer_timeout = int(os.environ.get("MEDIMAGE_INFER_TIMEOUT", "300"))
+            try:
+                actor = ray.get_actor(actor_name, namespace="default")
+            except Exception as e:
+                print(json.dumps({"error": f"Actor not found: {e}"}))
+                sys.exit(1)
+            for _i in range(120):
+                try:
+                    h = ray.get(actor.health.remote(), timeout=30)
+                    if h.get("ok") and h.get("model_loaded"):
+                        break
+                    if h.get("load_error"):
+                        print(json.dumps({"error": f"Model load failed: {h['load_error']}"}))
+                        sys.exit(1)
+                except Exception:
+                    time.sleep(5)
+            else:
+                print(json.dumps({"error": "Actor not ready after 600s"}))
+                sys.exit(1)
+            result = ray.get(actor.infer.remote(
+                img_b64, conf, prompt, sys_prompt
+            ), timeout=infer_timeout)
+            print("INFERENCE_RESULT:" + json.dumps(result))
+        """)
+        _script_b64 = _b64.b64encode(_script.encode()).decode()
+        # Send image + prompt via env vars (no argv limit)
+        _infer_env = {
+            "MEDIMAGE_IMG_B64": _img_b64,
+            "MEDIMAGE_PROMPT": prompt,
+            "MEDIMAGE_SYSTEM_PROMPT": system_prompt,
+            "MEDIMAGE_CONF": str(conf_threshold),
+            "MEDIMAGE_INFER_TIMEOUT": str(_infer_timeout),
+            "MEDIMAGE_ACTOR_NAME": _actor_name,
+        }
+        _payload = {
+            "entrypoint": "bash -c 'echo $MEDIMAGE_INFER_SCRIPT_B64 | base64 -d > /tmp/infer_runner.py && python3 /tmp/infer_runner.py'",
+            "runtime_env": {"env_vars": {**_infer_env, "MEDIMAGE_INFER_SCRIPT_B64": _script_b64}},
+        }
+        try:
+            _resp = _req.post(f"{_dashboard}/api/jobs/", json=_payload, timeout=15)
+            _resp.raise_for_status()
+            _submit_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+            _log.warning(f"[infer] Job submitted: {_submit_id}")
+        except Exception as _e:
+            _log.error(f"[infer] Job submit failed: {_e}")
+            raise RuntimeError(f"Failed to submit inference job: {_e}")
+
+        _deadline = time.time() + _infer_timeout + 60
+        while time.time() < _deadline:
+            try:
+                _st = _req.get(f"{_dashboard}/api/jobs/{_submit_id}", timeout=10).json()
+                _status = _st.get("status", "")
+            except Exception:
+                _status = "UNKNOWN"
+            if _status in ("SUCCEEDED", "FAILED", "STOPPED"):
+                break
+            await _asyncio.sleep(3)
+        else:
+            raise RuntimeError(f"Inference job timed out after {_infer_timeout + 60}s")
+
+        try:
+            _logs_resp = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=15)
+            _logs = _logs_resp.json().get("logs", "") if _logs_resp.ok else ""
+        except Exception:
+            _logs = ""
+
+        if _status != "SUCCEEDED":
+            _tail = _logs[-500:] if _logs else "no logs"
+            _log.error(f"[infer] Job {_submit_id} status={_status}: {_tail}")
+            raise RuntimeError(f"Inference failed ({_status}): {_tail}")
+
+        for _line in _logs.splitlines():
+            if _line.startswith("INFERENCE_RESULT:"):
+                _result = _json.loads(_line[len("INFERENCE_RESULT:"):])
+                _log.warning(f"[infer] Got result: {str(_result)[:200]}")
+                if isinstance(_result, dict) and _result.get("error"):
+                    raise RuntimeError(_result["error"])
+                return _result
+
+        _log.error(f"[infer] No INFERENCE_RESULT in logs: {_logs[-500:]}")
+        raise RuntimeError(f"Inference completed but no result found in output")
 
     async def _route_external(base_url: str, api_key: str) -> dict:
         # Modal fastapi_endpoint URLs are the endpoint itself (no path needed)

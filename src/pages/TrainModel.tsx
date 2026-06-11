@@ -3,11 +3,11 @@ import { useSearchParams, useNavigate } from 'react-router-dom'
 import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle, X, Loader2, StopCircle } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
-type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
-type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
-type TargetType  = 'finetune' | 'export'
+export type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
+export type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
+export type TargetType  = 'finetune' | 'export'
 
-interface TrainOption {
+export interface TrainOption {
   value: string
   label: string
   engine: string
@@ -16,6 +16,10 @@ interface TrainOption {
   description: string
   compatible: boolean
   zeroShot?: boolean
+  // Optional metadata for the Deploy-Only catalog (see DEPLOY_CATALOG)
+  dataTypes?: DataType[]
+  source?: string
+  paper?: string
 }
 
 interface TrainingConfig {
@@ -42,7 +46,7 @@ interface TrainingConfig {
 }
 
 // ─── Training Matrix ───────────────────────────────────────────────────────────
-const TRAINING_MATRIX: Record<string, TrainOption[]> = {
+export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   // ── Classification ──────────────────────────────────────────────────────────
   classification: [
     { value: 'eff-b2',     label: 'EfficientNet-B2',              engine: 'PyTorch',     model: 'efficientnet-b2',               hardware: 'GPU 8GB+',     description: 'Balanced accuracy & speed — defect grading, product quality classification',   compatible: true  },
@@ -109,13 +113,22 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   // Llama-3.2-Vision; for models unsloth doesn't have a pre-built
   // bnb-4bit version of, we still pass the original model id and unsloth
   // tries to load it (will raise a clear error if unsupported).
+  //
+  // Medical VLMs (Med-R1, Hulu-Med) are flagged zeroShot=true because they
+  // are SOTA off-the-shelf for diagnosis / VQA / report generation across
+  // 8-14 imaging modalities, so users can deploy them as-is before any
+  // LoRA fine-tune.
   'vlm-finetune': [
     { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'Unsloth',    model: 'unsloth/llava-v1.6-mistral-7b-bnb-4bit',  hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: true  },
     { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',    engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit',   hardware: 'GPU 16GB+',  description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: true  },
-    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'Unsloth',    model: 'unsloth/InternVL2-8B-bnb-4bit',           hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: false },
+    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'Unsloth',    model: 'unsloth/InternVL2-8B-bnb-4bit',           hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: true  },
     { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'Unsloth',    model: 'unsloth/paligemma2-3b-pt-448-bnb-4bit',  hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: true  },
     { value: 'medgemma-4b', label: 'MedGemma-4B-IT',          engine: 'Unsloth',    model: 'unsloth/medgemma-4b-it-bnb-4bit',         hardware: 'GPU 12GB+',  description: 'Google medical VLM — pre-trained บน medical images & text, ดีสำหรับ radiology, pathology, dermatology', compatible: true  },
     { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'Unsloth',    model: 'HuggingFaceTB/SmolVLM-500M-Instruct',     hardware: 'GPU 6GB+',   description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
+    { value: 'medr1-3b',    label: 'Med-R1-3B (GRPO Medical VLM)', engine: 'Unsloth', model: 'yuxianglai117/Med-R1',                hardware: 'GPU 14GB+',  description: 'Qwen2-VL fine-tuned ด้วย GRPO reinforcement learning — 8 imaging modalities (CT/MRI/X-Ray/Fundus/Dermoscopy/Microscopy/OCT/US), 5 tasks (anatomy ID, disease diagnosis, lesion grading, modality recognition, bio-attribute) — chain-of-thought reasoning แข็งแกร่ง, เหมาะ zero-shot diagnostic VQA', compatible: true, zeroShot: true },
+    { value: 'hulumed-7b',  label: 'Hulu-Med-7B (Medical Generalist VLM)', engine: 'Unsloth', model: 'ZJU-AI4H/Hulu-Med-7B',          hardware: 'GPU 16GB+',  description: 'ZJU-AI4H transparent generalist VLM — 14 imaging modalities (CT/MRI/X-Ray/US/PET/OCT/Endoscopy/Histopathology/Fundus/Dermoscopy/Angiography/...), รองรับ 2D/3D NIfTI/video, SOTA บน 30 medical benchmarks — generalist diagnostic + report generation', compatible: true, zeroShot: true },
+    { value: 'huatuogpt-v-7b', label: 'HuatuoGPT-Vision-7B (PubMedVision)', engine: 'Unsloth', model: 'FreedomIntelligence/HuatuoGPT-Vision-7B', hardware: 'GPU 16GB+', description: 'FreedomIntelligence medical MLLM (Qwen2-7B + LLaVA-style vision adapter) — train บน PubMedVision 1.3M medical VQA, SOTA บน VQA-RAD 63.7 / SLAKE 76.2 / PathVQA 57.9 / PMC-VQA 54.3 / OmniMedVQA 74.0 — แข่งกับ LLaVA-v1.6-34B ที่ขนาดเล็กกว่า', compatible: true, zeroShot: true },
+    { value: 'bimedix2-8b', label: 'BiMediX2-8B (Bilingual EN/AR Medical LMM)', engine: 'Unsloth', model: 'MBZUAI/BiMediX2',                   hardware: 'GPU 16GB+', description: 'MBZUAI bilingual medical LMM (Llama 3.1 + LLaVA-pp) — 1.6M Arabic-English multimodal instruction (BiMed-V), SOTA บน BiMed-MBench (+9% EN, +20% AR), USMLE +8% over GPT-4, medical VQA + report generation + summarization — bilingual medical assistant', compatible: true, zeroShot: true },
   ],
 
   // ── Self-supervised / SSL ────────────────────────────────────────────────────
@@ -131,6 +144,52 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   // ── Export ────────────────────────────────────────────────────────────────────
 }
 
+// ─── Deploy-Only Catalog ───────────────────────────────────────────────────
+//
+// SOTA pre-trained models that should be **deployed as-is** (not fine-tuned
+// via the Unsloth path in this UI). Each one needs a custom training
+// pipeline because its vision encoder / architecture is not in the set
+// that Unsloth knows how to LoRA-wrap:
+//
+//   - RaDialog_v2: LLaVA + BioViL (chest X-ray) + CheXbert + flash-attn
+//   - Med3DVLM:    DCFormer (3D decomposed conv) + Qwen-2.5-7B
+//
+// The Deploy page reads from this list and offers Ray Serve / Modal
+// endpoints. Adding a model here keeps the Train menu uncluttered and
+// avoids the false expectation that "select → train" will work — these
+// are inference-only out of the box.
+//
+// The Deploy page ALSO surfaces any model in TRAINING_MATRIX with
+// `zeroShot: true` set (see DeployModels.tsx for the union) — those
+// are SOTA off-the-shelf models that can be deployed without fine-tune
+// even though they are also fine-tunable via Unsloth.
+export const DEPLOY_CATALOG: TrainOption[] = [
+  {
+    value:        'radialog-v2',
+    label:        'RaDialog-v2 (LLaVA Radiology)',
+    engine:       'LLaVA + BioViL',
+    model:        'ChantalPellegrini/RaDialog-interactive-radiology-report-generation',
+    hardware:     'GPU 16GB+',
+    dataTypes:    ['xray'],
+    description:  'MIDL 2025 — LLaVA-based radiology VLM with BioViL image encoder, CheXbert classifier, fine-tuned on MIMIC-CXR + RaDialog-Instruct — supports chest X-ray report generation, view classification, impression generation, and interactive dialog correction',
+    compatible:   true,
+    source:       'https://github.com/ChantalMP/RaDialog_v2',
+    paper:        'https://openreview.net/pdf?id=trUvr1gSNI',
+  },
+  {
+    value:        'med3dvlm',
+    label:        'Med3DVLM (3D Medical VLM)',
+    engine:       'DCFormer + Qwen-2.5-7B',
+    model:        'MagicXin/Med3DVLM-Qwen-2.5-7B',
+    hardware:     'GPU 24GB+',
+    dataTypes:    ['xray'],   // 3D CT/MRI volumes — surfaced as 'xray' data type
+    description:  'IEEE JBHI 2025 — 3D medical VLM with DCFormer (decomposed 3D conv encoder) + SigLIP contrastive pretraining + Qwen-2.5-7B LLM, trained on M3D-Cap (120K 3D image-text) and M3D-VQA (96K 3D VQA) — supports volumetric CT/MRI report generation, image-text retrieval (R@1 61%), open-ended VQA (METEOR 36.76), closed-ended VQA (acc 79.95%)',
+    compatible:   true,
+    source:       'https://github.com/mirthai/med3dvlm',
+    paper:        'https://ieeexplore.ieee.org/document/11145341/',
+  },
+]
+
 // ─── Data-type compatibility per model ───────────────────────────────────────────────
 const _A: DataType[] = ['rgb', 'thermal', 'xray', 'microscopy', 'lidar', 'general'] // all
 const _V: DataType[] = ['rgb', 'thermal', 'xray', 'microscopy', 'general']           // visual (no lidar)
@@ -138,7 +197,7 @@ const _C: DataType[] = ['rgb', 'thermal', 'general']                            
 const _X: DataType[] = ['xray', 'microscopy', 'rgb', 'general']                      // precision detail
 const _I: DataType[] = ['rgb', 'thermal', 'xray', 'general']                         // inspection/anomaly
 
-const MODEL_DATA_TYPES: Record<string, DataType[]> = {
+export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   // Classification
   'eff-b2':            _A,
   'eff-b4':            _V,
@@ -193,6 +252,10 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'internvl2':         _V,
   'paligemma':         ['rgb', 'general'],
   'smolvlm':           ['rgb', 'general'],
+  'medr1-3b':          ['xray', 'microscopy', 'rgb', 'general'],
+  'hulumed-7b':        ['xray', 'microscopy', 'rgb', 'general'],
+  'huatuogpt-v-7b':    ['xray', 'microscopy', 'rgb', 'general'],
+  'bimedix2-8b':       ['xray', 'microscopy', 'rgb', 'general'],
   // Self-supervised / anomaly
   'mae':               ['rgb', 'general'],
   'dino':              ['rgb', 'microscopy', 'general'],

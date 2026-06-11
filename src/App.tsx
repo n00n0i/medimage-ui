@@ -14,6 +14,8 @@ import Storage from './pages/Storage'
 import Status from './pages/Status'
 import Playground from './pages/Playground'
 import ApiService from './pages/ApiService'
+import TestAllModels from './pages/TestAllModels'
+import DeployModels from './pages/DeployModels'
 import Users from './pages/Users'
 import Profile from './pages/Profile'
 import Sidebar from './components/Sidebar'
@@ -61,6 +63,7 @@ function AppInner() {
             <Route path="/train/llm"  element={<TrainLLM />} />
             <Route path="/jobs"      element={<Jobs />} />
             <Route path="/models"    element={<Models />} />
+            <Route path="/models/zero-shot" element={<DeployModels />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/ray-cluster" element={<RayCluster />} />
             <Route path="/modal-cluster" element={<ModalCluster />} />
@@ -68,6 +71,7 @@ function AppInner() {
             <Route path="/notebook" element={<Notebook />} />
             <Route path="/status" element={<Status />} />
             <Route path="/playground" element={<Playground />} />
+            <Route path="/test-all" element={<TestAllModels />} />
             <Route path="/api-service" element={<ApiService />} />
             <Route path="/users" element={<Users />} />
             <Route path="/profile" element={<Profile />} />
