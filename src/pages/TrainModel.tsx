@@ -77,6 +77,7 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'yolov9-c',   label: 'YOLOv9-C',                   engine: 'Ultralytics', model: 'yolov9c.pt',                    hardware: 'GPU 12GB+',    description: 'Programmable gradient — better small defect detection vs YOLOv8',            compatible: false },
     { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: false },
     { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet-50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
+    { value: 'rdd-yolov8s',label: 'YOLOv8 Road Damage',         engine: 'Ultralytics', model: 'road-damage-yolov8s.pt',        hardware: 'GPU 6GB+',     description: 'YOLOv8s fine-tuned on RDD2022 (Crowdsensing-based Road Damage Detection Challenge 2022) — 4 classes: Longitudinal Crack, Transverse Crack, Alligator Crack, Potholes, ดีสำหรับ road/infrastructure inspection (weights จาก oracl4/RoadDamageDetection)', compatible: true  },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
@@ -242,6 +243,7 @@ export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'covidnet-cxr-3':    ['xray'],
   // Detection
   'yolov8-s':          _C,
+  'rdd-yolov8s':       _C,
   'yolov8-m':          _C,
   'yolov8-l':          _C,
   'yolonano':          ['rgb', 'general'],
