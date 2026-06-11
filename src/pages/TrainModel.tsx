@@ -261,6 +261,76 @@ export const DEPLOY_CATALOG: TrainOption[] = [
     source:       'https://github.com/zhjohnchan/M3AE',
     paper:        'https://arxiv.org/abs/2209.07098',
   },
+  // ── Framework-dependent models (deploy-only — fine-tune needs custom path) ─────
+  {
+    value:        'medsam-deploy',
+    label:        'MedSAM (Segment Anything Medical)',
+    engine:       'SAM fine-tuned on medical',
+    model:        'MedSAM/MedSAM-ViT-B',
+    hardware:     'GPU 12GB+',
+    dataTypes:    ['xray', 'microscopy', 'rgb'],
+    description:  'SAM fine-tuned on medical images (1.5M image-mask pairs, 11 modalities) — segment organs/tumors with bounding-box or point prompt, ViT-B backbone, deployable zero-shot for inference, custom training path needed for fine-tune',
+    compatible:   true,
+    source:       'https://github.com/bowang-lab/MedSAM',
+    paper:        'https://arxiv.org/abs/2304.02606',
+  },
+  {
+    value:        'nnunet-3d-lowres-deploy',
+    label:        'nnU-Net 3D Low-Res (Deploy)',
+    engine:       'nnU-Net',
+    model:        'nnunet-3d-lowres',
+    hardware:     'GPU 8GB+',
+    dataTypes:    ['xray'],
+    description:  'MICCAI standard 3D segmentation (low-resolution config) — auto-preprocess + auto-configure, deploy pretrained checkpoint via nnU-Net v2 framework, large organ/whole-body CT and MRI',
+    compatible:   true,
+    source:       'https://github.com/MIC-DKFZ/nnUNet',
+  },
+  {
+    value:        'nnunet-3d-fullres-deploy',
+    label:        'nnU-Net 3D Full-Res (Deploy)',
+    engine:       'nnU-Net',
+    model:        'nnunet-3d-fullres',
+    hardware:     'GPU 16GB+',
+    dataTypes:    ['xray'],
+    description:  'MICCAI standard 3D segmentation (full-resolution) — best Dice on tumor/organ CT/MRI, deploy pretrained checkpoint via nnU-Net v2 framework',
+    compatible:   true,
+    source:       'https://github.com/MIC-DKFZ/nnUNet',
+  },
+  {
+    value:        'nnunet-3d-cascade-deploy',
+    label:        'nnU-Net 3D Cascade (Deploy)',
+    engine:       'nnU-Net',
+    model:        'nnunet-3d-cascade',
+    hardware:     'GPU 24GB+',
+    dataTypes:    ['xray'],
+    description:  'MICCAI standard 3D segmentation (cascade — low-res first, then full-res on detected regions), SOTA on large anisotropic volumes (whole-body CT, MRI), deploy via nnU-Net v2 framework',
+    compatible:   true,
+    source:       'https://github.com/MIC-DKFZ/nnUNet',
+  },
+  {
+    value:        'medicalnet-3d-r50-deploy',
+    label:        'MedicalNet 3D-ResNet50 (Deploy)',
+    engine:       'PyTorch (3D-ResNet)',
+    model:        'Tencent/MedicalNet-Resnet50',
+    hardware:     'GPU 16GB+',
+    dataTypes:    ['xray'],
+    description:  'Tencent MedicalNet 3D-ResNet50 (46M params) — pretrained on 23 medical datasets, transfer-learning backbone for CT/MRI volumetric classification/segmentation, best Dice on lung seg (93.3%) + nodule cls (89.9%), MIT license, weights from Tencent/MedicalNet',
+    compatible:   true,
+    source:       'https://github.com/Tencent/MedicalNet',
+    paper:        'https://arxiv.org/abs/1904.00625',
+  },
+  {
+    value:        'covidnet-cxr-3-deploy',
+    label:        'COVID-Net CXR-3 (Deploy)',
+    engine:       'TensorFlow 1.15',
+    model:        'covidnet-cxr-3',
+    hardware:     'GPU 6GB+',
+    dataTypes:    ['xray'],
+    description:  'DarwinAI COVID-Net CXR-3 (chest X-ray COVID-19 detection) — research-only, NOT for clinical use, requires TensorFlow 1.13-1.15 (EOL), trained on COVIDx V8B (16,352 CXR / 51 countries), sensitivity 99.0%/97.5% (neg/pos), weights from lindawangg/COVID-Net',
+    compatible:   true,
+    source:       'https://github.com/lindawangg/COVID-Net',
+    paper:        'https://www.nature.com/articles/s41598-020-76550-z',
+  },
 ]
 
 // ─── Data-type compatibility per model ───────────────────────────────────────────────
@@ -588,13 +658,15 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
   }, [config.trainingType])
 
   // Query Ray cluster for available GPU memory. Ray's `nodes?view=summary`
-  // returns per-node `mem: [total, available, usedPct, used]` in bytes but
-  // `gpus: []` is empty (Ray 2.x does not expose per-GPU mem in the summary
-  // view). We use `mem[1]` (available system RAM) as a proxy — for an
-  // H200 node, system RAM (~150 GB) is in the same ballpark as a single
-  // H200 GPU (141 GB), and the largest models in the catalog can run on
-  // one GPU. If the API fails entirely, we fall back to a generous 64 GB
-  // default so the dynamic check never silently disables models.
+  // returns per-node `mem: [total, available, usedPct, used]` in bytes
+  // but `gpus: []` is empty (Ray 2.x does not expose per-GPU mem in the
+  // summary view). We use `mem[1]` (available system RAM, in bytes) as
+  // a proxy — for an H200 node, system RAM (~150 GB) is in the same
+  // ballpark as a single H200 GPU (141 GB), and the largest models in
+  // the catalog can run on one GPU. We always take the MAX across all
+  // nodes (so a busy head node doesn't drag down the estimate). If the
+  // API fails entirely, we fall back to a généreus 64 GB default so the
+  // dynamic check never silently disables models.
   useEffect(() => {
     fetch('/api/ray/nodes?view=summary')
       .then(r => r.json())
@@ -602,22 +674,8 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
         const nodes: any[] = data?.data?.summary ?? []
         let maxFreeGb = 0
         for (const node of nodes) {
-          // Preferred: per-GPU mem (Ray 1.x or future versions may expose it)
-          const gpus: any[] = node.gpus ?? []
-          for (const gpu of gpus) {
-            const total = Number(gpu.memoryTotal ?? 0)
-            const used  = Number(gpu.memoryUsed  ?? 0)
-            if (total > 0) {
-              const freeGb = total - used > 1e12
-                ? (total - used) / (1024 ** 3)   // bytes → GB
-                : total - used > 1e6
-                  ? (total - used) / 1024         // MB   → GB
-                  : total - used                 // already GB
-              if (freeGb > maxFreeGb) maxFreeGb = freeGb
-            }
-          }
-          // Fallback: use available system RAM from `mem` array [total, available, usedPct, used] in bytes
-          if (maxFreeGb === 0 && Array.isArray(node.mem) && node.mem.length >= 2) {
+          // Always check system mem — Ray 2.x summary view has gpus: []
+          if (Array.isArray(node.mem) && node.mem.length >= 2) {
             const availBytes = Number(node.mem[1] ?? 0)
             if (availBytes > 0) {
               const availGb = availBytes / (1024 ** 3)
@@ -628,7 +686,7 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
         if (maxFreeGb > 0) {
           setGpuFreeGb(Math.floor(maxFreeGb))
         } else {
-          // API failed or returned no data — generous default so we don't
+          // API failed or returned no data — généreus default so we don't
           // silently fall back to the static `compatible: false` for LLMs.
           setGpuFreeGb(64)
         }
