@@ -587,7 +587,14 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
       .catch(() => {})
   }, [config.trainingType])
 
-  // Query Ray cluster for actual GPU memory
+  // Query Ray cluster for available GPU memory. Ray's `nodes?view=summary`
+  // returns per-node `mem: [total, available, usedPct, used]` in bytes but
+  // `gpus: []` is empty (Ray 2.x does not expose per-GPU mem in the summary
+  // view). We use `mem[1]` (available system RAM) as a proxy — for an
+  // H200 node, system RAM (~150 GB) is in the same ballpark as a single
+  // H200 GPU (141 GB), and the largest models in the catalog can run on
+  // one GPU. If the API fails entirely, we fall back to a generous 64 GB
+  // default so the dynamic check never silently disables models.
   useEffect(() => {
     fetch('/api/ray/nodes?view=summary')
       .then(r => r.json())
@@ -595,14 +602,38 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
         const nodes: any[] = data?.data?.summary ?? []
         let maxFreeGb = 0
         for (const node of nodes) {
-          for (const gpu of (node.gpus ?? [])) {
-            const freeGb = (gpu.memoryTotal - gpu.memoryUsed) / 1024
-            if (freeGb > maxFreeGb) maxFreeGb = freeGb
+          // Preferred: per-GPU mem (Ray 1.x or future versions may expose it)
+          const gpus: any[] = node.gpus ?? []
+          for (const gpu of gpus) {
+            const total = Number(gpu.memoryTotal ?? 0)
+            const used  = Number(gpu.memoryUsed  ?? 0)
+            if (total > 0) {
+              const freeGb = total - used > 1e12
+                ? (total - used) / (1024 ** 3)   // bytes → GB
+                : total - used > 1e6
+                  ? (total - used) / 1024         // MB   → GB
+                  : total - used                 // already GB
+              if (freeGb > maxFreeGb) maxFreeGb = freeGb
+            }
+          }
+          // Fallback: use available system RAM from `mem` array [total, available, usedPct, used] in bytes
+          if (maxFreeGb === 0 && Array.isArray(node.mem) && node.mem.length >= 2) {
+            const availBytes = Number(node.mem[1] ?? 0)
+            if (availBytes > 0) {
+              const availGb = availBytes / (1024 ** 3)
+              if (availGb > maxFreeGb) maxFreeGb = availGb
+            }
           }
         }
-        if (maxFreeGb > 0) setGpuFreeGb(Math.floor(maxFreeGb))
+        if (maxFreeGb > 0) {
+          setGpuFreeGb(Math.floor(maxFreeGb))
+        } else {
+          // API failed or returned no data — generous default so we don't
+          // silently fall back to the static `compatible: false` for LLMs.
+          setGpuFreeGb(64)
+        }
       })
-      .catch(() => {})
+      .catch(() => setGpuFreeGb(64))
   }, [])
 
   useEffect(() => {
