@@ -180,18 +180,18 @@ interface BulkDeployed {
 }
 
 interface BulkReport {
-  startedAt:   number          // unix seconds
-  finishedAt:  number          // unix seconds
-  total:       number          // models attempted
-  ok:          number          // training completed
-  deployed:    number          // successfully deployed after training
-  failed:      number          // error (training OR deploy)
-  stopped:     boolean         // user stopped early
-  provider:    'ray' | 'modal' | null   // null if user didn't pick
-  deployEnabled: boolean       // whether train → deploy chain was active
-  failures:    BulkFailure[]
-  deployed:    BulkDeployed[]  // successfully deployed
-  log:         string          // human-readable full run log (line per model)
+  startedAt:     number          // unix seconds
+  finishedAt:    number          // unix seconds
+  total:         number          // models attempted
+  ok:            number          // training completed
+  deployedCount: number          // successfully deployed after training
+  failed:        number          // error (training OR deploy)
+  stopped:       boolean         // user stopped early
+  provider:      'ray' | 'modal' | null   // null if user didn't pick
+  deployEnabled: boolean         // whether train → deploy chain was active
+  failures:      BulkFailure[]
+  deployed:      BulkDeployed[]  // successfully deployed
+  log:           string          // human-readable full run log (line per model)
 }
 
 // Module-level runs map. Components subscribe to changes via
@@ -727,7 +727,7 @@ export default function TestAllModels() {
       finishedAt:  Date.now() / 1000,
       total:       targets.length,
       ok,
-      deployed:    deployedOk,
+      deployedCount: deployedOk,
       failed:      failures.length,
       stopped,
       provider:    bulkDeployEnabled ? bulkProvider : null,
@@ -1292,7 +1292,7 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
   function copyToClipboard() {
     const dur = `${Math.round(report.finishedAt - report.startedAt)}s`
     const header = report.deployEnabled
-      ? `Bulk test run: ${report.ok} OK, ${report.deployed} deployed, ${report.failed} failed, ${report.total} total (provider=${report.provider ?? 'n/a'}, ${dur})`
+      ? `Bulk test run: ${report.ok} OK, ${report.deployedCount} deployed, ${report.failed} failed, ${report.total} total (provider=${report.provider ?? 'n/a'}, ${dur})`
       : `Bulk test run: ${report.ok} OK, ${report.failed} failed, ${report.total} total (${dur})`
     const deployedBlock = report.deployed.length > 0
       ? '\n\nDeployed:\n' + report.deployed.map(d => `  ✓ ${d.label}  →  ${d.url}  (${d.elapsedSec}s)`).join('\n')
@@ -1334,16 +1334,16 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
             {report.failed > 0
               ? <XCircle size={18} color="var(--danger)" />
-              : report.deployEnabled && report.deployed > 0
+              : report.deployEnabled && report.deployedCount > 0
                 ? <Rocket size={18} color="var(--success)" />
                 : <CheckCircle2 size={18} color="var(--success)" />}
             <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>
               {report.stopped
-                ? `Bulk run stopped · ${report.ok} OK${report.deployEnabled ? `, ${report.deployed} deployed` : ''}, ${report.failed} failed (out of ${report.total} started)`
+                ? `Bulk run stopped · ${report.ok} OK${report.deployEnabled ? `, ${report.deployedCount} deployed` : ''}, ${report.failed} failed (out of ${report.total} started)`
                 : report.failed > 0
                   ? `Bulk run finished · ${report.failed} of ${report.total} failed`
                   : report.deployEnabled
-                    ? `Bulk run finished · all ${report.total} trained + ${report.deployed} deployed to ${report.provider}`
+                    ? `Bulk run finished · all ${report.total} trained + ${report.deployedCount} deployed to ${report.provider}`
                     : `Bulk run finished · all ${report.ok} models OK`}
             </span>
             <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
@@ -1355,7 +1355,7 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
             {report.deployEnabled && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <Rocket size={11} color="var(--info, #3b82f6)" />
-                <strong style={{ color: 'var(--info, #3b82f6)' }}>{report.deployed}</strong> deployed
+                <strong style={{ color: 'var(--info, #3b82f6)' }}>{report.deployedCount}</strong> deployed
               </span>
             )}
             <span><strong style={{ color: 'var(--danger)'  }}>{report.failed}</strong> failed</span>
