@@ -1244,7 +1244,6 @@ function BulkReportPanel({ report, runs, setExpanded, onClose }: {
             background: 'var(--bg-base)',
           }}>
             {report.failures.map((f, i) => {
-              const run = runs[f.key]
               return (
                 <div key={f.key} style={{
                   padding: '10px 12px', borderBottom: i < report.failures.length - 1 ? '1px solid var(--border-subtle)' : 'none',
