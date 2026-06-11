@@ -371,6 +371,10 @@ export default function TestAllModels() {
   // Pre-run config — picked once before the bulk loop starts
   const [bulkProvider, setBulkProvider] = useState<'ray' | 'modal'>('ray')
   const [bulkDeployEnabled, setBulkDeployEnabled] = useState(true)
+  // Stop the loop the moment any step fails so the user can debug
+  // the broken model before running the rest (otherwise the loop
+  // continues past failures and the report grows huge).
+  const [bulkStopOnError, setBulkStopOnError] = useState(false)
 
   // Keep latest runs in a ref so the bulk loop always reads the current
   // state instead of the snapshot from when runAllCompatible was called.
@@ -681,6 +685,7 @@ export default function TestAllModels() {
         })
         logLines.push(`[${idx}/${targets.length}]  ✗  TRAIN  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
         setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `TRAIN: ${errMsg}` }])
+        if (bulkStopOnError) { stopped = true; break }
         continue
       }
       ok += 1
@@ -763,7 +768,7 @@ export default function TestAllModels() {
   }
 
   return (
-    <div style={{ maxWidth: 1200, margin: '0 auto' }}>
+    <div>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
         <div>
