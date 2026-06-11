@@ -105,6 +105,7 @@ import {
   FlaskConical, Play, RefreshCw, Loader2, CheckCircle2, XCircle, Clock,
   Terminal, ChevronDown, ChevronUp, Search, Cpu, MessageSquare, Eye, EyeOff,
   Database, AlertCircle, StopCircle, Filter, Copy, Check, Download, X,
+  Server, Cloud, Rocket,
 } from 'lucide-react'
 import { TRAINING_MATRIX } from './TrainModel'
 
@@ -157,24 +158,39 @@ interface TestRun {
 // Bulk run report — a snapshot of the last completed "Run all compatible"
 // pass so the user can see at a glance which models failed and why,
 // then export the failure list for follow-up fixes.
+type BulkStage = 'train' | 'deploy'
+
 interface BulkFailure {
-  key:          string   // row key, e.g. 'classification:medr1-3b'
-  label:        string   // human label, e.g. 'Med-R1-3B (GRPO Medical VLM)'
+  key:          string         // row key, e.g. 'classification:medr1-3b'
+  label:        string         // human label, e.g. 'Med-R1-3B (GRPO Medical VLM)'
   trainingType: TrainingType
   engine:       string
   model:        string
-  error:        string   // short error from backend (last 200 chars)
+  error:        string         // short error from backend (last 500 chars)
   jobId:        string | null
+  stage:        BulkStage       // which step failed
+}
+
+interface BulkDeployed {
+  key:        string
+  label:      string
+  provider:   'ray' | 'modal'
+  url:        string           // endpoint URL returned by /api/deploy
+  elapsedSec: number
 }
 
 interface BulkReport {
   startedAt:   number          // unix seconds
   finishedAt:  number          // unix seconds
   total:       number          // models attempted
-  ok:          number          // completed
-  failed:      number          // error
+  ok:          number          // training completed
+  deployed:    number          // successfully deployed after training
+  failed:      number          // error (training OR deploy)
   stopped:     boolean         // user stopped early
+  provider:    'ray' | 'modal' | null   // null if user didn't pick
+  deployEnabled: boolean       // whether train → deploy chain was active
   failures:    BulkFailure[]
+  deployed:    BulkDeployed[]  // successfully deployed
   log:         string          // human-readable full run log (line per model)
 }
 
@@ -343,14 +359,18 @@ export default function TestAllModels() {
   // navigation. We mirror into useState for re-render.
   const [bulkRunning, setBulkRunning] = useState(false)
   const [bulkStopRequested, setBulkStopRequested] = useState(false)
-  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null)
+  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string; stage: 'train' | 'deploy' } | null>(null)
   // Snapshot of the last completed bulk run — surfaces failed models
   // + a copyable/exportable log so the user can follow up on each error.
   const [bulkReport, setBulkReport] = useState<BulkReport | null>(null)
   // Live stream of failures + statuses while the run is in progress, so
   // the user sees what's failing in real time instead of waiting for the
   // whole pass to finish.
-  const [bulkStream, setBulkStream] = useState<{ label: string; status: 'ok' | 'err'; error?: string }[]>([])
+  const [bulkStream, setBulkStream] = useState<{ label: string; status: 'ok' | 'err' | 'deploy' | 'deployed'; error?: string }[]>([])
+
+  // Pre-run config — picked once before the bulk loop starts
+  const [bulkProvider, setBulkProvider] = useState<'ray' | 'modal'>('ray')
+  const [bulkDeployEnabled, setBulkDeployEnabled] = useState(true)
 
   // Keep latest runs in a ref so the bulk loop always reads the current
   // state instead of the snapshot from when runAllCompatible was called.
@@ -489,8 +509,9 @@ export default function TestAllModels() {
     return null
   }, [lsProjects, textDatasets])
 
-  // ── Submit single test ──
-  const submitTest = useCallback(async (row: ModelRow) => {
+  // ── Submit single test (uses `bulkProvider` so the bulk loop can
+  //    steer Ray vs Modal from one place). ───────────────────────────────
+  const submitTest = useCallback(async (row: ModelRow, provider: 'ray' | 'modal' = bulkProvider) => {
     const ds = effectiveDataset(row)
     const preErr = validateBeforeSubmit(row, ds)
     if (preErr) {
@@ -515,7 +536,7 @@ export default function TestAllModels() {
         optimizer:     'adamw',
         imgsz:         640,
         notes:         `test-all run · ${row.option.label}`,
-        cluster:       'ray',
+        cluster:       provider,
         text_dataset:  needsTextDataset(row.trainingType) ? String(ds.id) : '',
       }
       const r = await fetch(`/api/train/${ds.id}`, {
@@ -542,7 +563,38 @@ export default function TestAllModels() {
         ...cur, status: 'error', error: e.message, finishedAt: Date.now() / 1000,
       })
     }
-  }, [effectiveDataset, validateBeforeSubmit])
+  }, [effectiveDataset, validateBeforeSubmit, bulkProvider])
+
+  // ── Deploy a freshly-trained model. Used by the bulk loop right after
+  //    a successful training job completes (per-model train → deploy →
+  //    next flow). Mirrors the DeployModels page's POST to /api/deploy. ─
+  const deployModel = useCallback(async (row: ModelRow, provider: 'ray' | 'modal'): Promise<{ ok: boolean; url?: string; error?: string; elapsedSec: number }> => {
+    const t0 = Date.now() / 1000
+    try {
+      const r = await fetch('/api/deploy', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          model_id:   row.option.value,
+          model_name: row.option.model,
+          provider,
+        }),
+      })
+      if (!r.ok) {
+        let detail = `HTTP ${r.status}`
+        try { const d = await r.json(); detail = d?.detail || detail } catch {}
+        return { ok: false, error: detail, elapsedSec: Math.round(Date.now() / 1000 - t0) }
+      }
+      const data = await r.json()
+      return {
+        ok: true,
+        url: data.url ?? data.endpoint ?? `${provider}://${row.option.value}`,
+        elapsedSec: Math.round(Date.now() / 1000 - t0),
+      }
+    } catch (e: any) {
+      return { ok: false, error: e.message, elapsedSec: Math.round(Date.now() / 1000 - t0) }
+    }
+  }, [])
 
   // ── Polling is now handled by the module-level ensurePolling() ──
   //    The background poll loop fires every 3s while any job is tracked
@@ -569,8 +621,9 @@ export default function TestAllModels() {
   const bulkStopRequestedRef = useRef(bulkStopRequested)
   useEffect(() => { bulkStopRequestedRef.current = bulkStopRequested }, [bulkStopRequested])
 
-  // ── Run all compatible — strictly sequential: submit, then wait for
-  //    the job to finish (OK or error) before moving to the next model. ──
+  // ── Run all compatible — strictly sequential: per-model TRAIN →
+  //    DEPLOY → NEXT. The user picks Ray vs Modal once before the loop
+  //    starts; every model goes to the same provider. ──────────────────
   const runAllCompatible = async () => {
     if (bulkRunning) return
     setBulkRunning(true)
@@ -582,7 +635,9 @@ export default function TestAllModels() {
     const targets = filteredRows.filter(r => isCompatible(r.option))
     const startedAt = Date.now() / 1000
     const failures: BulkFailure[] = []
+    const deployed: BulkDeployed[] = []
     let ok = 0
+    let deployedOk = 0
     let stopped = false
     const logLines: string[] = []
 
@@ -590,7 +645,7 @@ export default function TestAllModels() {
     for (const row of targets) {
       if (bulkStopRequestedRef.current) { stopped = true; break }
       idx += 1
-      setBulkProgress({ current: idx, total: targets.length, label: row.option.label })
+      setBulkProgress({ current: idx, total: targets.length, label: row.option.label, stage: 'train' })
 
       // Skip rows that already finished in a previous run, but re-run
       // anything that errored so the user can retry without resetting
@@ -599,26 +654,20 @@ export default function TestAllModels() {
       if (existing && (existing.status === 'queued' || existing.status === 'running' || existing.status === 'submitting')) {
         // Wait for the in-flight one first
         await waitForCompletion(row.key)
-        continue
-      }
-      if (existing && existing.status === 'completed') {
+      } else if (existing && existing.status === 'completed') {
         logLines.push(`[${idx}/${targets.length}]  ✓  ${row.option.label}  (cached)`)
         ok += 1
         setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
         continue
+      } else {
+        await submitTest(row, bulkProvider)
+        await waitForCompletion(row.key)
       }
-
-      await submitTest(row)
-      await waitForCompletion(row.key)
 
       // Read the final state from the module store (the polling loop
       // has already attributed the job's status to this row key).
       const final = moduleRuns[row.key]
-      if (final?.status === 'completed') {
-        ok += 1
-        logLines.push(`[${idx}/${targets.length}]  ✓  ${row.option.label}`)
-        setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
-      } else {
+      if (final?.status !== 'completed') {
         const errMsg = (final?.error ?? 'Unknown error').slice(0, 500)
         failures.push({
           key:          row.key,
@@ -628,21 +677,64 @@ export default function TestAllModels() {
           model:        row.option.model,
           error:        errMsg,
           jobId:        final?.jobId ?? null,
+          stage:        'train',
         })
-        logLines.push(`[${idx}/${targets.length}]  ✗  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
-        setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: errMsg }])
+        logLines.push(`[${idx}/${targets.length}]  ✗  TRAIN  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
+        setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `TRAIN: ${errMsg}` }])
+        continue
+      }
+      ok += 1
+      logLines.push(`[${idx}/${targets.length}]  ✓  TRAIN  ${row.option.label}`)
+      setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
+
+      // TRAIN → DEPLOY step (skip if user disabled it)
+      if (bulkDeployEnabled) {
+        if (bulkStopRequestedRef.current) { stopped = true; break }
+        setBulkProgress({ current: idx, total: targets.length, label: row.option.label, stage: 'deploy' })
+        setBulkStream(s => [...s, { label: row.option.label, status: 'deploy' }])
+        const dep = await deployModel(row, bulkProvider)
+        if (dep.ok) {
+          deployedOk += 1
+          deployed.push({
+            key:        row.key,
+            label:      row.option.label,
+            provider:   bulkProvider,
+            url:        dep.url ?? '',
+            elapsedSec: dep.elapsedSec,
+          })
+          logLines.push(`[${idx}/${targets.length}]  ✓  DEPLOY  ${row.option.label}  →  ${dep.url}  (${dep.elapsedSec}s)`)
+          setBulkStream(s => [...s, { label: row.option.label, status: 'deployed' }])
+        } else {
+          const errMsg = (dep.error ?? 'Unknown deploy error').slice(0, 500)
+          failures.push({
+            key:          row.key,
+            label:        row.option.label,
+            trainingType: row.trainingType,
+            engine:       row.option.engine,
+            model:        row.option.model,
+            error:        errMsg,
+            jobId:        final?.jobId ?? null,
+            stage:        'deploy',
+          })
+          logLines.push(`[${idx}/${targets.length}]  ✗  DEPLOY  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
+          setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `DEPLOY: ${errMsg}` }])
+        }
       }
     }
 
     const report: BulkReport = {
       startedAt,
-      finishedAt: Date.now() / 1000,
-      total:      targets.length,
+      finishedAt:  Date.now() / 1000,
+      total:       targets.length,
       ok,
-      failed:     failures.length,
+      deployed:    deployedOk,
+      failed:      failures.length,
       stopped,
+      provider:    bulkDeployEnabled ? bulkProvider : null,
+      deployEnabled: bulkDeployEnabled,
       failures,
-      log:        logLines.join('\n'),
+      deployed,
+      log:         logLines.join('\n'),
     }
     setBulkReport(report)
     setBulkProgress(null)
@@ -730,6 +822,56 @@ export default function TestAllModels() {
           {/* Post-run report — summary card + failed-list + export. */}
           {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} setExpanded={setExpanded} onClose={() => setBulkReport(null)} />}
         </div>
+
+        {/* Pre-run config — pick provider + toggle train→deploy chain. */}
+        {!bulkRunning && !bulkReport && (
+          <div style={{
+            marginTop: 14, padding: 12, borderRadius: 8,
+            background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
+            display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+              <Server size={12} />
+              <span style={{ fontWeight: 600 }}>Provider:</span>
+            </div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {([
+                { val: 'ray',   label: 'Ray Serve', icon: Server },
+                { val: 'modal', label: 'Modal',     icon: Cloud },
+              ] as const).map(({ val, label, icon: Icon }) => {
+                const active = bulkProvider === val
+                return (
+                  <button
+                    key={val}
+                    onClick={() => setBulkProvider(val as 'ray' | 'modal')}
+                    style={{
+                      padding: '5px 10px', borderRadius: 6,
+                      border: `1px solid ${active ? 'var(--primary)' : 'var(--border-default)'}`,
+                      background: active ? 'var(--primary-dim)' : 'transparent',
+                      color: active ? 'var(--primary-hover)' : 'var(--text-secondary)',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5,
+                      fontSize: 11.5, fontWeight: 500,
+                    }}
+                  >
+                    <Icon size={11} /> {label}
+                  </button>
+                )
+              })}
+            </div>
+            <div style={{ width: 1, height: 22, background: 'var(--border-subtle)' }} />
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer', userSelect: 'none' }}>
+              <input
+                type="checkbox"
+                checked={bulkDeployEnabled}
+                onChange={e => setBulkDeployEnabled(e.target.checked)}
+                style={{ width: 13, height: 13, cursor: 'pointer', accentColor: 'var(--primary)' }}
+              />
+              <span style={{ fontWeight: 500 }}>Train → Deploy → Next</span>
+              <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>(auto-deploy after each train OK)</span>
+            </label>
+          </div>
+        )}
+
         <div style={{ display: 'flex', gap: 8 }}>
           <button
             className="btn btn-secondary"
@@ -1148,11 +1290,19 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
   )
 
   function copyToClipboard() {
-    const text = report.failures.length === 0
-      ? `Bulk test run completed with no failures.\n${report.ok}/${report.total} models OK in ${Math.round(report.finishedAt - report.startedAt)}s`
-      : `Bulk test run: ${report.ok} OK, ${report.failed} failed, ${report.total} total\n` +
-        `Duration: ${Math.round(report.finishedAt - report.startedAt)}s\n\n` +
-        failureLines.join('\n')
+    const dur = `${Math.round(report.finishedAt - report.startedAt)}s`
+    const header = report.deployEnabled
+      ? `Bulk test run: ${report.ok} OK, ${report.deployed} deployed, ${report.failed} failed, ${report.total} total (provider=${report.provider ?? 'n/a'}, ${dur})`
+      : `Bulk test run: ${report.ok} OK, ${report.failed} failed, ${report.total} total (${dur})`
+    const deployedBlock = report.deployed.length > 0
+      ? '\n\nDeployed:\n' + report.deployed.map(d => `  ✓ ${d.label}  →  ${d.url}  (${d.elapsedSec}s)`).join('\n')
+      : ''
+    const failureBlock = failureLines.length > 0
+      ? '\n\nFailures:\n' + failureLines.join('\n')
+      : ''
+    const text = report.failures.length === 0 && report.deployed.length === 0
+      ? `Bulk test run completed with no failures.\n${report.ok}/${report.total} models OK in ${dur}`
+      : header + deployedBlock + failureBlock
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 1800)
@@ -1184,13 +1334,17 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
             {report.failed > 0
               ? <XCircle size={18} color="var(--danger)" />
-              : <CheckCircle2 size={18} color="var(--success)" />}
+              : report.deployEnabled && report.deployed > 0
+                ? <Rocket size={18} color="var(--success)" />
+                : <CheckCircle2 size={18} color="var(--success)" />}
             <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>
               {report.stopped
-                ? `Bulk run stopped · ${report.ok} OK, ${report.failed} failed (out of ${report.total} started)`
+                ? `Bulk run stopped · ${report.ok} OK${report.deployEnabled ? `, ${report.deployed} deployed` : ''}, ${report.failed} failed (out of ${report.total} started)`
                 : report.failed > 0
                   ? `Bulk run finished · ${report.failed} of ${report.total} failed`
-                  : `Bulk run finished · all ${report.ok} models OK`}
+                  : report.deployEnabled
+                    ? `Bulk run finished · all ${report.total} trained + ${report.deployed} deployed to ${report.provider}`
+                    : `Bulk run finished · all ${report.ok} models OK`}
             </span>
             <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
               ({elapsedSec}s)
@@ -1198,6 +1352,12 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, fontSize: 12, color: 'var(--text-secondary)' }}>
             <span><strong style={{ color: 'var(--success)' }}>{report.ok}</strong> OK</span>
+            {report.deployEnabled && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <Rocket size={11} color="var(--info, #3b82f6)" />
+                <strong style={{ color: 'var(--info, #3b82f6)' }}>{report.deployed}</strong> deployed
+              </span>
+            )}
             <span><strong style={{ color: 'var(--danger)'  }}>{report.failed}</strong> failed</span>
             <span style={{ color: 'var(--text-muted)' }}>{okPct}% success</span>
           </div>
@@ -1273,6 +1433,14 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                       <span style={{ fontWeight: 600, fontSize: 12.5, color: 'var(--text-primary)' }}>{f.label}</span>
+                      <span style={{
+                        fontSize: 9.5, fontWeight: 700, padding: '1px 6px', borderRadius: 4,
+                        background: f.stage === 'train' ? 'rgba(245,158,11,0.15)' : 'rgba(59,130,246,0.15)',
+                        color:      f.stage === 'train' ? '#d97706'                 : '#3b82f6',
+                        textTransform: 'uppercase', letterSpacing: '0.04em',
+                      }}>
+                        {f.stage === 'train' ? '✗ TRAIN' : '✗ DEPLOY'}
+                      </span>
                       <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--bg-elevated)', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{f.trainingType}</span>
                       {f.jobId && (
                         <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>job={f.jobId.slice(0, 10)}…</span>
