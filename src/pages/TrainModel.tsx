@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle, X, Loader2, StopCircle } from 'lucide-react'
+import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle, X, Loader2, StopCircle, AlertTriangle } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
-export type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
+export type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text' | 'anomaly-detection'
 export type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
 export type TargetType  = 'finetune' | 'export'
 
@@ -163,6 +163,70 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     // ── From Intel Geti catalog ────────────────────────────────────────────────────
     { value: 'stfpm',      label: 'STFPM (Anomaly)',           engine: 'Anomalib', model: 'stfpm_resnet18',                hardware: 'GPU 6GB+',    description: 'Student-Teacher Feature Pyramid Matching (2021) — ResNet-18 teacher/student + multi-layer feature distillation, AUROC 92+ on MVTec, Geti default', compatible: true  },
     { value: 'uflow',      label: 'U-Flow (Anomaly)',          engine: 'Anomalib', model: 'uflow_resnet18',                hardware: 'GPU 8GB+',    description: 'Unsupervised Flow (2022) — normalizing flow + multi-scale feature, AUROC 96+ on MVTec AD, Geti default anomaly',                compatible: true  },
+  ],
+
+  // ── Industrial Anomaly Detection ──────────────────────────────────────────────
+  //
+  // Models from M-3LAB/awesome-industrial-anomaly-detection.
+  // Categorized by method type: Teacher-Student, Memory Bank, Reconstruction,
+  // Normalizing Flow, Multi-Class Unified, Zero/Few-Shot, VLM-based.
+  //
+  // Use cases: factory QC, PCB inspection, textile defect, food/agri sorting,
+  // oil & gas corrosion, road damage, construction crack, electronic soldering.
+  //
+  'anomaly-detection': [
+    // ── Teacher-Student ──────────────────────────────────────────────────────────
+    { value: 'rd4ad',         label: 'RD4AD (Reverse Distillation)', engine: 'Anomalib',  model: 'rd4ad_wide_resnet50',          hardware: 'GPU 8GB+',  description: 'CVPR 2022 — Teacher→Student reverse knowledge distillation, AUROC 95+ MVTec, ดีสำหรับ surface scratch, texture defect, metal/plastic inspection', compatible: true },
+    { value: 'rd4ad-r18',     label: 'RD4AD (ResNet18 Light)',      engine: 'Anomalib',  model: 'rd4ad_resnet18',               hardware: 'GPU 4GB+',  description: 'RD4AD variant with ResNet-18 — เร็วกว่า 2x, เหมาะ edge GPU, Jetson, smart camera', compatible: true },
+    { value: 'stfpm-r18',     label: 'STFPM (ResNet18)',            engine: 'Anomalib',  model: 'stfpm_resnet18',               hardware: 'GPU 6GB+',  description: 'Student-Teacher Feature Pyramid Matching (2021) — multi-layer feature distillation, AUROC 92+ MVTec', compatible: true },
+    { value: 'efficientad',   label: 'EfficientAD',                engine: 'Anomalib',  model: 'efficientad_wide_resnet50',    hardware: 'GPU 4GB+',  description: 'WACV 2024 — ultra-fast teacher-student, >100 FPS, designed for real-time production line', compatible: true },
+    // ── Memory Bank ──────────────────────────────────────────────────────────────
+    { value: 'patchcore-wr50',label: 'PatchCore (WRN-50)',         engine: 'Anomalib',  model: 'patchcore_wide_resnet50',      hardware: 'GPU 8GB+',  description: 'CVPR 2022 Amazon — SOTA memory-bank, AUROC 99+ MVTec, ดีสำหรับทุก industrial inspection ที่ต้องการ precision สูง', compatible: true },
+    { value: 'patchcore-r18', label: 'PatchCore (ResNet18)',       engine: 'Anomalib',  model: 'patchcore_resnet18',           hardware: 'GPU 4GB+',  description: 'PatchCore เบา — เหมาะ edge deployment, ตรวจของเสียสายพานแบบ real-time', compatible: true },
+    // ── One-Class Classification ─────────────────────────────────────────────────
+    { value: 'simplenet',     label: 'SimpleNet',                  engine: 'Anomalib',  model: 'simplenet_wide_resnet50',      hardware: 'GPU 6GB+',  description: 'CVPR 2023 — simplest architecture, single feature adaptor + discriminative classifier, เร็วมาก, ดีสำหรับ quick POC', compatible: true },
+    // ── Normalizing Flow ─────────────────────────────────────────────────────────
+    { value: 'cflow-ad',      label: 'CFlow-AD',                   engine: 'Anomalib',  model: 'cflow_ad_wide_resnet50',       hardware: 'GPU 8GB+',  description: 'WACV 2022 — conditional normalizing flows, real-time anomaly detection + localization, AUROC 93+ MVTec', compatible: true },
+    { value: 'pyramidflow',   label: 'PyramidFlow',                engine: 'PyTorch',   model: 'pyramidflow',                  hardware: 'GPU 10GB+', description: 'CVPR 2023 — pyramid normalizing flow + contrastive localization, high-res defect map, ดีสำหรับ fine-grained defect', compatible: false },
+    { value: 'cs-flow',       label: 'CS-Flow',                    engine: 'Anomalib',  model: 'csflow_wide_resnet50',         hardware: 'GPU 8GB+',  description: 'Cross-scale normalizing flow — multi-scale feature coupling, AUROC 93+ MVTec', compatible: true },
+    // ── Reconstruction-Based ─────────────────────────────────────────────────────
+    { value: 'draem',         label: 'DRAEM',                      engine: 'Anomalib',  model: 'draem',                        hardware: 'GPU 8GB+',  description: 'ICCV 2021 — discriminatively trained reconstruction, ดีมากสำหรับ surface anomaly (scratch, dent, stain, discoloration)', compatible: true },
+    { value: 'dsr',           label: 'DSR (Dual Subspace)',        engine: 'PyTorch',   model: 'dsr',                          hardware: 'GPU 8GB+',  description: 'ECCV 2022 — dual subspace re-projection, reconstruct + detect anomaly in parallel, ดีสำหรับ texture + logical defect', compatible: false },
+    { value: 'realnet',       label: 'RealNet',                    engine: 'PyTorch',   model: 'realnet',                      hardware: 'GPU 10GB+', description: 'CVPR 2024 — realistic synthetic anomaly generation + feature selection, แก้ปัญหา "ไม่มีรูป defect เลย" ด้วย anomaly synthesis', compatible: false },
+    // ── Multi-Class Unified (1 model, many product types) ────────────────────────
+    { value: 'dinomaly',      label: 'Dinomaly (CVPR 2025)',      engine: 'PyTorch',   model: 'dinomaly',                     hardware: 'GPU 12GB+', description: 'CVPR 2025 SOTA — "less is more" DINOv2-based, 1 model รองรับหลาย product type, AUROC 98+ multi-class, ดีสำหรับ multi-product factory', compatible: false },
+    { value: 'dinomaly2',     label: 'Dinomaly2 (Full-Spectrum)',  engine: 'PyTorch',   model: 'dinomaly2',                    hardware: 'GPU 16GB+', description: '2025 — multi-class + multi-view + multi-modal + few-shot, full-spectrum AD, handles RGB + RGBD + point cloud', compatible: false },
+    { value: 'uniad',         label: 'UniAD',                      engine: 'PyTorch',   model: 'uniad',                        hardware: 'GPU 12GB+', description: 'NeurIPS 2022 — unified multi-class AD via transformer reconstruction, 1 model N classes', compatible: false },
+    { value: 'hvq-trans',     label: 'HVQ-Trans',                  engine: 'PyTorch',   model: 'hvq_trans',                    hardware: 'GPU 12GB+', description: 'NeurIPS 2023 — hierarchical vector quantized transformer, multi-class AD', compatible: false },
+    { value: 'uniformaly',    label: 'UniFormaly',                 engine: 'PyTorch',   model: 'uniformaly',                   hardware: 'GPU 10GB+', description: 'Task-agnostic unified framework — รองรับหลาย anomaly task ใน model เดียว', compatible: false },
+    // ── Few-Shot AD ──────────────────────────────────────────────────────────────
+    { value: 'regad',         label: 'RegAD (Few-Shot)',           engine: 'PyTorch',   model: 'regad',                        hardware: 'GPU 8GB+',  description: 'ECCV 2022 — registration-based few-shot AD, เหมาะเมื่อมีรูปปกติน้อยมาก (1-4 shots)', compatible: false },
+    { value: 'anomalygpt',    label: 'AnomalyGPT',                 engine: 'PyTorch',   model: 'anomalygpt',                   hardware: 'GPU 24GB+', description: 'AAAI 2024 — LVLM-based anomaly detection, อธิบาย defect เป็นภาษาคน, รองรับ few-shot in-context learning', compatible: false },
+    // ── Supervised AD (มีตัวอย่าง defect) ────────────────────────────────────────
+    { value: 'dra',           label: 'DRA (Open-Set)',             engine: 'PyTorch',   model: 'dra',                          hardware: 'GPU 8GB+',  description: 'CVPR 2022 — open-set supervised AD, catch known + unknown defect types, เหมาะเมื่อมี defect sample บางประเภท', compatible: false },
+    { value: 'bgad',          label: 'BGAD (Boundary Guided)',     engine: 'PyTorch',   model: 'bgad',                         hardware: 'GPU 8GB+',  description: 'CVPR 2023 — explicit boundary guided semi-push-pull contrastive, precise anomaly boundary', compatible: false },
+    // ── Zero-Shot AD (ไม่ต้อง train เลย) ──────────────────────────────────────────
+    { value: 'anovl',         label: 'AnoVL (Zero-Shot)',          engine: 'PyTorch',   model: 'anovl',                        hardware: 'GPU 8GB+',  description: '2023 — vision-language zero-shot anomaly localization via CLIP, ไม่ต้อง train, พิมพ์ชื่อ defect → หาให้', compatible: false },
+    { value: 'grounded-sam-ad',label: 'Grounded SAM Zero-Shot',   engine: 'PyTorch',   model: 'grounded_sam_ad',              hardware: 'GPU 12GB+', description: 'GroundingDINO + SAM — zero-shot: พิมพ์ "scratch, dent, crack" → หา + segment ทันที, ดีสำหรับ ad-hoc inspection', compatible: false },
+    { value: 'winclip',       label: 'WinCLIP (Zero-Shot)',        engine: 'PyTorch',   model: 'winclip',                      hardware: 'GPU 8GB+',  description: 'CVPR 2023 — window-based CLIP, zero-shot AD + localization, competitive with unsupervised methods without training', compatible: false },
+    { value: 'april-gan',     label: 'April-GAN',                  engine: 'Anomalib',  model: 'winclip',                      hardware: 'GPU 8GB+',  description: 'Anomalib zero-shot — CLIP-based anomaly detection, text-promptable, ไม่ต้องมี training data เลย', compatible: true },
+    // ── Noisy AD (มี contaminated training data) ─────────────────────────────────
+    { value: 'softpatch',     label: 'SoftPatch (Noisy)',          engine: 'PyTorch',   model: 'softpatch',                    hardware: 'GPU 8GB+',  description: 'NeurIPS 2022 Tencent — PatchCore + noise-robust scoring, ดีเมื่อ training data มี defect ปนอยู่ (noisy normal set)', compatible: false },
+    { value: 'igd',           label: 'IGD (Noisy)',                engine: 'PyTorch',   model: 'igd',                          hardware: 'GPU 6GB+',  description: 'AAAI 2022 — interpolated Gaussian descriptor, robust to contaminated training set', compatible: false },
+    // ── RGBD / 3D ────────────────────────────────────────────────────────────────
+    { value: 'm3dm',          label: 'M3DM (RGBD)',                engine: 'PyTorch',   model: 'm3dm',                         hardware: 'GPU 12GB+', description: 'CVPR 2023 — multimodal (RGB + depth) industrial AD via hybrid fusion, ดีสำหรับ 3D inspection (machined parts, electronics)', compatible: false },
+    { value: 'real3d-ad',     label: 'Real3D-AD (Point Cloud)',    engine: 'PyTorch',   model: 'real3d_ad',                    hardware: 'GPU 16GB+', description: 'NeurIPS 2023 — point cloud anomaly detection, 3D shape inspection, CAD model comparison', compatible: false },
+    // ── Continual AD ─────────────────────────────────────────────────────────────
+    { value: 'ucad',          label: 'UCAD (Continual)',           engine: 'PyTorch',   model: 'ucad',                         hardware: 'GPU 10GB+', description: 'AAAI 2024 — unsupervised continual AD with contrastively-learned prompt, เรียนรู้ product ใหม่เรื่อยๆ โดยไม่ลืมของเก่า', compatible: false },
+    // ── Logical AD ───────────────────────────────────────────────────────────────
+    { value: 'psad',          label: 'PSAD (Logical)',             engine: 'PyTorch',   model: 'psad',                         hardware: 'GPU 8GB+',  description: 'AAAI 2024 — part segmentation reveals compositional logic, ตรวจ logical anomaly (วางผิดที่, ขาดชิ้น, เกินชิ้น)', compatible: false },
+    { value: 'salad',         label: 'SALAD (Semantic Logic)',     engine: 'PyTorch',   model: 'salad',                        hardware: 'GPU 10GB+', description: 'ICCV 2025 — semantics-aware logical AD, ตรวจความผิดปกติเชิงตรรกะ (เช่น ฝาปิดผิด, ฉลากผิด)', compatible: false },
+    // ── MLLM-based AD (LLM ตรวจของเสีย) ────────────────────────────────────────
+    { value: 'ad-copilot',    label: 'AD-Copilot (MLLM)',          engine: 'PyTorch',   model: 'ad_copilot',                   hardware: 'GPU 24GB+', description: '2025 — end-to-end trained MLLM สำหรับ industrial AD, เหนือกว่าคนบน real inspection tasks, อธิบาย + localize defect', compatible: false },
+    { value: 'mmad',          label: 'MMAD (Benchmark VLM)',       engine: 'PyTorch',   model: 'mmad',                         hardware: 'GPU 16GB+', description: 'ICLR 2025 — benchmark LLMs เป็น quality inspector, evaluate GPT-4V/Gemini/Claude บน industrial AD', compatible: false },
+    // ── Anomalib built-in (already wired, listed here for visibility) ────────────
+    { value: 'padim',         label: 'PaDiM',                      engine: 'Anomalib',  model: 'padim_resnet18',               hardware: 'GPU 6GB+',  description: 'ICPR 2021 — Gaussian embedding per patch, fast unsupervised AD baseline, ดีสำหรับ prototype / quick POC', compatible: true },
+    { value: 'patchcore-ad',  label: 'PatchCore',                  engine: 'Anomalib',  model: 'patchcore_wide_resnet50',      hardware: 'GPU 8GB+',  description: 'CVPR 2022 Amazon — SOTA memory-bank, AUROC 99+ MVTec, ดีสำหรับทุก industrial inspection ที่ต้องการ precision สูง', compatible: true },
   ],
 
   // ── Export ────────────────────────────────────────────────────────────────────
@@ -1145,6 +1209,29 @@ export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--primary-hover)', fontSize: 12 }}>
                 <span>{countForType('self-supervised')} models</span>
                 <ChevronDown size={12} />
+              </div>
+            </button>)}
+
+            {showType('anomaly-detection') && (<button
+              onClick={() => { set('trainingType', 'anomaly-detection'); nextStep() }}
+              className="card text-left"
+              style={config.trainingType === 'anomaly-detection' ? { borderColor: '#f97316', background: 'rgba(249,115,22,0.08)' } : {}}
+            >
+              <div className="flex items-center gap-3 mb-3">
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(249,115,22,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <AlertTriangle size={18} style={{ color: '#f97316' }} />
+                </div>
+                <div>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Anomaly Detection</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Industrial Defect · Unsupervised</p>
+                </div>
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                ตรวจของเสีย / ของผิดปกติ โดยไม่ต้องมีรูป defect — โรงงาน, PCB, textile, food, oil & gas, road inspection
+              </p>
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <span style={{ background: 'rgba(249,115,22,0.15)', color: '#f97316', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>No defect sample needed</span>
+                <span style={{ background: 'rgba(249,115,22,0.15)', color: '#f97316', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>{countForType('anomaly-detection')} models</span>
               </div>
             </button>)}
 
