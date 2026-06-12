@@ -7,6 +7,7 @@ MedImage Training Backend
 """
 
 import os
+import sys
 import uuid
 import time
 import threading
@@ -91,11 +92,45 @@ def init_db():
             ("pipeline_step",    "TEXT DEFAULT ''"),
             ("updated_at",       "TEXT DEFAULT ''"),
             ("user_id",          "TEXT DEFAULT ''"),
+            ("num_gpus",         "INTEGER DEFAULT 1"),
+            ("ray_submission_id","TEXT DEFAULT ''"),
+            ("bulk_run_id",      "TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {defval}")
             except Exception:
                 pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bulk_runs (
+                id              TEXT PRIMARY KEY,
+                started_at      REAL NOT NULL,
+                finished_at     REAL,
+                stopped         INTEGER DEFAULT 0,
+                provider        TEXT DEFAULT 'ray',
+                deploy_enabled  INTEGER DEFAULT 0,
+                total           INTEGER DEFAULT 0,
+                ok              INTEGER DEFAULT 0,
+                failed          INTEGER DEFAULT 0,
+                deployed_count  INTEGER DEFAULT 0,
+                user_id         TEXT DEFAULT ''
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bulk_runs_started ON bulk_runs(started_at DESC)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bulk_run_jobs (
+                bulk_run_id  TEXT NOT NULL,
+                row_key      TEXT NOT NULL,
+                job_id       TEXT,
+                status       TEXT,
+                error        TEXT,
+                elapsed_sec  REAL DEFAULT 0,
+                deployed     INTEGER DEFAULT 0,
+                deploy_url   TEXT,
+                PRIMARY KEY (bulk_run_id, row_key)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -182,6 +217,146 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ─── Ray job reconciliation watchdog ──────────────────────────────────────────
+#
+# Without this, stuck PENDING jobs accumulate on the Ray cluster and hold GPU
+# resources forever — every subsequent job then queues behind them and the
+# whole pipeline grinds to a halt (the "TRAIN: UNKNOWN error" symptom).
+#
+# Every 60s the watchdog:
+#   1. Lists all Ray jobs from the dashboard
+#   2. Stops any PENDING job older than 5 min (orphans OR jobs that the
+#      autoscaler can't place)
+#   3. Marks the matching medimage DB job as 'error' if the Ray job is
+#      FAILED/STOPPED but the DB still says 'running' (catches the race
+#      where run_training() crashes before it can _set_status the error)
+#
+# Runs as a daemon thread so the API can restart without leaking the loop.
+
+_RAY_RECONCILE_INTERVAL_S = 60
+_RAY_STUCK_PENDING_AGE_S  = 300   # 5 min
+
+
+def _stop_ray_submission(submission_id: str) -> bool:
+    """Ask the Ray dashboard to stop a job. Returns True on success."""
+    if not submission_id or not submission_id.startswith("raysubmit_"):
+        return False
+    try:
+        import requests as _req
+        r = _req.post(f"{RAY_URL}/api/jobs/{submission_id}/stop", timeout=5)
+        return r.ok
+    except Exception:
+        return False
+
+
+def _reconcile_ray_jobs() -> dict:
+    """One pass: kill stuck PENDING jobs + sync DB state for finished Ray jobs.
+    Returns a summary for logging / API responses.
+    """
+    import requests as _req
+    summary = {"stopped_pending": [], "synced_errors": [], "errors": []}
+    try:
+        r = _req.get(f"{RAY_URL}/api/jobs/?limit=200", timeout=10)
+        if not r.ok:
+            summary["errors"].append(f"list jobs HTTP {r.status_code}")
+            return summary
+        data = r.json()
+        ray_jobs = data if isinstance(data, list) else data.get("data", [])
+    except Exception as e:
+        summary["errors"].append(f"list jobs: {e}")
+        return summary
+
+    now_ms = time.time() * 1000
+    ray_status_by_sub = {}
+    for j in ray_jobs:
+        sid = j.get("submission_id")
+        st  = j.get("status")
+        st_ms = j.get("start_time") or 0
+        if sid:
+            ray_status_by_sub[sid] = (st, st_ms)
+
+    # 1) Stop PENDING jobs older than threshold
+    for j in ray_jobs:
+        if j.get("type") != "SUBMISSION":
+            continue
+        sid  = j.get("submission_id")
+        st   = j.get("status")
+        st_t = j.get("start_time") or 0
+        if st == "PENDING" and (now_ms - st_t) > _RAY_STUCK_PENDING_AGE_S * 1000:
+            if _stop_ray_submission(sid):
+                summary["stopped_pending"].append(sid)
+                _append_log_for_sub(sid, f"[reconcile] Stopped stuck PENDING job after {int((now_ms - st_t)/1000)}s")
+
+    # 2) Sync DB for FAILED/STOPPED/SUCCEEDED Ray jobs whose medimage row
+    #    is still 'running' or 'queued' (run_training thread crashed
+    #    before updating the status).
+    finished = ["FAILED", "STOPPED", "SUCCEEDED"]
+    for sid, (st, st_ms) in ray_status_by_sub.items():
+        if st not in finished:
+            continue
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, status, error, started_at, finished_at FROM jobs "
+                "WHERE ray_submission_id=? AND status IN ('running','queued') LIMIT 1",
+                (sid,),
+            ).fetchone()
+        if not row:
+            continue
+        d = dict(row)
+        medimage_id = d["id"]
+        if st == "SUCCEEDED":
+            # Ray says success but DB is still running — odd. Don't claim
+            # victory ourselves (the training thread will set weights path
+            # + 'completed'). Just log it.
+            _append_log(medimage_id, f"[reconcile] Ray job reports SUCCEEDED but DB is still '{d['status']}' — leaving for training thread")
+            continue
+        # FAILED or STOPPED → mark DB as error.
+        # IMPORTANT: set a SHORT message here so the training thread's later
+        # _set_status() call overwrites it with the real reason. The previous
+        # behavior set a verbose "(reconciled — training thread may have
+        # crashed)" message that masked the actual error when the thread
+        # eventually did update — confusing for users reading the report.
+        # If the training thread is dead (e.g. killed by an API restart),
+        # the user will see this short message + can read the full log for
+        # the captured stdout.
+        err_msg = f"Ray job ended: {st} (status set by reconciler)"
+        _append_log(medimage_id, f"[reconcile] {err_msg} — if the training thread is still alive, it will overwrite this with the real reason; otherwise check the wrapper stdout above")
+        _set_status(medimage_id, "error", err_msg)
+        summary["synced_errors"].append({"medimage_id": medimage_id, "ray_submission_id": sid, "ray_status": st})
+
+    return summary
+
+
+def _append_log_for_sub(submission_id: str, line: str):
+    """Append a log line to the medimage job that owns this Ray submission."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM jobs WHERE ray_submission_id=? LIMIT 1", (submission_id,),
+        ).fetchone()
+    if row:
+        _append_log(row["id"], line)
+
+
+def _ray_reconcile_watchdog():
+    """Background loop: reconcile Ray cluster state every N seconds."""
+    while True:
+        try:
+            time.sleep(_RAY_RECONCILE_INTERVAL_S)
+            _reconcile_ray_jobs()
+        except Exception as e:
+            print(f"[reconcile] watchdog error: {e}")
+
+
+# Start the watchdog once when the module loads (API container has a single
+# worker process, so we don't worry about multiple instances).
+try:
+    _t = threading.Thread(target=_ray_reconcile_watchdog, daemon=True, name="ray-reconcile-watchdog")
+    _t.start()
+    print(f"[reconcile] watchdog started (interval={_RAY_RECONCILE_INTERVAL_S}s, stuck_pending>{_RAY_STUCK_PENDING_AGE_S}s)")
+except Exception as _e:
+    print(f"[reconcile] failed to start watchdog: {e}")
+
 # ─── Keycloak JWT Auth ────────────────────────────────────────────────────────
 
 _KC_ENABLED = os.getenv("KEYCLOAK_ENABLED", "true").lower() == "true"
@@ -209,8 +384,8 @@ def _sync_verify_token(token: str):
 
 
 # Paths excluded from JWT auth
-_KC_PUBLIC_PATHS = {"/api/health", "/api/diag/minio"}
-_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/", "/api/inference/thumbnail/", "/api/inference/image/")
+_KC_PUBLIC_PATHS = {"/api/health", "/api/diag/minio", "/api/gpu-util"}
+_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/", "/api/inference/thumbnail/", "/api/inference/image/", "/api/ray/gpu-stats", "/api/ray/api/", "/api/ray/nodes", "/api/gpu-util")
 
 @app.middleware("http")
 async def jwt_auth_middleware(request: Request, call_next):
@@ -853,6 +1028,7 @@ class TrainRequest(BaseModel):
     grad_accum: int = 4
     text_dataset: str = ""          # text_dataset id or name
     cluster: str = "ray"            # ray | modal
+    num_gpus: int = 1               # GPUs per training job (1=sequential, 2-4=data-parallel)
 
 
 # ─── Training runner ─────────────────────────────────────────────────────────
@@ -862,6 +1038,49 @@ LS_TOKEN   = os.getenv("LS_TOKEN", "medimage-ls-token-2026")
 MINIO_URL  = os.getenv("MINIO_URL", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+
+
+def _verify_weights_uploaded(s3_path: str) -> tuple[bool, str]:
+    """Confirm an s3://bucket/key path actually has an object in MinIO.
+
+    Ray reporting SUCCEEDED only means the wrapper script exited 0 — it
+    does NOT guarantee the training script actually ran end-to-end. The
+    common "phantom SUCCEEDED" cases are:
+      - main() falls through without matching a (engine, type) branch
+      - the engine raises but main() catches it and returns cleanly
+      - upload_to_minio() silently no-ops (e.g., no checkpoint to save)
+
+    This check turns a "phantom" success into a real error by verifying
+    the expected object exists. Returns (ok, message).
+    """
+    if not s3_path or not s3_path.startswith("s3://"):
+        return False, f"not an s3:// path: {s3_path!r}"
+    path = s3_path[5:]
+    if "/" not in path:
+        return False, f"s3 path missing bucket/key: {s3_path!r}"
+    bucket, key = path.split("/", 1)
+    try:
+        import boto3 as _b3
+        from botocore.config import Config as _Cfg
+        from botocore.exceptions import ClientError as _CE
+        s3 = _b3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_Cfg(signature_version="s3v4"),
+        )
+        try:
+            resp = s3.head_object(Bucket=bucket, Key=key)
+            size = resp.get("ContentLength", 0)
+            if size <= 0:
+                return False, f"object exists but is empty (0 bytes): s3://{bucket}/{key}"
+            return True, f"verified s3://{bucket}/{key} ({size} bytes)"
+        except _CE as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False, f"object NOT found in MinIO: s3://{bucket}/{key}"
+            return False, f"head_object failed: {e}"
+    except Exception as e:
+        return False, f"verify failed: {e}"
 # Public URL for MinIO accessible from Ray/Modal clusters (set to external/VPN IP)
 MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", MINIO_URL)
 # Public URL for Label Studio accessible from Ray cluster
@@ -1383,6 +1602,39 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
     # will hard-fail with feature-map mismatches if we feed the wrong
     # resolution. Always honour the model's default in that case.
     timm_name = model_name.replace("-", "_")
+    # ── Model name alias map ──────────────────────────────────────────────────
+    # The catalog uses torchvision-style names for some models (e.g.
+    # `regnet_y_400mf`), but the rest of this function talks to TIMM,
+    # which uses different names (e.g. `regnety_004`). Without this map
+    # TIMM raises "Unknown model" and the user sees a confusing error
+    # with no hint about the right name to use. Keys are catalog names;
+    # values are the TIMM equivalent.
+    _TIMM_ALIAS = {
+        "regnet_y_400mf":   "regnety_004",
+        "regnet_y_800mf":   "regnety_008",
+        "regnet_y_1_6gf":   "regnety_016",
+        "regnet_y_3_2gf":   "regnety_032",
+        "regnet_y_8gf":     "regnety_080",
+        "regnet_y_16gf":    "regnety_160",
+        "regnet_y_32gf":    "regnety_320",
+        "regnet_z_500mf":   "regnetz_005",
+        # EfficientNet — TIMM ships the original TF-pretrained weights under
+        # `tf_efficientnet_b{0..7}`; the plain `efficientnet_b4` only has
+        # noisy-students weights. We default to the TF version (the
+        # smaller, faster, better-known checkpoint).
+        "efficientnet-b0":  "tf_efficientnet_b0",
+        "efficientnet-b1":  "tf_efficientnet_b1",
+        "efficientnet-b2":  "tf_efficientnet_b2",
+        "efficientnet-b3":  "tf_efficientnet_b3",
+        "efficientnet-b4":  "tf_efficientnet_b4",
+        "efficientnet-b5":  "tf_efficientnet_b5",
+        "efficientnet-b6":  "tf_efficientnet_b6",
+        "efficientnet-b7":  "tf_efficientnet_b7",
+    }
+    if timm_name in _TIMM_ALIAS:
+        _alias_target = _TIMM_ALIAS[timm_name]
+        print(f"[train] aliasing {timm_name} → {_alias_target} for TIMM", flush=True)
+        timm_name = _alias_target
     _model_default_input = None
     _model_fixed = False
     try:
@@ -1419,7 +1671,113 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] Device: {device} | model: {timm_name} | imgsz={imgsz}")
-    model = timm.create_model(timm_name, pretrained=True, num_classes=nc).to(device)
+    # ── torchxrayvision branch ──────────────────────────────────────────────
+    # `densenet121-res224-all` and other TorchXRayVision medical models are
+    # NOT in the TIMM registry — they're a separate library with a different
+    # loader API (xrv.models.DenseNet(weights="densenet121-res224-all")).
+    # TIMM's create_model() raises a confusing "not a valid model" error if
+    # we route them through here, so detect and dispatch instead.
+    # Note: xrv's weights param uses the original dashed name, not the
+    # underscored `timm_name` we computed above.
+    _is_xrv_model = model_name.lower().startswith("densenet") and "res224" in model_name.lower()
+    if _is_xrv_model:
+        import torchxrayvision as xrv
+        # xrv expects a single-channel 224x224 input with specific mean/std
+        # normalization. We override the user's imgsz since the weights are
+        # trained on 224. Also the model outputs (1, num_classes_xrv) for the
+        # 18 X-ray pathologies, not the user's label count — we wrap it with
+        # a fresh linear head to map to our `nc` classes.
+        if imgsz != 224:
+            print(f"[train] {timm_name} is fixed at 224x224 (xrv weights) — overriding imgsz={imgsz}")
+            imgsz = 224
+        xrv_model = xrv.models.DenseNet(weights=model_name)
+        # The xrv DenseNet.forward() runs an internal `op_norm()` step that
+        # multiplies the features by a buffer sized to the model's
+        # pathology count (18 for densenet121-res224-all). Simply swapping
+        # `self.classifier` to a different output size makes op_norm
+        # broadcast a (1, 18) tensor against a (B, nc) feature map → crash
+        # with "tensor a (3) must match tensor b (18)". The clean fix is
+        # to bypass xrv's full forward() entirely and use only its feature
+        # extractor (the conv stack) + our own linear classifier.
+        class _XRVEncoderClassifier(nn.Module):
+            def __init__(self, xrv_base: nn.Module, num_classes: int):
+                super().__init__()
+                # Pull out the conv backbone (everything up to the
+                # adaptive pool + flatten) and discard the pathology head.
+                self.features = xrv_base.features
+                feat_dim = self._infer_feature_dim()
+                self.classifier = nn.Linear(feat_dim, num_classes)
+            def _infer_feature_dim(self) -> int:
+                # xrv.features ends in adaptive_avg_pool2d((7,7)) NOT (1,1),
+                # so the output is (1, C, 7, 7). We must run the pool
+                # ourselves to get the per-image feature size (C), not
+                # C*7*7 = 50176.
+                with torch.no_grad():
+                    self.features.eval()
+                    dummy = torch.zeros(1, 1, imgsz, imgsz)
+                    out = self.features(dummy)
+                    if out.dim() > 2:
+                        out = nn.functional.adaptive_avg_pool2d(out, (1, 1))
+                    return int(out.flatten(1).shape[-1])
+            def forward(self, x):
+                f = self.features(x)
+                if f.dim() > 2:
+                    f = nn.functional.adaptive_avg_pool2d(f, (1, 1)).view(f.size(0), -1)
+                return self.classifier(f)
+        model = _XRVEncoderClassifier(xrv_model, nc).to(device)
+        # Use a single-channel transform (xrv default) instead of 3-channel
+        tf_tr_xrv = transforms.Compose([
+            transforms.Resize((imgsz, imgsz)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),  # xrv's default mean/std
+        ])
+        tf_vl_xrv = transforms.Compose([
+            transforms.Resize((imgsz, imgsz)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+        train_dl = DataLoader(ImgDS(samples[:-n_val], tf_tr_xrv), batch_size=batch, shuffle=True, drop_last=True)
+        val_dl   = DataLoader(ImgDS(samples[-n_val:], tf_vl_xrv), batch_size=batch, drop_last=False)
+    elif (
+        # ── DINOv2-style encoder models ─────────────────────────────────────
+        # DINOv2 (and HF models that use DINOv2 backbones — MahmoodLab/UNI,
+        # microsoft/rad-dino) ship as VISION ENCODERS: they output
+        # (batch, embed_dim) features, NOT (batch, num_classes) logits.
+        # `timm.create_model("vit_base_patch14_dinov2", num_classes=nc)`
+        # works for downstream linear-probe because TIMM has a registered
+        # classification head, BUT it ignores the self-supervised
+        # pretraining (uses the head, not the encoder features). For
+        # linear-probe the cleanest approach is:
+        #   1. Load the model with num_classes=0 → no head, just features
+        #   2. Pool the output (DINOv2 ViT-B/14 uses [CLS]-style tokens)
+        #   3. Add a fresh nn.Linear(embed_dim, num_classes)
+        # This works the same for HF models that share the DINOv2
+        # architecture (rad-dino, UNI) when called via timm.create_model
+        # with the hf-hub:org/repo prefix stripped.
+        (timm_name.startswith("vit_base_patch14_dinov2")
+         or timm_name == "vit_small_patch14_dinov2"
+         or timm_name in ("vit_small_patch14_reg4_dinov2",
+                          "vit_base_patch14_reg4_dinov2"))
+    ):
+        print(f"[train] loading {timm_name} as DINOv2-style encoder (no head) + custom classifier")
+        # num_classes=0 makes timm drop the classification head and
+        # return the pooled feature vector.
+        encoder = timm.create_model(timm_name, pretrained=True, num_classes=0)
+        embed_dim = encoder.num_features
+        class _DinoV2LinearProbe(nn.Module):
+            def __init__(self, enc: nn.Module, embed_dim: int, num_classes: int):
+                super().__init__()
+                self.encoder = enc
+                self.classifier = nn.Linear(embed_dim, num_classes)
+            def forward(self, x):
+                feats = self.encoder(x)
+                return self.classifier(feats)
+        model = _DinoV2LinearProbe(encoder, embed_dim, nc).to(device)
+    else:
+        model = timm.create_model(timm_name, pretrained=True, num_classes=nc).to(device)
 
     crit = nn.CrossEntropyLoss()
     opt_map = {
@@ -2122,6 +2480,65 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
 
     split = max(1, int(len(all_images) * 0.9))
     train_imgs, val_imgs = all_images[:split], all_images[split:] or all_images[:1]
+
+    # ── Validate HF access BEFORE doing dataset prep (fail fast) ──────────
+    # Gated models (e.g. MahmoodLab/UNI, microsoft/rad-dino) return 401/403
+    # with an opaque "Access to model ... is restricted" message that's
+    # hard to debug in the worker log. Two checks up front:
+    #   1. If no HF_TOKEN at all → tell user to set one
+    #   2. If gated AND has token, probe a real file download — many
+    #      gated models (UNIs, rad-dino) require EXPLICIT APPROVAL on
+    #      the HF model page before any token works. A 403 here means
+    #      the user needs to go to the model page and click "Agree and
+    #      access repository", then retry.
+    _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+    _hf_token_present = bool(_hf_token)
+    _is_gated = False
+    _gated_kind = None  # "auto" / "manual" / "false"
+    try:
+        from huggingface_hub import HfApi
+        _api = HfApi(token=_hf_token)
+        _model_info = _api.model_info(model_name)
+        _g = getattr(_model_info, "gated", False)
+        _gated_kind = _g if isinstance(_g, str) else ("true" if _g else "false")
+        _is_gated = bool(_g) and _gated_kind != "false"
+    except Exception:
+        pass  # probe itself failed — let the actual download report the error
+
+    if _is_gated and not _hf_token_present:
+        raise RuntimeError(
+            f"Model '{model_name}' is a GATED HuggingFace model — it requires "
+            f"a HuggingFace token.\n"
+            f"  → In this UI: Profile → HuggingFace Token → paste your token (from "
+            f"https://huggingface.co/settings/tokens) → Save.\n"
+            f"  → Or set HF_TOKEN in the medimage-api container's environment."
+        )
+
+    if _is_gated and _hf_token_present and _gated_kind in ("manual", "auto", "true"):
+        # Many gated repos require the user to explicitly request
+        # access on the HF model page BEFORE their token works. Probe
+        # by trying to fetch a tiny metadata file — if the HF API
+        # returns 403/401 the user hasn't been approved yet.
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(
+                repo_id=model_name, filename="config.json",
+                token=_hf_token, cache_dir=None,
+            )
+        except Exception as _probe_err:
+            _err_str = str(_probe_err).lower()
+            if any(t in _err_str for t in ("403", "401", "gated", "restricted", "authorized list")):
+                raise RuntimeError(
+                    f"Model '{model_name}' is GATED and your HF token is not in the "
+                    f"authorized list.\n"
+                    f"  → Go to https://huggingface.co/{model_name} in a browser\n"
+                    f"  → Click the 'Agree and access repository' button (you may need "
+                    f"to log in with the same HF account that owns the token set in "
+                    f"your Profile)\n"
+                    f"  → Wait ~1 min for HF to propagate the approval\n"
+                    f"  → Retry the test-all run\n"
+                    f"\nUnderlying error: {_probe_err}"
+                ) from _probe_err
 
     processor = AutoImageProcessor.from_pretrained(model_name)
 
@@ -3121,8 +3538,10 @@ def _run_on_ray_cluster(job: dict) -> None:
         for _k, _v in env_vars.items():
             _re_env["env_vars"][_k] = str(_v)
 
+        _num_gpus = int(job.get("num_gpus") or 1)
         _payload = {
             "entrypoint": _entrypoint,
+            "entrypoint_num_gpus": _num_gpus,
             "runtime_env": _re_env,
         }
 
@@ -3134,6 +3553,9 @@ def _run_on_ray_cluster(job: dict) -> None:
             _job_data = _resp.json()
             _ray_job_id = _job_data.get("submission_id") or _job_data.get("job_id")
             _append_log(job_id, f"[cluster] Ray job submitted: {_ray_job_id}")
+            with get_db() as _c:
+                _c.execute("UPDATE jobs SET ray_submission_id=? WHERE id=?", (_ray_job_id, job_id))
+                _c.commit()
         except Exception as _e:
             _append_log(job_id, f"[cluster] Ray job submission failed: {_e}")
             raise
@@ -3189,7 +3611,21 @@ def _run_on_ray_cluster(job: dict) -> None:
                 _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} len={len(_logs_resp.text)}")
                 if _logs_resp.ok and _logs_resp.text:
                     _all_log_lines = []
-                    for _line in _logs_resp.text.splitlines():
+                    # IMPORTANT: Ray returns `{"logs": "line1\nline2\n..."}` —
+                    # a single JSON line whose `"logs"` field has the real
+                    # log content (with real newlines). Treating `text`
+                    # as the log itself would feed the entire JSON
+                    # through the filter as ONE line, then "Runtime env
+                    # is setting up" would match `in _line_s` and the
+                    # whole 12kB blob gets dropped — leaving the user
+                    # staring at "Log fetch attempt N/15 empty" with no
+                    # actual wrapper stdout in the log. Parse the JSON
+                    # first, then iterate over real log lines.
+                    try:
+                        _logs_str = _logs_resp.json().get("logs", "") or ""
+                    except Exception:
+                        _logs_str = _logs_resp.text
+                    for _line in _logs_str.splitlines():
                         _line_s = _line.strip()
                         if _line_s:
                             _all_log_lines.append(_line_s)
@@ -3236,6 +3672,18 @@ def _run_on_ray_cluster(job: dict) -> None:
                     (_weights_path, job_id),
                 )
                 conn.commit()
+        # Verify the weights actually exist in MinIO before declaring success.
+        # Ray SUCCEEDED + missing object = "phantom" success (training script
+        # returned without uploading). See _verify_weights_uploaded docstring.
+        if _weights_path:
+            _ok, _msg = _verify_weights_uploaded(_weights_path)
+            _append_log(job_id, f"[cluster] weight check: {_msg}")
+            if not _ok:
+                raise RuntimeError(
+                    f"Training script returned 0 but weights are missing in MinIO: {_msg}. "
+                    f"This usually means the training script exited without uploading — "
+                    f"check the captured stdout above for the actual failure."
+                )
         _append_log(job_id, f"✓ Training complete — weights: {_weights_path or '(not found)'}")
         _set_step(job_id, "done")
         _set_status(job_id, "completed")
@@ -3244,7 +3692,9 @@ def _run_on_ray_cluster(job: dict) -> None:
     # ── Deep-learning dispatch ─────────────────────────────────────────────
     # pip packages depend on engine
     if engine in ("PyTorch", "PyTorch+TIMM", "TIMM"):
-        pip_pkgs = ["timm>=0.9", "boto3>=1.34", "requests", "Pillow"]
+        # torchxrayvision needed for medical DenseNet ("densenet121-res224-all"
+        # etc.) which TIMM doesn't ship. ~50MB wheel, only used by that branch.
+        pip_pkgs = ["timm>=0.9", "torchxrayvision>=1.2", "boto3>=1.34", "requests", "Pillow"]
     elif engine == "TorchVision" and training_type == "classification":
         pip_pkgs = ["timm>=0.9", "boto3>=1.34", "requests", "Pillow"]
     elif engine in ("Segmentation Models PyTorch", "TorchVision"):
@@ -3282,37 +3732,57 @@ def _run_on_ray_cluster(job: dict) -> None:
     # Keep the wrapper script small (no inline base64) — pass training script
     # via env var to avoid "Argument list too long" (Linux argv limit ~128KB).
     _wrapper = (
-        "import os, sys, subprocess, base64\n"
+        "import os, sys, subprocess, base64, time\n"
         f"_pip = {pip_pkgs!r}\n"
         f"_env = {env_vars!r}\n"
         "_b64 = os.environ.get('MEDIMAGE_TRAIN_SCRIPT_B64', '')\n"
         "if not _b64:\n"
         "    raise RuntimeError('_MEDIMAGE_TRAIN_SCRIPT_B64 env var not set')\n"
-        "_sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', 'numpy<2.0'], capture_output=True)\n"
+        "print(f'[wrapper] python={sys.executable} pid={os.getpid()}', flush=True)\n"
+        "print(f'[wrapper] env keys={len(_env)} pip_pkgs={len(_pip)} script_b64_len={len(_b64)}', flush=True)\n"
+        "print(f'[wrapper] pip_pkgs={_pip}', flush=True)\n"
+        "print('[wrapper] pip install --force-reinstall numpy<2.0 ...', flush=True)\n"
+        "t0 = time.time()\n"
+        "_sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', 'numpy<2.0'], capture_output=True, text=True)\n"
+        "print(f'[wrapper] numpy install done in {time.time()-t0:.1f}s rc={_sp.returncode}', flush=True)\n"
+        "if _sp.returncode != 0:\n"
+        "    print(f'[wrapper] numpy install FAILED stderr={(_sp.stderr or \"\")[:500]}', flush=True)\n"
         "if _pip:\n"
-        "    _sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q'] + _pip, capture_output=True)\n"
+        "    print(f'[wrapper] pip install {\" \".join(_pip)} ...', flush=True)\n"
+        "    t0 = time.time()\n"
+        "    _sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q'] + _pip, capture_output=True, text=True)\n"
+        "    print(f'[wrapper] pip install done in {time.time()-t0:.1f}s rc={_sp.returncode}', flush=True)\n"
+        "    if _sp.returncode != 0:\n"
+        "        print(f'[wrapper] pip install FAILED stderr={(_sp.stderr or \"\")[:500]}', flush=True)\n"
         "# Opencv fix: ultralytics's dep chain pulls opencv-python (needs libGL.so.1,\n"
         "# missing on the cluster). Uninstall opencv-python entirely and force-\n"
         "# reinstall opencv-python-headless so the headless .so files win on import.\n"
         "print('[opencv-fix] uninstall opencv-python...', flush=True)\n"
+        "t0 = time.time()\n"
         "r = subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', '-q', 'opencv-python', 'opencv-contrib-python'], capture_output=True, text=True)\n"
-        "print(f'[opencv-fix] uninstall rc={r.returncode}', flush=True)\n"
+        "print(f'[opencv-fix] uninstall rc={r.returncode} in {time.time()-t0:.1f}s', flush=True)\n"
         "print('[opencv-fix] force-reinstall opencv-python-headless...', flush=True)\n"
+        "t0 = time.time()\n"
         "r = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', '--no-deps', 'opencv-python-headless'], capture_output=True, text=True)\n"
-        "print(f'[opencv-fix] install rc={r.returncode}', flush=True)\n"
+        "print(f'[opencv-fix] install rc={r.returncode} in {time.time()-t0:.1f}s', flush=True)\n"
         "r = subprocess.run([sys.executable, '-c', 'import cv2; print(\"cv2 ok:\", cv2.__version__)'], capture_output=True, text=True)\n"
         "print(f'[opencv-fix] cv2 check: {r.stdout.strip()} {r.stderr.strip()}', flush=True)\n"
+        "print(f'[wrapper] setting {len(_env)} env vars (JOB_ID={os.environ.get(\"JOB_ID\", \"?\")})', flush=True)\n"
         "for k, v in _env.items(): os.environ[k] = v\n"
         "from io import StringIO\n"
         "_cap = StringIO()\n"
         "_so, _se = sys.stdout, sys.stderr\n"
         "sys.stdout = sys.stderr = _cap\n"
+        "print('[wrapper] exec training script ...', flush=True)\n"
         "try:\n"
         "    exec(base64.b64decode(_b64).decode(), {'__name__': '__main__'})\n"
         "except SystemExit as _e:\n"
         "    if _e.code not in (None, 0):\n"
         "        sys.stdout = _so; sys.stderr = _se\n"
         "        raise RuntimeError(f'Script exited {_e.code}\\n{_cap.getvalue()}')\n"
+        "except BaseException as _e:\n"
+        "    sys.stdout = _so; sys.stderr = _se\n"
+        "    raise RuntimeError(f'Script crashed: {type(_e).__name__}: {_e}\\n{_cap.getvalue()}')\n"
         "finally:\n"
         "    sys.stdout, sys.stderr = _so, _se\n"
         "print(_cap.getvalue())\n"
@@ -3321,8 +3791,10 @@ def _run_on_ray_cluster(job: dict) -> None:
     # Send the actual training script via env var (no argv limit on env vars)
     _env_for_job = dict(env_vars)
     _env_for_job["MEDIMAGE_TRAIN_SCRIPT_B64"] = script_b64
+    _num_gpus = int(job.get("num_gpus") or 1)
     _deploy_payload = {
         "entrypoint": f"bash -c 'echo {_wrapper_b64} | base64 -d > /tmp/dl_train.py && python3 /tmp/dl_train.py'",
+        "entrypoint_num_gpus": _num_gpus,
         "runtime_env": {"env_vars": _env_for_job},
     }
     try:
@@ -3330,6 +3802,9 @@ def _run_on_ray_cluster(job: dict) -> None:
         _resp.raise_for_status()
         _ray_job_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
         _append_log(job_id, f"[cluster] DL training job submitted: {_ray_job_id}")
+        with get_db() as _c:
+            _c.execute("UPDATE jobs SET ray_submission_id=? WHERE id=?", (_ray_job_id, job_id))
+            _c.commit()
     except Exception as _e:
         _append_log(job_id, f"[cluster] DL job submission failed: {_e}")
         raise
@@ -3365,7 +3840,15 @@ def _run_on_ray_cluster(job: dict) -> None:
             _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
             _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} len={len(_logs_resp.text)}")
             if _logs_resp.ok and _logs_resp.text:
-                for _line in _logs_resp.text.splitlines():
+                # Ray returns `{"logs": "line1\nline2\n..."}` — parse JSON
+                # first so we iterate over real log lines, not the JSON
+                # wrapper (which contains the substring "Runtime env is"
+                # and would otherwise be skipped as a single 12kB blob).
+                try:
+                    _logs_str = _logs_resp.json().get("logs", "") or ""
+                except Exception:
+                    _logs_str = _logs_resp.text
+                for _line in _logs_str.splitlines():
                     _line_s = _line.strip()
                     if not _line_s: continue
                     # Skip Ray's own log lines (timestamps, runtime env setup)
@@ -3405,6 +3888,17 @@ def _run_on_ray_cluster(job: dict) -> None:
                 (_weights_path, job_id),
             )
             conn.commit()
+    # Verify the weights actually exist in MinIO before declaring success.
+    # See _verify_weights_uploaded docstring — Ray SUCCEEDED ≠ training done.
+    if _weights_path:
+        _ok, _msg = _verify_weights_uploaded(_weights_path)
+        _append_log(job_id, f"[cluster] weight check: {_msg}")
+        if not _ok:
+            raise RuntimeError(
+                f"Training script returned 0 but weights are missing in MinIO: {_msg}. "
+                f"This usually means the training script exited without uploading — "
+                f"check the captured stdout above for the actual failure."
+            )
     _append_log(job_id, f"✓ Training complete — weights: {_weights_path or '(not found)'}")
     _set_step(job_id, "done")
     _set_status(job_id, "completed")
@@ -3781,8 +4275,8 @@ def submit_job(project_id: int, req: TrainRequest, request: Request):
                (id, name, project_id, dataset, training_type, model_name, engine,
                 epochs, batch_size, learning_rate, optimizer, imgsz, notes,
                 lora_rank, quantization, max_seq_len, chat_template, grad_accum, text_dataset,
-                cluster, status, progress, log, created_at, user_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?,?)""",
+                cluster, num_gpus, status, progress, log, created_at, user_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?,?)""",
             (
                 job_id, name, project_id, dataset_label,
                 req.training_type, req.model_name, req.engine,
@@ -3790,7 +4284,7 @@ def submit_job(project_id: int, req: TrainRequest, request: Request):
                 req.optimizer, req.imgsz, req.notes,
                 req.lora_rank, req.quantization, req.max_seq_len,
                 req.chat_template, req.grad_accum, req.text_dataset,
-                cluster,
+                cluster, req.num_gpus,
                 time.time(),
                 submitter_user_id,
             ),
@@ -6801,6 +7295,171 @@ async def ray_clear_dead_nodes(request: Request):
     return {"cleared": cleared, "total_dead": len(seen), "errors": errors}
 
 
+@app.post("/api/ray/serve/stop-all")
+async def ray_serve_stop_all(request: Request):
+    """Stop every running Ray Serve deploy from the medimage API.
+
+    Called by the test-all bulk run as a pre-flight (and by the Stop-All
+    button on the Models page) to free the GPUs that persistent deploy
+    actors are holding. On a 4-GPU cluster, 4 deploys eat all the GPUs
+    and every subsequent training job sits PENDING until the reconciler
+    kills it — running stop-all first keeps the cluster usable for the
+    whole test-all sweep.
+
+    Two sources of actors to kill:
+      1. DB-tracked: jobs with ray_serve_url set + inference_provider='ray'
+      2. Orphan: any alive `model-*` actor on the cluster that the DB
+         doesn't know about (e.g. from a previous test-all run where the
+         API was restarted before the DB row was written)
+    """
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    import requests as _req
+    import base64 as _b64lib
+    import concurrent.futures as _cf
+
+    # 1) Collect DB-tracked deploys
+    with get_db() as conn:
+        db_rows = conn.execute(
+            "SELECT id, ray_serve_url FROM jobs "
+            "WHERE ray_serve_url != '' AND inference_provider='ray' "
+            "ORDER BY finished_at DESC"
+        ).fetchall()
+    db_ids = {r["id"] for r in db_rows}
+
+    # 2) Find orphan model-* actors (alive but not in DB)
+    orphan_actor_names = []
+    try:
+        _ar = _req.get(f"{RAY_URL}/api/v0/actors", timeout=5)
+        if _ar.ok:
+            for a in _ar.json().get("data", {}).get("result", {}).get("result", []):
+                name = a.get("name", "")
+                st = a.get("state", "")
+                if name.startswith("model-") and st == "ALIVE":
+                    jid = name[len("model-"):]
+                    if jid not in db_ids:
+                        orphan_actor_names.append(name)
+    except Exception:
+        pass
+
+    # Build work list: (job_id, actor_name). For DB-tracked, name =
+    # "model-{jid}". For orphans, name is what we discovered.
+    work = [(r["id"], f"model-{r['id']}") for r in db_rows] + \
+           [(None, name) for name in orphan_actor_names]
+    if not work:
+        return {"stopped": 0, "failed": 0, "orphans": 0, "ids": []}
+
+    # Stronger kill: no_restart=True (Ray supervisor can otherwise
+    # respawn the actor on the next health probe) + a follow-up
+    # ray.get_actor() check to confirm the death actually stuck.
+    # Without this, the actor state stays ALIVE for minutes even
+    # though ray.kill() returned — letting stale deploys keep
+    # holding the GPU.
+    def _kill_one(item) -> tuple[str | None, bool, str]:
+        jid, actor_name = item
+        kill_script = (
+            "import ray, sys, time, os\n"
+            "ray.init(address='auto', ignore_reinit_error=True, log_to_driver=False)\n"
+            "actor_name = os.environ.get('ACTOR_NAME','')\n"
+            "if not actor_name:\n"
+            "    print('NO_ACTOR_NAME', flush=True); sys.exit(1)\n"
+            "try:\n"
+            "    actor = ray.get_actor(actor_name, namespace='default')\n"
+            "    print(f'FOUND:{actor_name}', flush=True)\n"
+            "    ray.kill(actor, no_restart=True)\n"
+            "    print(f'KILLED:{actor_name}', flush=True)\n"
+            "    time.sleep(2)\n"
+            "    try:\n"
+            "        ray.get_actor(actor_name, namespace='default')\n"
+            "        print(f'STILL_ALIVE:{actor_name}', flush=True)\n"
+            "    except Exception:\n"
+            "        print(f'CONFIRMED_DEAD:{actor_name}', flush=True)\n"
+            "except Exception as e:\n"
+            "    print(f'NOT_FOUND:{e}', flush=True)\n"
+        )
+        b64 = _b64lib.b64encode(kill_script.encode()).decode()
+        try:
+            r = _req.post(
+                f"{RAY_URL}/api/jobs/",
+                json={"entrypoint": f"bash -c 'echo {b64} | base64 -d > /tmp/kill.py && ACTOR_NAME={actor_name} python3 /tmp/kill.py'",
+                      "runtime_env": {}},
+                timeout=15,
+            )
+            r.raise_for_status()
+            sub_id = r.json().get("submission_id") or r.json().get("job_id")
+            for _ in range(15):
+                time.sleep(1)
+                st = _req.get(f"{RAY_URL}/api/jobs/{sub_id}", timeout=5).json()
+                if st.get("status") in ("SUCCEEDED", "FAILED", "STOPPED"):
+                    break
+            if jid is not None:
+                with get_db() as _c:
+                    _c.execute("UPDATE jobs SET ray_serve_url='', inference_provider='' WHERE id=?", (jid,))
+                    _c.commit()
+            return (jid, True, "")
+        except Exception as e:
+            return (jid, False, str(e))
+
+    stopped, failed, errors = [], [], []
+    # Up to 4 kills in parallel (matches the cluster GPU count)
+    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(_kill_one, item) for item in work]
+        for f in _cf.as_completed(futs):
+            jid, ok, err = f.result()
+            if ok:
+                stopped.append(jid)
+            else:
+                failed.append(jid)
+                errors.append({"id": jid, "error": err})
+
+    # Wait until at least one GPU is free — same reason as the per-model
+    # stop endpoint above. The bulk loop's pre-flight calls this and then
+    # immediately submits the first training job, so we must hold until
+    # the cluster's GPU accounting reflects the freed slot.
+    try:
+        for _wait_i in range(30):
+            time.sleep(1)
+            _cs = _req.get(f"{RAY_URL}/api/cluster_status", timeout=4).json()
+            _ru = _cs.get("data", {}).get("autoscalingStatus", "")
+            try:
+                _gpu_chunk = _ru.split("ResourceUsage:")[1].split("\n")[0]
+                _used_g = float(_gpu_chunk.split("GPU,")[0].rsplit(" ", 1)[-1])
+                _total_g = float(_gpu_chunk.split("GPU,")[1].split(" ", 1)[0].rstrip("/"))
+                if _used_g < _total_g:
+                    break
+            except Exception:
+                pass
+        else:
+            pass  # caller will see PENDING; reconciler will clean up
+    except Exception:
+        pass
+
+    return {"stopped": len(stopped), "failed": len(failed), "orphans": len(orphan_actor_names), "ids": stopped, "errors": errors}
+
+
+@app.post("/api/ray/jobs/{submission_id}/stop")
+def ray_job_stop(submission_id: str, request: Request):
+    """Stop a single Ray job by submission_id. Used by the reconciler and the
+    test-all UI to free GPUs that are stuck on a PENDING job."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    ok = _stop_ray_submission(submission_id)
+    return {"stopped": ok, "submission_id": submission_id}
+
+
+@app.get("/api/ray/jobs/reconcile")
+def ray_reconcile(request: Request):
+    """Run one reconciliation pass: stop stuck PENDING Ray jobs + sync DB
+    state for finished jobs that the training thread forgot to update.
+    Returns a summary so the UI can show what was cleaned up."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    return _reconcile_ray_jobs()
+
+
 @app.post("/api/ray-serve/deploy")
 async def ray_infer_deploy(body: dict):
     ray_dashboard_url = (body.get("ray_dashboard_url") or "").rstrip("/")
@@ -6866,6 +7525,357 @@ def ray_infer_status_ep():
         "url": _ray_serve_state["url"],
         "logs": _ray_serve_state["logs"][-20:],
     }
+
+
+# ── GPU stats via nvidia-smi on Ray cluster ──────────────────────────────────
+_gpu_stats_cache: dict = {"ts": 0.0, "data": None}
+
+# ── GPU utilization cache: receives data from gpu-monitor sidecar ──────────
+# Structure: { "hostname1": {"util": 12.0, "gpus": [...], "ts": 1781...}, ... }
+_gpu_util_per_node: dict = {}
+
+# ── GPU status cache: consumes the team's /api/gpu-status (which already
+# filters to Ray-managed GPUs and attaches ray_node_index + ray_gpu_indices).
+# Keyed by ray_node_index so we can attribute data to the right Ray node
+# without brittle list-slicing across clusters.
+# Structure: {
+#   <ray_node_index>: {
+#     "hostname": "...", "internal_ip": "...",
+#     "ts": <float>, "gpus": [{"index","util_pct","power_watt",...}, ...]
+#   }, ...
+# }
+_gpu_status_cache: dict = {}
+GPU_STATUS_URL = os.getenv("GPU_STATUS_URL", f"{RAY_URL.rsplit(':', 1)[0]}:8085/api/gpu-status")
+
+# Per-GPU TDP map (Watts). Used as the denominator for power-based activity
+# estimation. Falls back to 700W (H200) when the model is unknown.
+GPU_TDP_W = {
+    "H200": 700, "H100": 700, "A100": 400, "L40S": 350, "L40": 300,
+    "A10": 150, "L4": 72, "T4": 70, "V100": 300, "A40": 300,
+    "RTX 4090": 450, "RTX 3090": 350, "RTX 3080": 320, "RTX A6000": 300,
+}
+
+
+def _tdp_for(name: str) -> int:
+    if not name:
+        return 700
+    n = name.upper()
+    for k, w in GPU_TDP_W.items():
+        if k.upper() in n:
+            return w
+    return 700
+
+
+def _estimate_activity_pct(util_pct: int, power_watt: float, tdp_w: int) -> int:
+    """nvidia-smi's utilization.gpu is a 1s rolling window that under-reports
+    whenever the GPU is mid-batch (data loader, sync, CPU prep). Power draw
+    is a more reliable proxy: idle H200 ≈ 30W, full load ≈ 700W. When
+    util_pct is 0 but power is significantly above idle (~50W+), report an
+    activity estimate derived from power."""
+    if util_pct and util_pct > 0:
+        return int(util_pct)
+    if power_watt and tdp_w > 0:
+        est = int(round(power_watt / tdp_w * 100))
+        return max(0, min(100, est))
+    return 0
+
+
+@app.put("/api/gpu-util")
+def update_gpu_util(body: dict):
+    """Endpoint for gpu-monitor sidecar containers to push real GPU utilization.
+    Accepts:
+      { "gpu_util_pct": 35.2, "hostname": "node1", "gpus": [{ "index": 0, "util_pct": 35, ... }] }
+    Or simple:
+      { "gpu_util_pct": 35.2 }
+    """
+    global _gpu_util_per_node
+    hostname = body.get("hostname", "")
+    util = float(body.get("gpu_util_pct", 0))
+    gpus = body.get("gpus", [])
+    ts = time.time()
+
+    if hostname:
+        _gpu_util_per_node[hostname] = {"util": util, "gpus": gpus, "ts": ts}
+    else:
+        # Legacy: cluster-wide average, store under empty key
+        _gpu_util_per_node[""] = {"util": util, "gpus": gpus, "ts": ts}
+
+    # Also write to file for persistence across restarts
+    try:
+        import json as _json
+        with open("/tmp/gpu_util_cache.json", "w") as f:
+            _json.dump({"per_node": _gpu_util_per_node, "ts": ts}, f)
+    except Exception:
+        pass
+
+    return {"ok": True, "hostname": hostname, "gpu_util_pct": util}
+
+
+def _get_cluster_gpu_util():
+    """Get cluster-wide average GPU utilization from sidecar cache."""
+    global _gpu_util_per_node
+
+    # Load from file if cache is empty (after restart)
+    if not _gpu_util_per_node:
+        try:
+            import json as _json
+            with open("/tmp/gpu_util_cache.json") as f:
+                cached = _json.load(f)
+                _gpu_util_per_node = cached.get("per_node", {})
+        except Exception:
+            pass
+
+    # Prune stale entries (> 60s old)
+    now = time.time()
+    _gpu_util_per_node = {k: v for k, v in _gpu_util_per_node.items() if now - v.get("ts", 0) < 60}
+
+    if not _gpu_util_per_node:
+        return 0.0, {}
+
+    # Calculate cluster average from all per-node entries
+    utils = [v["util"] for k, v in _gpu_util_per_node.items() if k and v.get("util", 0) > 0]
+    if utils:
+        return round(sum(utils) / len(utils), 1), _gpu_util_per_node
+
+    # Fallback to legacy cluster-wide value
+    legacy = _gpu_util_per_node.get("", {})
+    return legacy.get("util", 0), _gpu_util_per_node
+
+def _poll_gpu_status():
+    """Fetch the team's /api/gpu-status (which filters to Ray-managed GPUs
+    and tags each with ray_node_index) and store it in _gpu_status_cache
+    keyed by ray_node_index. Runs as a daemon thread so the UI gets fresh
+    data without paying the per-request HTTP cost."""
+    global _gpu_status_cache
+    import requests as _req
+    while True:
+        try:
+            r = _req.get(GPU_STATUS_URL, timeout=5)
+            if r.ok:
+                nodes = r.json()
+                now = time.time()
+                new_cache = {}
+                for n in nodes:
+                    rni = n.get("ray_node_index")
+                    if rni is None:
+                        continue
+                    gpus = []
+                    for g in n.get("gpus", []):
+                        tdp = _tdp_for(g.get("name", ""))
+                        power = float(g.get("power_watt") or 0)
+                        util = int(g.get("util_pct") or 0)
+                        # dmon is a per-GPU object: {sm_pct, mem_pct, dec_pct,
+                        # enc_pct, jpg_pct, ofa_pct}. We surface sm_pct as the
+                        # canonical SM utilization (it averages over a 1s
+                        # window so it's less spiky than --query-gpu util.gpu)
+                        # and keep mem_pct around for a future memory-channel
+                        # chart.
+                        dmon = g.get("dmon") or {}
+                        sm_pct = int(dmon.get("sm_pct") or 0)
+                        dmon_mem_pct = int(dmon.get("mem_pct") or 0)
+                        gpus.append({
+                            "index": int(g.get("index", 0)),
+                            "name": g.get("name", "GPU"),
+                            "util_pct": util,
+                            "power_watt": power,
+                            "tdp_w": tdp,
+                            "activity_pct": _estimate_activity_pct(util, power, tdp),
+                            "sm_pct": sm_pct,
+                            "dmon_mem_pct": dmon_mem_pct,
+                            "mem_used_mb": int(g.get("mem_used_mb") or 0),
+                            "mem_total_mb": int(g.get("mem_total_mb") or 0),
+                            "temp_c": int(g.get("temp_c") or 0),
+                        })
+                    new_cache[int(rni)] = {
+                        "hostname": n.get("hostname", "?"),
+                        "internal_ip": n.get("internal_ip", ""),
+                        "ts": now,
+                        "gpus": gpus,
+                    }
+                _gpu_status_cache = new_cache
+        except Exception as e:
+            print(f"[gpu-status] poll error: {e}", file=sys.stderr)
+        time.sleep(2)
+
+
+# Start the poller daemon (only once per process).
+if not getattr(_poll_gpu_status, "_started", False):
+    _t = threading.Thread(target=_poll_gpu_status, daemon=True, name="gpu-status-poller")
+    _t.start()
+    _poll_gpu_status._started = True
+
+
+@app.get("/api/ray/gpu-stats")
+def ray_gpu_stats():
+    """Return per-node GPU info from the Ray Dashboard API.
+    Since nvidia-smi cannot run on the head node (no NVML) and GPU resources
+    are fully allocated (blocking entrypoint_num_gpus jobs), we parse the
+    cluster status and node summary for allocation data instead."""
+    import requests as _req
+    now = time.time()
+    cached = _gpu_stats_cache.get("data")
+    if cached and (now - _gpu_stats_cache.get("ts", 0)) < 5:
+        return cached
+
+    nodes_data = []
+    total_gpu_allocated = 0
+    total_gpu_count = 0
+    total_cpu_pct = 0
+
+    # 1. Get cluster-level + per-node resource usage from cluster_status
+    node_gpu_usage: dict[str, dict] = {}
+    try:
+        cs = _req.get(f"{RAY_URL}/api/cluster_status", timeout=5).json()
+        lmr = cs.get("data", {}).get("clusterStatus", {}).get("loadMetricsReport", {})
+        usage = lmr.get("usage", {})
+        total_cpu_pct = (usage.get("CPU", [0, 1])[0] / usage.get("CPU", [0, 1])[1] * 100) if usage.get("CPU", [0, 1])[1] else 0
+        total_gpu_allocated = int(usage.get("GPU", [0, 0])[0])
+        total_gpu_count = int(usage.get("GPU", [0, 0])[1])
+        # Per-node usage from usageByNode
+        for _nid, nu in lmr.get("usageByNode", {}).items():
+            ng = nu.get("GPU", [0, 0])
+            ncpu = nu.get("CPU", [0, 0])
+            node_gpu_usage[_nid] = {
+                "gpu_alloc": int(ng[0]),
+                "gpu_total": int(ng[1]),
+                "cpu_pct": round(ncpu[0] / ncpu[1] * 100, 1) if ncpu[1] else 0,
+            }
+    except Exception:
+        pass
+
+    # 2. Fall back to local sidecar data if the team's endpoint isn't
+    # reachable. Used for the cluster-wide average only — per-GPU detail
+    # comes from the team's cache below.
+    _cluster_gpu_util, _per_node_util = _get_cluster_gpu_util()
+    _max_gpu_detail: list = []
+    for _nk, _nv in _per_node_util.items():
+        if _nk:
+            _ngpus = _nv.get("gpus", [])
+            if len(_ngpus) > len(_max_gpu_detail):
+                _max_gpu_detail = _ngpus
+
+    # Build per-node GPU count from usageByNode (Ray knows how many GPUs
+    # each node registered via --num-gpus, which is the correct count for
+    # NVLink clusters where nvidia-smi shows ALL GPUs on every node).
+    _node_gpu_total_by_id: dict[str, int] = {}
+    for _nid, _nu in node_gpu_usage.items():
+        _gt = _nu.get("gpu_total", 0)
+        if _gt > 0:
+            _node_gpu_total_by_id[_nid] = _gt
+
+    # Prune stale entries from the team's gpu-status cache (older than 30s).
+    _status_ts_fresh = {k: v for k, v in _gpu_status_cache.items() if now - v.get("ts", 0) < 30}
+
+    # 4. Get per-node details from nodes?view=summary
+    try:
+        ns = _req.get(f"{RAY_URL}/nodes?view=summary", timeout=5).json()
+        for n_idx, n in enumerate(ns.get("data", {}).get("summary", [])):
+            hn = n.get("hostname", "?")
+            if hn.startswith("?"):
+                continue
+            ip = n.get("ip", "")
+            cpu_pct = n.get("cpu", 0)
+            mem_info = n.get("mem", [0, 0, 0, 0])
+            mem_total = mem_info[1] if len(mem_info) > 1 else 0
+            mem_used = mem_info[3] if len(mem_info) > 3 else 0
+
+            # GPU count: prefer Ray's per-node total from usageByNode,
+            # then resourcesTotal, then worker slots (in that order).
+            node_id = n.get("raylet", {}).get("nodeId", "")
+            gpus_from_ray = _node_gpu_total_by_id.get(node_id, 0)
+            gpus_from_resources = round(n.get("raylet", {}).get("resourcesTotal", {}).get("GPU", 0))
+            gpu_count = gpus_from_ray or gpus_from_resources or 0
+
+            # Per-GPU detail: prefer the team's gpu-status (already filtered
+            # to Ray-managed GPUs and keyed by ray_node_index). Fall back to
+            # the local sidecar slice (works for NVLink, wrong for heterogeneous
+            # clusters) and finally to an empty list.
+            node_gpus_detail: list = []
+            node_gpu_util = 0.0
+            rni = n.get("raylet", {}).get("nodeIndex") if isinstance(n.get("raylet"), dict) else None
+            # Try a few ways to match: explicit ray_node_index from the team's
+            # feed, then n_idx (positional match), then IP.
+            status_match = _status_ts_fresh.get(n_idx)
+            if status_match is None and ip:
+                for v in _status_ts_fresh.values():
+                    if v.get("internal_ip") == ip:
+                        status_match = v
+                        break
+            if status_match:
+                node_gpus_detail = status_match.get("gpus", [])
+                if node_gpus_detail:
+                    node_gpu_util = round(
+                        sum(g["activity_pct"] for g in node_gpus_detail) / len(node_gpus_detail), 1
+                    )
+            elif _max_gpu_detail and gpu_count > 0:
+                # Legacy fallback: slice the longest sidecar array. Correct
+                # only for NVLink clusters where every node sees every GPU.
+                node_gpus_detail = _max_gpu_detail[:gpu_count]
+                if _cluster_gpu_util > 0:
+                    node_gpu_util = _cluster_gpu_util
+
+            nodes_data.append({
+                "hostname": hn,
+                "ip": ip,
+                "cpu_pct": round(cpu_pct, 1),
+                "mem_total_bytes": mem_total,
+                "mem_used_bytes": mem_used,
+                "gpus_allocated": gpu_count,
+                "gpu_util_pct": round(node_gpu_util, 1),
+                "gpus_detail": node_gpus_detail,
+            })
+    except Exception:
+        pass
+
+    # Cluster-wide activity: prefer the team's data (which uses
+    # power-based activity estimation), fall back to sidecar cluster avg.
+    team_activity_values = []
+    for v in _status_ts_fresh.values():
+        for g in v.get("gpus", []):
+            team_activity_values.append(g.get("activity_pct", 0))
+    if team_activity_values:
+        cluster_gpu_util = round(sum(team_activity_values) / len(team_activity_values), 1)
+        gpu_active_count = len(team_activity_values)
+    else:
+        cluster_gpu_util = _cluster_gpu_util
+        gpu_active_count = len(_max_gpu_detail)
+
+    result = {
+        "gpus_allocated": total_gpu_allocated,
+        "gpus_total": total_gpu_count or len(nodes_data),
+        "cpu_pct": round(total_cpu_pct, 1),
+        "nodes": nodes_data,
+        "cluster": {
+            "gpu_allocation_pct": round(total_gpu_allocated / total_gpu_count * 100, 1) if total_gpu_count else 0,
+            "gpu_util_pct": cluster_gpu_util,
+            "gpu_active_count": gpu_active_count,
+            "gpu_total_count": total_gpu_count or 0,
+        },
+    }
+    _gpu_stats_cache.update(ts=now, data=result)
+    return result
+
+
+@app.post("/api/deploy")
+async def deploy_model_generic(body: dict):
+    """Generic deploy endpoint used by test-all and DeployModels.
+    Accepts { job_id, model_id, model_name, provider }."""
+    job_id     = body.get("job_id", "") or body.get("model_id", "")
+    model_name = body.get("model_name", "")
+    provider   = body.get("provider", "ray")
+
+    if provider == "ray":
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, status, ray_serve_url, inference_provider FROM jobs WHERE id=? OR model_name=? ORDER BY created_at DESC LIMIT 1",
+                (job_id, model_name),
+            ).fetchone()
+        if row and row["status"] == "completed":
+            if row["inference_provider"] == "ray" and row["ray_serve_url"]:
+                return {"status": "running", "url": row["ray_serve_url"]}
+            return await deploy_model_to_ray(row["id"], body)
+        raise HTTPException(404, f"No completed training job found for model '{model_name}' (id={job_id})")
+    raise HTTPException(400, f"Provider '{provider}' not supported via /api/deploy. Use /api/jobs/{{id}}/deploy-ray directly.")
 
 
 @app.post("/api/jobs/{job_id}/deploy-ray")
@@ -6990,20 +8000,35 @@ def model_deploy_stop(job_id: str):
     try:
         import requests as _req
         import base64 as _b64lib
+        # Stronger kill: no_restart=True (otherwise Ray's supervisor may
+        # respawn the actor on the next health probe) + a follow-up
+        # ray.get_actor() check to confirm the death actually stuck
+        # before returning. The previous plain ray.kill() reported
+        # KILLED but the actor state stayed ALIVE for minutes, which
+        # let stale deploys keep holding GPU resources.
         _kill_script = (
-            "import ray, sys\n"
+            "import ray, sys, time, os\n"
             "ray.init(address='auto', ignore_reinit_error=True, log_to_driver=False)\n"
-            f"actor_name = {_actor_name!r}\n"
+            "actor_name = os.environ.get('ACTOR_NAME','')\n"
+            "if not actor_name:\n"
+            "    print('NO_ACTOR_NAME', flush=True); sys.exit(1)\n"
             "try:\n"
             "    actor = ray.get_actor(actor_name, namespace='default')\n"
-            "    ray.kill(actor)\n"
-            "    print('KILLED:' + actor_name, flush=True)\n"
+            "    print(f'FOUND:{actor_name}', flush=True)\n"
+            "    ray.kill(actor, no_restart=True)\n"
+            "    print(f'KILLED:{actor_name}', flush=True)\n"
+            "    time.sleep(2)\n"
+            "    try:\n"
+            "        ray.get_actor(actor_name, namespace='default')\n"
+            "        print(f'STILL_ALIVE:{actor_name}', flush=True)\n"
+            "    except Exception:\n"
+            "        print(f'CONFIRMED_DEAD:{actor_name}', flush=True)\n"
             "except Exception as e:\n"
             "    print(f'NOT_FOUND:{e}', flush=True)\n"
         )
         _b64 = _b64lib.b64encode(_kill_script.encode()).decode()
         _payload = {
-            "entrypoint": f"bash -c 'echo {_b64} | base64 -d > /tmp/kill_actor.py && python3 /tmp/kill_actor.py'",
+            "entrypoint": f"bash -c 'echo {_b64} | base64 -d > /tmp/kill_actor.py && ACTOR_NAME={actor_name} python3 /tmp/kill_actor.py'",
             "runtime_env": {},
         }
         # Use the same dashboard URL as deploy
@@ -7025,8 +8050,12 @@ def model_deploy_stop(job_id: str):
             _lr = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=10)
             if _lr.ok:
                 _lt = _lr.json().get("logs", "")
-                if "KILLED:" in _lt:
-                    logs.append(f"[stop] Actor '{actor_name}' killed successfully")
+                if "CONFIRMED_DEAD:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' killed + confirmed dead")
+                elif "KILLED:" in _lt and "STILL_ALIVE:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' kill reported but state stayed ALIVE — Ray supervisor didn't reap")
+                elif "KILLED:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' killed (verification inconclusive)")
                 elif "NOT_FOUND:" in _lt:
                     logs.append(f"[stop] Actor '{actor_name}' not found (already stopped)")
                 else:
@@ -7035,6 +8064,33 @@ def model_deploy_stop(job_id: str):
             logs.append(f"[stop] Could not fetch kill job logs: {_e}")
     except Exception as e:
         logs.append(f"[stop] warning: {e}")
+    # After the actor is killed, wait until a GPU is actually free
+    # on the cluster. The kill completes on Ray's side but the resource
+    # accounting + actor reaping is async — without this wait the next
+    # training job submitted right after the stop API returns would
+    # still see "GPU: 4/4 used" and get stuck in PENDING. The test-all
+    # bulk loop calls this endpoint between every iteration precisely
+    # so we hold the loop until a GPU slot opens up.
+    try:
+        import requests as _req2
+        for _wait_i in range(30):  # up to ~30s
+            time.sleep(1)
+            _cs = _req2.get(f"{RAY_URL}/api/cluster_status", timeout=4).json()
+            _ru = _cs.get("data", {}).get("autoscalingStatus", "")
+            # ResourceUsage: 7.0/240.0 CPU, 4.0/4.0 GPU, ...
+            try:
+                _gpu_chunk = _ru.split("ResourceUsage:")[1].split("\n")[0]
+                _used_g = float(_gpu_chunk.split("GPU,")[0].rsplit(" ", 1)[-1])
+                _total_g = float(_gpu_chunk.split("GPU,")[1].split(" ", 1)[0].rstrip("/"))
+                if _used_g < _total_g:
+                    logs.append(f"[stop] GPU available: {_used_g}/{_total_g} (waited {_wait_i+1}s)")
+                    break
+            except Exception:
+                pass
+        else:
+            logs.append("[stop] GPU still not free after 30s — caller may see PENDING")
+    except Exception as _e:
+        logs.append(f"[stop] GPU-wait check failed (non-fatal): {_e}")
     # Clear DB state
     with get_db() as conn:
         conn.execute(

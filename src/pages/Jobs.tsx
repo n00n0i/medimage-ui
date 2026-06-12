@@ -1,6 +1,6 @@
 
 import { useState, useEffect, useRef } from 'react'
-import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square, Wifi, Database, Send, Brain, Save, Package, ShieldCheck, RotateCcw, Copy, Check } from 'lucide-react'
+import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square, Wifi, Database, Send, Brain, Save, Package, ShieldCheck, RotateCcw, Copy, Check, StopCircle } from 'lucide-react'
 import GpuMonitor from '../components/GpuMonitor'
 
 interface Job {
@@ -133,10 +133,12 @@ export default function Jobs() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [deletingBulk, setDeletingBulk] = useState(false)
   const [retrying, setRetrying] = useState<Set<string>>(new Set())
+  const [stopping, setStopping] = useState<Set<string>>(new Set())
   const [copiedError, setCopiedError] = useState<string | null>(null)
   const [logJob, setLogJob] = useState<{id: string; name: string} | null>(null)
   const [logText, setLogText] = useState<string>('')
   const [logLoading, setLogLoading] = useState(false)
+  const [logCopied, setLogCopied] = useState(false)
   const logRef = useRef<HTMLPreElement>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -203,8 +205,6 @@ export default function Jobs() {
     try {
       const res = await fetch(`/api/jobs/${jobId}/retry`, { method: 'POST' })
       if (!res.ok) {
-        // Surface the API's preflight error message in full — it tells the
-        // user which env var to set on the medimage-api container.
         let body: any = null
         try { body = await res.json() } catch { body = { detail: await res.text() } }
         const detail = (body && (body.detail || body.error)) || `HTTP ${res.status}`
@@ -214,6 +214,24 @@ export default function Jobs() {
       await fetchJobs(true)
     } finally {
       setRetrying(prev => { const s = new Set(prev); s.delete(jobId); return s })
+    }
+  }
+
+  const stopJob = async (jobId: string) => {
+    const job = jobs.find((j: Job) => j.id === jobId)
+    if (!confirm(`หยุยก job "${job?.name ?? jobId}"?\n\nJob จะถูกตั้งสถานะเป็น error (Cancelled by user)`)) return
+    setStopping(prev => new Set([...prev, jobId]))
+    try {
+      const res = await fetch(`/api/jobs/${jobId}?from_view=jobs`, { method: 'DELETE' })
+      if (!res.ok) {
+        let body: any = null
+        try { body = await res.json() } catch { body = { detail: await res.text() } }
+        alert(`Cannot stop ${jobId}:\n\n${body?.detail || `HTTP ${res.status}`}`)
+        return
+      }
+      await fetchJobs(true)
+    } finally {
+      setStopping(prev => { const s = new Set(prev); s.delete(jobId); return s })
     }
   }
 
@@ -428,7 +446,18 @@ export default function Jobs() {
                       Retry
                     </button>
                   )}
-                  {job.status !== 'running' && (
+                  {(job.status === 'running' || job.status === 'queued') && (
+                    <button
+                      className="btn btn-sm"
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--danger)', color: '#fff', border: 'none' }}
+                      onClick={() => stopJob(job.id)}
+                      disabled={stopping.has(job.id)}
+                    >
+                      {stopping.has(job.id) ? <Loader size={13} className="animate-spin" /> : <StopCircle size={13} />}
+                      Stop
+                    </button>
+                  )}
+                  {job.status !== 'running' && job.status !== 'queued' && (
                     <button className="btn btn-secondary btn-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger)' }} onClick={() => deleteJob(job.id)}>
                       <Trash2 size={13} /> Delete
                     </button>
@@ -462,6 +491,20 @@ export default function Jobs() {
                 <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>{logJob.name}</p>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                  onClick={() => {
+                    navigator.clipboard.writeText(logText).then(() => {
+                      setLogCopied(true)
+                      setTimeout(() => setLogCopied(false), 1500)
+                    }).catch(() => { /* clipboard blocked */ })
+                  }}
+                  title="Copy full log to clipboard"
+                >
+                  {logCopied ? <Check size={13} /> : <Copy size={13} />}
+                  {logCopied ? 'Copied' : 'Copy'}
+                </button>
                 <button className="btn btn-secondary btn-sm" onClick={() => fetchLog(logJob.id)}>
                   {logLoading ? <Loader size={13} className="animate-spin" /> : <RefreshCw size={13} />}
                 </button>

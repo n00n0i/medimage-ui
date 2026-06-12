@@ -96,6 +96,20 @@ services:
       - api-data:/data
     restart: unless-stopped
 
+  # Pushes real GPU utilization (nvidia-smi) to medimage-api every 10s.
+  # Deploy one instance on each GPU node with:  deploy: placement: constraints: [node.labels.gpu == true]
+  gpu-monitor:
+    build: ./gpu-monitor
+    environment:
+      - GPU_UTIL_API_URL=http://medimage-api:8000/api/gpu-util
+      - GPU_UTIL_INTERVAL=10
+    deploy:
+      mode: daemon          # one per node
+      placement:
+        constraints:
+          - node.labels.gpu == true
+    restart: unless-stopped
+
   jupyter:
     image: quay.io/jupyter/scipy-notebook:latest
     environment:

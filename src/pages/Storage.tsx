@@ -7,9 +7,11 @@ import {
 import {
   listBuckets, listObjects, createBucket as s3CreateBucket,
   deleteBucket as s3DeleteBucket, deleteObject as s3DeleteObject,
-  copyObject as s3CopyObject, uploadObject as s3UploadObject, fetchDiskInfo,
+  deleteObjects as s3DeleteObjects, deletePrefix as s3DeletePrefix,
+  copyObject as s3CopyObject,
+  uploadObject as s3UploadObject, fetchDiskInfo,
   loadMinioConfig, saveMinioConfig, MINIO_DEFAULTS,
-  type ObjectInfo, type DiskInfo,
+  type ObjectInfo, type DirInfo, type DiskInfo,
 } from '../lib/minioClient'
 
 /* ── Types ──────────────────────────────────────────────────── */
@@ -20,7 +22,7 @@ interface Bucket {
   sizeBytes: number | null
 }
 
-type ModalState = 'none' | 'settings' | 'create-bucket' | 'upload' | 'delete-bucket' | 'delete-object' | 'clear-bucket' | 'rename-bucket'
+type ModalState = 'none' | 'settings' | 'create-bucket' | 'upload' | 'delete-bucket' | 'delete-object' | 'delete-prefix' | 'bulk-delete' | 'clear-bucket' | 'rename-bucket'
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 function fmtSize(bytes: number) {
@@ -65,6 +67,78 @@ function StatCard({ label, value, sub, icon }: {
   )
 }
 
+/* ── Delete-prefix modal ───────────────────────────────────────── */
+function DeletePrefixModal({ bucket, prefix, onClose, onConfirm }: {
+  bucket: string
+  prefix: string
+  onClose: () => void
+  onConfirm: () => void | Promise<void>
+}) {
+  const [scanning, setScanning] = useState(true)
+  const [objectCount, setObjectCount] = useState(0)
+  const [totalBytes, setTotalBytes]   = useState(0)
+  const [error, setError]             = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { objects } = await listObjects(bucket, prefix, '')
+        if (cancelled) return
+        setObjectCount(objects.length)
+        setTotalBytes(objects.reduce((s, o) => s + (o.size ?? 0), 0))
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message ?? 'Failed to enumerate directory')
+      } finally {
+        if (!cancelled) setScanning(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [bucket, prefix])
+
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+        <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--danger-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+          <AlertTriangle size={18} style={{ color: 'var(--danger)' }} />
+        </div>
+        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Delete Directory</h3>
+      </div>
+      <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 12, lineHeight: 1.5 }}>
+        Permanently delete the directory{' '}
+        <strong style={{ color: 'var(--primary-hover)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{prefix}</strong>{' '}
+        and <strong style={{ color: 'var(--text-primary)' }}>all of its contents</strong> from <strong style={{ color: 'var(--text-primary)' }}>{bucket}</strong>?
+      </p>
+      <div style={{ background: 'var(--bg-surface)', borderRadius: 6, padding: '8px 12px', marginBottom: 18, border: '1px solid var(--border-subtle)', fontSize: 12, color: 'var(--text-secondary)' }}>
+        {scanning ? (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="loading-spinner" style={{ width: 12, height: 12 }} />Scanning contents…
+          </span>
+        ) : error ? (
+          <span style={{ color: 'var(--danger)' }}>⚠ {error}</span>
+        ) : (
+          <>
+            <strong style={{ color: 'var(--text-primary)' }}>{objectCount.toLocaleString()}</strong> object{objectCount !== 1 ? 's' : ''}
+            {totalBytes > 0 && <> · {fmtSize(totalBytes)}</>}
+            {' '}will be deleted.
+          </>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+        <button className="btn btn-secondary" onClick={onClose} disabled={scanning}>Cancel</button>
+        <button
+          className="btn btn-primary"
+          style={{ background: 'var(--danger)', borderColor: 'var(--danger)' }}
+          disabled={scanning || !!error}
+          onClick={onConfirm}
+        >
+          <Trash2 size={13} />Delete Directory
+        </button>
+      </div>
+    </>
+  )
+}
+
 /* ── Main Component ──────────────────────────────────────────── */
 export default function Storage() {
   const [buckets, setBuckets]         = useState<Bucket[]>([])
@@ -96,6 +170,9 @@ export default function Storage() {
   const [expandedBuckets, setExpandedBuckets] = useState<Set<string>>(new Set())
   const [bucketDirs, setBucketDirs]   = useState<Record<string, string[]>>({})
   const [dirsLoading, setDirsLoading] = useState<Set<string>>(new Set())
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
+  const [currentDirs, setCurrentDirs] = useState<DirInfo[]>([])
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const fileRef                       = useRef<HTMLInputElement>(null)
 
   /* ── Toast helper ─────────────────────────────────────────── */
@@ -116,10 +193,10 @@ export default function Storage() {
       // Lazy-load object counts in background
       raw.forEach(async (b) => {
         try {
-          const objs = await listObjects(b.name)
-          const totalBytes = objs.reduce((s, o) => s + o.size, 0)
-          setBuckets(prev => prev.map(x => x.name === b.name
-            ? { ...x, objectCount: objs.length, sizeBytes: totalBytes }
+           const { objects: objs } = await listObjects(b.name)
+           const totalBytes = objs.reduce((s, o) => s + o.size, 0)
+           setBuckets(prev => prev.map(x => x.name === b.name
+             ? { ...x, objectCount: objs.length, sizeBytes: totalBytes }
             : x
           ))
         } catch { /* ignore per-bucket errors */ }
@@ -140,11 +217,14 @@ export default function Storage() {
   /* ── Fetch objects ────────────────────────────────────────── */
   const fetchObjects = useCallback(async (bucket: string, p = '') => {
     setObjLoading(true)
+    setSelectedKeys(new Set())
     try {
-      const data = await listObjects(bucket, p)
+      const { objects: data, dirs } = await listObjects(bucket, p, '/')
       setObjects(data)
+      setCurrentDirs(dirs)
     } catch {
       setObjects([])
+      setCurrentDirs([])
     } finally {
       setObjLoading(false)
     }
@@ -208,6 +288,7 @@ export default function Storage() {
     setSelectedBucket(name)
     setPrefix('')
     setSearch('')
+    setCurrentDirs([])
     fetchObjects(name, '')
   }
 
@@ -216,6 +297,8 @@ export default function Storage() {
     setObjects([])
     setPrefix('')
     setSearch('')
+    setCurrentDirs([])
+    setSelectedKeys(new Set())
   }
 
   /* ── Toggle bucket directory expand ─────────────────────── */
@@ -228,15 +311,18 @@ export default function Storage() {
     if (bucketDirs[name]) return // already loaded
     setDirsLoading(prev => new Set([...prev, name]))
     try {
-      const objs = await listObjects(name)
-      // Extract unique top-level prefixes (directories)
-      const dirs = [...new Set(
-        objs
-          .map(o => o.key.includes('/') ? o.key.split('/')[0] : null)
-          .filter(Boolean) as string[]
-      )].sort()
-      // Files at root (no directory)
-      setBucketDirs(prev => ({ ...prev, [name]: dirs }))
+       const { objects: objs, dirs: subDirs } = await listObjects(name, '', '/')
+       // Extract unique top-level prefixes (directories)
+       const prefixDirs = subDirs.map(d => d.prefix.replace(/\/$/, '')).sort()
+       // Also check objects for any keys with /
+       const objDirs = [...new Set(
+         objs
+           .map(o => o.key.includes('/') ? o.key.split('/')[0] : null)
+           .filter(Boolean) as string[]
+       )]
+       const dirs = [...new Set([...prefixDirs, ...objDirs])].sort()
+       // Files at root (no directory)
+       setBucketDirs(prev => ({ ...prev, [name]: dirs }))
     } catch {
       setBucketDirs(prev => ({ ...prev, [name]: [] }))
     } finally {
@@ -266,7 +352,7 @@ export default function Storage() {
     setRenameLoading(true)
     try {
       await s3CreateBucket(newName)
-      const objs = await listObjects(renamingBucket)
+      const { objects: objs } = await listObjects(renamingBucket)
       if (objs.length > 0) {
         await Promise.all(objs.map(o => s3CopyObject(renamingBucket, o.key, newName, o.key)))
         await Promise.all(objs.map(o => s3DeleteObject(renamingBucket, o.key)))
@@ -289,7 +375,7 @@ export default function Storage() {
   async function clearBucket(name: string) {
     setClearing(true)
     try {
-      const objs = await listObjects(name)
+      const { objects: objs } = await listObjects(name)
       await Promise.all(objs.map(o => s3DeleteObject(name, o.key)))
       showToast(`Cleared ${objs.length} object${objs.length !== 1 ? 's' : ''} from "${name}"`)
       setModal('none')
@@ -306,7 +392,7 @@ export default function Storage() {
   /* ── Delete bucket ────────────────────────────────────────── */
   async function deleteBucket(name: string) {
     try {      // S3 requires empty bucket before deletion — auto-clear first
-      const objs = await listObjects(name)
+      const { objects: objs } = await listObjects(name)
       if (objs.length > 0) {
         await Promise.all(objs.map(o => s3DeleteObject(name, o.key)))
       }      await s3DeleteBucket(name)
@@ -330,6 +416,49 @@ export default function Storage() {
       fetchObjects(bucket, prefix)
     } catch (e: any) {
       showToast(e?.message ?? 'Failed to delete object', 'err')
+    }
+  }
+
+  /** Bulk delete: expands any selected directory prefixes into their full
+   *  list of object keys, then deletes everything in a single batched call. */
+  async function bulkDeleteSelected(bucket: string) {
+    setBulkDeleting(true)
+    try {
+      const fileKeys: string[]  = []
+      const dirPrefixes: string[] = []
+      for (const item of selectedKeys) {
+        if (item.endsWith('/')) dirPrefixes.push(item)
+        else fileKeys.push(item)
+      }
+
+      // Expand each selected directory to its full key list.
+      const dirKeys: string[] = []
+      let dirFileCount = 0
+      for (const p of dirPrefixes) {
+        const { objects } = await listObjects(bucket, p, '')
+        dirKeys.push(...objects.map(o => o.key))
+        dirFileCount += objects.length
+      }
+      const allKeys = [...fileKeys, ...dirKeys]
+      if (allKeys.length === 0) {
+        showToast('Nothing to delete', 'err')
+        return
+      }
+      await s3DeleteObjects(bucket, allKeys)
+
+      const parts: string[] = []
+      if (fileKeys.length)  parts.push(`${fileKeys.length} file${fileKeys.length !== 1 ? 's' : ''}`)
+      if (dirPrefixes.length) parts.push(`${dirPrefixes.length} director${dirPrefixes.length !== 1 ? 'ies' : 'y'} (${dirFileCount} file${dirFileCount !== 1 ? 's' : ''})`)
+      showToast(`Deleted ${parts.join(' + ')}`)
+
+      setSelectedKeys(new Set())
+      setModal('none')
+      setDeleteTarget(null)
+      fetchObjects(bucket, prefix)
+    } catch (e: any) {
+      showToast(e?.message ?? 'Bulk delete failed', 'err')
+    } finally {
+      setBulkDeleting(false)
     }
   }
 
@@ -393,7 +522,19 @@ export default function Storage() {
   /* ── Derived ──────────────────────────────────────────────── */
   const totalObjects  = buckets.reduce((s, b) => s + (b.objectCount ?? 0), 0)
   const totalSizeBytes = buckets.reduce((s, b) => s + (b.sizeBytes ?? 0), 0)
-  const filteredObjs  = objects.filter(o => o.key.toLowerCase().includes(search.toLowerCase()))
+  const prefixParts = prefix ? prefix.split('/').filter(Boolean) : []
+  const prefixPath = prefixParts.map((p, i) => ({ label: p, prefix: prefixParts.slice(0, i + 1).join('/') + '/' }))
+  const filteredObjs  = objects
+    .filter(o => !prefix || o.key === prefix || o.key.startsWith(prefix))
+    .filter(o => o.key.toLowerCase().includes(search.toLowerCase()))
+  // The selectable set = file keys (no trailing /) + dir prefixes (trailing /).
+  // These two namespaces never collide, so we can put them in the same Set.
+  const dirPrefixes = currentDirs.map(d => d.prefix)
+  const allKeys = [...filteredObjs.map(o => o.key), ...dirPrefixes]
+  const allSelected = allKeys.length > 0 && allKeys.every(k => selectedKeys.has(k))
+  const someSelected = selectedKeys.size > 0 && !allSelected
+  const selectedDirCount = [...selectedKeys].filter(k => k.endsWith('/')).length
+  const selectedFileCount = selectedKeys.size - selectedDirCount
 
   /* ── Render ──────────────────────────────────────────────────*/
   if (loading) {
@@ -519,7 +660,7 @@ export default function Storage() {
               const freePct = Math.min(100, (diskInfo.freeBytes / diskInfo.totalBytes) * 100)
               return (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
-                  Disk: <span style={{ color: freePct < 15 ? 'var(--danger)' : freePct < 30 ? 'oklch(0.75 0.15 60)' : 'var(--success)', fontWeight: 500 }}>
+                  Disk: <span style={{ color: freePct < 15 ? 'var(--danger)' : freePct < 30 ? 'rgb(255,207,217)' : 'var(--success)', fontWeight: 500 }}>
                     {fmtSize(diskInfo.freeBytes)} free
                   </span>
                   {' '}/ {fmtSize(diskInfo.totalBytes)}
@@ -635,7 +776,7 @@ export default function Storage() {
                             <button
                               title="Clear all objects (bucket is used by a Dataset)"
                               className="btn btn-secondary"
-                              style={{ fontSize: 11, padding: '3px 8px', color: 'var(--warning, oklch(0.75 0.15 60))' }}
+                              style={{ fontSize: 11, padding: '3px 8px', color: 'var(--warning, rgb(255,207,217))' }}
                               onClick={() => { setDeleteTarget({ bucket: b.name }); setModal('clear-bucket') }}
                             >
                               <Eraser size={11} />
@@ -677,7 +818,7 @@ export default function Storage() {
                                   key={dir}
                                   className="btn btn-secondary"
                                   style={{ fontSize: 11, padding: '4px 10px', fontFamily: 'var(--font-mono)', display: 'flex', alignItems: 'center', gap: 5 }}
-                                  onClick={() => { openBucket(b.name); setPrefix(dir + '/'); fetchObjects(b.name, dir + '/') }}
+                                  onClick={() => { openBucket(b.name); setTimeout(() => { setPrefix(dir + '/'); fetchObjects(b.name, dir + '/') }, 0) }}
                                 >
                                   <Folder size={11} style={{ color: 'var(--primary-hover)' }} />{dir}/
                                 </button>
@@ -699,6 +840,32 @@ export default function Storage() {
       {/* ── Object browser ─────────────────────────────────── */}
       {selectedBucket && (
         <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+          {/* Breadcrumb */}
+          {prefix && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '10px 18px', borderBottom: '1px solid var(--border-subtle)', fontSize: 12, flexWrap: 'wrap' }}>
+              <button
+                onClick={() => { setPrefix(''); fetchObjects(selectedBucket, '') }}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary-hover)', fontWeight: 500, fontSize: 12, padding: 0 }}
+              >
+                {selectedBucket}
+              </button>
+              {prefixPath.map((pp, i) => (
+                <span key={pp.prefix} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <ChevronRight size={12} style={{ color: 'var(--text-muted)' }} />
+                  {i < prefixPath.length - 1 ? (
+                    <button
+                      onClick={() => { setPrefix(pp.prefix); fetchObjects(selectedBucket, pp.prefix) }}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary-hover)', fontSize: 12, padding: 0 }}
+                    >
+                      {pp.label}
+                    </button>
+                  ) : (
+                    <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{pp.label}</span>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
           {/* Toolbar */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 18px', borderBottom: '1px solid var(--border-subtle)' }}>
             <div style={{ position: 'relative', flex: 1, maxWidth: 320 }}>
@@ -712,8 +879,20 @@ export default function Storage() {
                 style={{ paddingLeft: 30, fontSize: 12, height: 30 }}
               />
             </div>
+            {selectedKeys.size > 0 && (
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: 12, padding: '4px 12px', color: 'var(--danger)', borderColor: 'var(--danger)', whiteSpace: 'nowrap' }}
+                disabled={bulkDeleting}
+                onClick={() => { setDeleteTarget({ bucket: selectedBucket, key: undefined }); setModal('bulk-delete') }}
+              >
+                {bulkDeleting
+                  ? <><div className="loading-spinner" style={{ width: 12, height: 12 }} />Deleting…</>
+                  : <><Trash2 size={12} />Delete {selectedFileCount > 0 && `${selectedFileCount} file${selectedFileCount !== 1 ? 's' : ''}`}{selectedFileCount > 0 && selectedDirCount > 0 && ' + '}{selectedDirCount > 0 && `${selectedDirCount} dir${selectedDirCount !== 1 ? 's' : ''}`}</>}
+              </button>
+            )}
             <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 'auto' }}>
-              {filteredObjs.length} object{filteredObjs.length !== 1 ? 's' : ''}
+              {(currentDirs.length + filteredObjs.length)} item{(currentDirs.length + filteredObjs.length) !== 1 ? 's' : ''}
             </span>
           </div>
 
@@ -721,7 +900,7 @@ export default function Storage() {
             <div style={{ padding: 48, textAlign: 'center' }}>
               <div className="loading-spinner" style={{ margin: '0 auto' }} />
             </div>
-          ) : filteredObjs.length === 0 ? (
+          ) : (currentDirs.length === 0 && filteredObjs.length === 0) ? (
             <div style={{ padding: 48, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
               <File size={28} style={{ margin: '0 auto 10px', opacity: 0.4 }} />
               {search ? 'No objects match the filter' : 'This bucket is empty — upload files to get started'}
@@ -730,24 +909,101 @@ export default function Storage() {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                  <th style={{ padding: '8px 10px', textAlign: 'left', width: 30 }}>
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={el => { if (el) el.indeterminate = someSelected }}
+                      onChange={() => {
+                        if (allSelected) setSelectedKeys(new Set())
+                        else setSelectedKeys(new Set(allKeys))
+                      }}
+                      style={{ cursor: 'pointer' }}
+                      title="Select all (files + directories)"
+                    />
+                  </th>
                   {['Name', 'Size', 'Modified', ''].map(h => (
                     <th key={h} style={{ padding: '8px 18px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
+                {currentDirs.map(dir => {
+                  const dirSelected = selectedKeys.has(dir.prefix)
+                  return (
+                    <tr
+                      key={dir.prefix}
+                      style={{ borderBottom: '1px solid var(--border-subtle)', cursor: 'pointer', transition: 'background 0.15s', background: dirSelected ? 'var(--primary-dim)' : undefined }}
+                      onMouseEnter={e => { if (!dirSelected) e.currentTarget.style.background = 'var(--bg-elevated)' }}
+                      onMouseLeave={e => { if (!dirSelected) e.currentTarget.style.background = '' }}
+                      onClick={() => { setPrefix(dir.prefix); fetchObjects(selectedBucket, dir.prefix) }}
+                    >
+                      <td style={{ padding: '10px 10px' }} onClick={e => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={dirSelected}
+                          onChange={() => {
+                            setSelectedKeys(prev => {
+                              const next = new Set(prev)
+                              if (next.has(dir.prefix)) next.delete(dir.prefix)
+                              else next.add(dir.prefix)
+                              return next
+                            })
+                          }}
+                          style={{ cursor: 'pointer' }}
+                          title="Select this directory (deleting will remove all contents)"
+                        />
+                      </td>
+                      <td style={{ padding: '10px 18px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <Folder size={14} style={{ color: 'var(--primary-hover)' }} />
+                          <span style={{ fontSize: 12.5, color: 'var(--primary-hover)', fontWeight: 500, fontFamily: 'var(--font-mono)' }}>
+                            {dir.prefix.replace(/\/$/, '').split('/').pop()}/
+                          </span>
+                        </div>
+                      </td>
+                      <td style={{ padding: '10px 18px', fontSize: 12, color: 'var(--text-muted)' }}>—</td>
+                      <td style={{ padding: '10px 18px', fontSize: 12, color: 'var(--text-muted)' }}>—</td>
+                      <td style={{ padding: '10px 18px', textAlign: 'right' }} onClick={e => e.stopPropagation()}>
+                        <button
+                          title="Delete directory and all its contents"
+                          className="btn btn-secondary"
+                          style={{ fontSize: 11, padding: '3px 8px', color: 'var(--danger)' }}
+                          onClick={() => { setDeleteTarget({ bucket: selectedBucket, key: dir.prefix }); setModal('delete-prefix') }}
+                        >
+                          <Trash2 size={11} />
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                })}
                 {filteredObjs.map(obj => (
                   <tr
                     key={obj.key}
-                    style={{ borderBottom: '1px solid var(--border-subtle)', transition: 'background 0.15s' }}
-                    onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-elevated)')}
-                    onMouseLeave={e => (e.currentTarget.style.background = '')}
+                    style={{ borderBottom: '1px solid var(--border-subtle)', transition: 'background 0.15s', background: selectedKeys.has(obj.key) ? 'var(--primary-dim)' : undefined }}
+                    onMouseEnter={e => { if (!selectedKeys.has(obj.key)) e.currentTarget.style.background = 'var(--bg-elevated)' }}
+                    onMouseLeave={e => { if (!selectedKeys.has(obj.key)) e.currentTarget.style.background = '' }}
                   >
+                    <td style={{ padding: '10px 10px' }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedKeys.has(obj.key)}
+                        onChange={() => {
+                          setSelectedKeys(prev => {
+                            const next = new Set(prev)
+                            if (next.has(obj.key)) next.delete(obj.key)
+                            else next.add(obj.key)
+                            return next
+                          })
+                        }}
+                        style={{ cursor: 'pointer' }}
+                      />
+                    </td>
                     <td style={{ padding: '10px 18px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         {fileIcon(obj.key)}
                         <span style={{ fontSize: 12.5, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {obj.key}
+                          {prefix ? obj.key.slice(prefix.length) : obj.key}
                         </span>
                       </div>
                     </td>
@@ -788,7 +1044,7 @@ export default function Storage() {
       {/* ── Modals ─────────────────────────────────────────────*/}
       {modal !== 'none' && (
         <div
-          style={{ position: 'fixed', inset: 0, background: 'oklch(0 0 0 / 0.6)', zIndex: 'var(--z-modal-bg)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 'var(--z-modal-bg)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
           onClick={() => setModal('none')}
         >
           <div
@@ -901,8 +1157,8 @@ export default function Storage() {
             {modal === 'clear-bucket' && deleteTarget && (
               <>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-                  <div style={{ width: 36, height: 36, borderRadius: 8, background: 'oklch(0.25 0.05 60)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <Eraser size={18} style={{ color: 'oklch(0.75 0.15 60)' }} />
+                  <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgb(164,126,132)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <Eraser size={18} style={{ color: 'rgb(255,207,217)' }} />
                   </div>
                   <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Clear Bucket</h3>
                 </div>
@@ -916,7 +1172,7 @@ export default function Storage() {
                   <button className="btn btn-secondary" onClick={() => setModal('none')}>Cancel</button>
                   <button
                     className="btn btn-primary"
-                    style={{ background: 'oklch(0.55 0.15 60)', borderColor: 'oklch(0.55 0.15 60)' }}
+                    style={{ background: 'rgb(240,176,189)', borderColor: 'rgb(240,176,189)' }}
                     disabled={clearing}
                     onClick={() => clearBucket(deleteTarget.bucket)}
                   >
@@ -976,6 +1232,69 @@ export default function Storage() {
                 </div>
               </>
             )}
+
+            {/* Bulk delete — files and/or directories */}
+            {modal === 'bulk-delete' && deleteTarget && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--danger-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <AlertTriangle size={18} style={{ color: 'var(--danger)' }} />
+                  </div>
+                  <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Delete {selectedFileCount} File{selectedFileCount !== 1 ? 's' : ''}{selectedDirCount > 0 ? ` + ${selectedDirCount} Director${selectedDirCount !== 1 ? 'ies' : 'y'}` : ''}</h3>
+                </div>
+                <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 12, lineHeight: 1.5 }}>
+                  Delete {selectedFileCount} file{selectedFileCount !== 1 ? 's' : ''}{selectedDirCount > 0 ? <> and <strong style={{ color: 'var(--text-primary)' }}>{selectedDirCount} director{selectedDirCount !== 1 ? 'ies' : 'y'}</strong> (including all their contents)</> : null} from <strong style={{ color: 'var(--text-primary)' }}>{deleteTarget.bucket}</strong>? This cannot be undone.
+                </p>
+                <div style={{ maxHeight: 150, overflow: 'auto', background: 'var(--bg-surface)', borderRadius: 6, padding: 8, marginBottom: 18, border: '1px solid var(--border-subtle)' }}>
+                  {[...selectedKeys].slice(0, 10).map(k => (
+                    <div key={k} style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: k.endsWith('/') ? 'var(--primary-hover)' : 'var(--text-secondary)', padding: '2px 0' }}>
+                      {k.endsWith('/') ? `📁 ${k}` : k}
+                    </div>
+                  ))}
+                  {selectedKeys.size > 10 && (
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', paddingTop: 4 }}>…and {selectedKeys.size - 10} more</div>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                  <button className="btn btn-secondary" onClick={() => setModal('none')}>Cancel</button>
+                  <button
+                    className="btn btn-primary"
+                    style={{ background: 'var(--danger)', borderColor: 'var(--danger)' }}
+                    disabled={bulkDeleting}
+                    onClick={() => bulkDeleteSelected(deleteTarget.bucket)}
+                  >
+                    {bulkDeleting ? <><div className="loading-spinner" style={{ width: 12, height: 12 }} />Deleting…</> : <><Trash2 size={13} />Delete</>}
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* Delete a single directory (and all its contents) */}
+            {modal === 'delete-prefix' && deleteTarget?.key && (() => {
+              const dirKey = deleteTarget.key
+              return (
+                <DeletePrefixModal
+                  bucket={deleteTarget.bucket}
+                  prefix={dirKey}
+                  onClose={() => setModal('none')}
+                  onConfirm={async () => {
+                    setModal('none')
+                    setBulkDeleting(true)
+                    try {
+                      const n = await s3DeletePrefix(deleteTarget.bucket, dirKey)
+                      showToast(`Deleted directory "${dirKey}" (${n} object${n !== 1 ? 's' : ''})`)
+                      setSelectedKeys(prev => { const s = new Set(prev); s.delete(dirKey); return s })
+                      fetchObjects(deleteTarget.bucket, prefix)
+                    } catch (e: any) {
+                      showToast(e?.message ?? 'Delete failed', 'err')
+                    } finally {
+                      setBulkDeleting(false)
+                      setDeleteTarget(null)
+                    }
+                  }}
+                />
+              )
+            })()}
           </div>
         </div>
       )}

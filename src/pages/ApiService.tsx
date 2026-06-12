@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import {
   Zap, Key, Copy, Trash2, Plus, RefreshCw, CheckCircle2, Code2,
   Globe, Lock, Eye, EyeOff, ExternalLink, BookOpen, Wifi, WifiOff,
@@ -136,6 +136,77 @@ function fmtDate(ts: number) {
   return new Date(ts * 1000).toLocaleDateString('th-TH', { day: '2-digit', month: 'short', year: 'numeric' })
 }
 
+// ── Model Card sub-component ───────────────────────────────────────────────
+
+function ModelCard({ m, dimmed, serveStatus, onSelect }: {
+  m: DeployedModel
+  dimmed: boolean
+  serveStatus: Record<string, boolean | null>
+  onSelect: (m: DeployedModel) => void
+}) {
+  const color = TT_COLORS[m.training_type] ?? '#6366f1'
+  const hasRay   = m.inference_provider === 'ray'   && !!m.ray_serve_url
+  const hasModal = m.inference_provider === 'modal' && !!m.modal_url
+  const hasAny   = hasRay || hasModal
+  const online = hasAny ? serveStatus[m.id] : undefined
+  const isOnline = online === true
+  const isOffline = hasAny && online === false
+  const isLoadingStatus = hasAny && online === null
+  const clickable = !dimmed && (!hasAny || isOnline)
+
+  return (
+    <button
+      onClick={() => clickable && onSelect(m)}
+      style={{
+        background: 'var(--bg-surface)', border: '1px solid var(--border-default)',
+        borderRadius: 12, padding: '18px 18px',
+        cursor: clickable ? 'pointer' : 'not-allowed',
+        opacity: dimmed ? 0.45 : isOffline ? 0.55 : 1,
+        textAlign: 'left',
+        transition: 'border-color 0.15s, box-shadow 0.15s, opacity 0.15s',
+        display: 'flex', flexDirection: 'column', gap: 12,
+      }}
+      onMouseEnter={e => { if (clickable) { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.boxShadow = `0 0 0 3px ${color}18` } }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.boxShadow = 'none' }}
+    >
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+        <div style={{ width: 42, height: 42, borderRadius: 10, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+          <Zap size={20} color={color} />
+        </div>
+        {hasRay ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, fontWeight: 700, padding: '3px 7px', borderRadius: 20, flexShrink: 0, background: '#f59e0b20', color: '#f59e0b', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Ray</div>
+        ) : hasModal ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, fontWeight: 700, padding: '3px 7px', borderRadius: 20, flexShrink: 0, background: '#8b5cf620', color: '#8b5cf6', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Modal</div>
+        ) : null}
+        {hasAny && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, padding: '3px 7px', borderRadius: 20, flexShrink: 0, background: isLoadingStatus ? 'var(--bg-elevated)' : isOnline ? '#10b98120' : '#ef444418', color: isLoadingStatus ? 'var(--text-muted)' : isOnline ? '#10b981' : '#ef4444' }}>
+            {isLoadingStatus ? (
+              <RefreshCw size={9} style={{ animation: 'spin 1s linear infinite' }} />
+            ) : isOnline ? (
+              <Wifi size={9} />
+            ) : (
+              <WifiOff size={9} />
+            )}
+            {isLoadingStatus ? '…' : isOnline ? 'Online' : 'Offline'}
+          </div>
+        )}
+      </div>
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.model}</div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'auto' }}>
+        <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 4, background: color + '22', color, fontWeight: 600 }}>
+          {TT_LABELS[m.training_type] ?? m.training_type}
+        </span>
+        <code style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', background: 'var(--bg-elevated)', padding: '2px 6px', borderRadius: 4 }}>
+          {m.id}
+        </code>
+      </div>
+    </button>
+  )
+}
+
 // ── Main Page ──────────────────────────────────────────────────────────────
 
 export default function ApiService() {
@@ -237,6 +308,25 @@ export default function ApiService() {
   }
 
   const baseUrl = window.location.origin
+
+  const { onlineModels, offlineModels, undeployedModels } = useMemo(() => {
+    const isOnline = (m: DeployedModel) => {
+      const hasRay = m.inference_provider === 'ray' && !!m.ray_serve_url
+      const hasModal = m.inference_provider === 'modal' && !!m.modal_url
+      const hasAny = hasRay || hasModal
+      return hasAny && serveStatus[m.id] === true
+    }
+    const hasDeployment = (m: DeployedModel) => {
+      const hasRay = m.inference_provider === 'ray' && !!m.ray_serve_url
+      const hasModal = m.inference_provider === 'modal' && !!m.modal_url
+      return hasRay || hasModal
+    }
+    return {
+      onlineModels: models.filter(m => isOnline(m)),
+      offlineModels: models.filter(m => hasDeployment(m) && !isOnline(m)),
+      undeployedModels: models.filter(m => !hasDeployment(m)),
+    }
+  }, [models, serveStatus])
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -394,90 +484,43 @@ export default function ApiService() {
             No trained models yet — complete a training job to expose an endpoint
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
-            {models.map(m => {
-              const color = TT_COLORS[m.training_type] ?? '#6366f1'
-              const hasRay   = m.inference_provider === 'ray'   && !!m.ray_serve_url
-              const hasModal = m.inference_provider === 'modal' && !!m.modal_url
-              const hasAny   = hasRay || hasModal
-              const online = hasAny ? serveStatus[m.id] : undefined
-              const isOnline = online === true
-              const isOffline = hasAny && online === false
-              const isLoadingStatus = hasAny && online === null
-              // Clickable if NOT deployed anywhere, OR deployed and online.
-              // Same rule for both Ray and Modal (modal Web Functions are
-              // independent of the Modal Ray cluster).
-              const clickable = !hasAny || isOnline
-              return (
-                <button
-                  key={m.id}
-                  onClick={() => clickable && setSelectedModel(m)}
-                  style={{
-                    background: 'var(--bg-surface)', border: `1px solid ${isOffline ? 'var(--border-default)' : 'var(--border-default)'}`,
-                    borderRadius: 12, padding: '18px 18px',
-                    cursor: clickable ? 'pointer' : 'not-allowed',
-                    opacity: isOffline ? 0.55 : 1,
-                    textAlign: 'left',
-                    transition: 'border-color 0.15s, box-shadow 0.15s, opacity 0.15s',
-                    display: 'flex', flexDirection: 'column', gap: 12,
-                  }}
-                  onMouseEnter={e => { if (clickable) { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.boxShadow = `0 0 0 3px ${color}18` } }}
-                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.boxShadow = 'none' }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
-                    <div style={{ width: 42, height: 42, borderRadius: 10, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <Zap size={20} color={color} />
-                    </div>
-                    {/* Provider badge — Ray (orange) or Modal (purple) */}
-                    {hasRay ? (
-                      <div style={{
-                        display: 'flex', alignItems: 'center', gap: 4,
-                        fontSize: 9, fontWeight: 700, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
-                        background: '#f59e0b20', color: '#f59e0b',
-                        textTransform: 'uppercase', letterSpacing: '0.04em',
-                      }}>Ray</div>
-                    ) : hasModal ? (
-                      <div style={{
-                        display: 'flex', alignItems: 'center', gap: 4,
-                        fontSize: 9, fontWeight: 700, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
-                        background: '#8b5cf620', color: '#8b5cf6',
-                        textTransform: 'uppercase', letterSpacing: '0.04em',
-                      }}>Modal</div>
-                    ) : null}
-                    {/* Online/Offline badge */}
-                    {hasAny && (
-                      <div style={{
-                        display: 'flex', alignItems: 'center', gap: 4,
-                        fontSize: 10, fontWeight: 600, padding: '3px 7px', borderRadius: 20, flexShrink: 0,
-                        background: isLoadingStatus ? 'var(--bg-elevated)' : isOnline ? '#10b98120' : '#ef444418',
-                        color: isLoadingStatus ? 'var(--text-muted)' : isOnline ? '#10b981' : '#ef4444',
-                      }}>
-                        {isLoadingStatus ? (
-                          <RefreshCw size={9} style={{ animation: 'spin 1s linear infinite' }} />
-                        ) : isOnline ? (
-                          <Wifi size={9} />
-                        ) : (
-                          <WifiOff size={9} />
-                        )}
-                        {isLoadingStatus ? '…' : isOnline ? 'Online' : 'Offline'}
-                      </div>
-                    )}
-                  </div>
-                  <div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.model}</div>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'auto' }}>
-                    <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 4, background: color + '22', color, fontWeight: 600 }}>
-                      {TT_LABELS[m.training_type] ?? m.training_type}
-                    </span>
-                    <code style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', background: 'var(--bg-elevated)', padding: '2px 6px', borderRadius: 4 }}>
-                      {m.id}
-                    </code>
-                  </div>
-                </button>
-              )
-            })}
+          <div>
+            {onlineModels.length > 0 && (
+              <div style={{ marginBottom: offlineModels.length + undeployedModels.length > 0 ? 24 : 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+                  <Wifi size={13} color="#10b981" />
+                  <span style={{ fontSize: 12, fontWeight: 600, color: '#10b981' }}>Online — Ready to use</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>({onlineModels.length})</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
+                  {onlineModels.map(m => <ModelCard key={m.id} m={m} dimmed={false} serveStatus={serveStatus} onSelect={setSelectedModel} />)}
+                </div>
+              </div>
+            )}
+            {offlineModels.length > 0 && (
+              <div style={{ marginBottom: undeployedModels.length > 0 ? 24 : 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+                  <WifiOff size={13} color="#ef4444" />
+                  <span style={{ fontSize: 12, fontWeight: 600, color: '#ef4444' }}>Offline</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>({offlineModels.length}) — endpoint unavailable until redeployed</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
+                  {offlineModels.map(m => <ModelCard key={m.id} m={m} dimmed={false} serveStatus={serveStatus} onSelect={setSelectedModel} />)}
+                </div>
+              </div>
+            )}
+            {undeployedModels.length > 0 && (
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+                  <Zap size={13} color="var(--text-muted)" />
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)' }}>Not deployed</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>({undeployedModels.length}) — deploy first from the Models page</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
+                  {undeployedModels.map(m => <ModelCard key={m.id} m={m} dimmed={true} serveStatus={serveStatus} onSelect={setSelectedModel} />)}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </section>

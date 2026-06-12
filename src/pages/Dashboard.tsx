@@ -11,7 +11,7 @@ interface DashboardStats {
 
 interface RayClusterSummary {
   cpuUsed: number; cpuTotal: number
-  gpuUsed: number; gpuTotal: number
+  gpuUsed: number; gpuTotal: number; gpuAllocPct: number; gpuUtilPct: number; gpuActiveCount: number; gpuTotalCount: number
   memUsedGb: number; memTotalGb: number
   nodesAlive: number; nodesTotal: number
   connected: boolean
@@ -20,20 +20,45 @@ interface RayClusterSummary {
 async function fetchRayCluster(_url: string): Promise<RayClusterSummary> {
   const proxied = '/api/ray/api/cluster_status'
   const nodes   = '/api/ray/nodes?view=summary'
-  const [sRes, nRes] = await Promise.all([
+  const [sRes, nRes, gpuRes] = await Promise.all([
     fetch(proxied),
     fetch(nodes),
+    fetch('/api/ray/gpu-stats').catch(() => null),
   ])
   if (!sRes.ok || !nRes.ok) throw new Error('unreachable')
   const sData = await sRes.json()
   const nData = await nRes.json()
   const usage: Record<string, [number, number]> = sData.data?.clusterStatus?.loadMetricsReport?.usage ?? {}
   const nodesArr: any[] = nData.data?.summary ?? []
-  return {
+  // Real GPU compute utilization from nvidia-smi (if available)
+  let gpuComputeUtil = 0
+  let gpuRealUtil = 0
+  let gpuActiveCount = 0
+  let gpuTotalCount = 0
+  if (gpuRes && gpuRes.ok) {
+    const gd = await gpuRes.json()
+    if (gd.cluster?.gpu_allocation_pct != null) {
+      gpuComputeUtil = gd.cluster.gpu_allocation_pct
+    }
+    if (gd.cluster?.gpu_util_pct != null) {
+      gpuRealUtil = gd.cluster.gpu_util_pct
+    }
+    if (gd.cluster?.gpu_active_count != null) {
+      gpuActiveCount = gd.cluster.gpu_active_count
+    }
+    if (gd.cluster?.gpu_total_count != null) {
+      gpuTotalCount = gd.cluster.gpu_total_count
+    }
+  }
+   return {
     cpuUsed:    Math.round(usage['CPU']?.[0]    ?? 0),
     cpuTotal:   Math.round(usage['CPU']?.[1]    ?? 0),
-    gpuUsed:    usage['GPU']?.[0]    ?? 0,
-    gpuTotal:   usage['GPU']?.[1]    ?? 0,
+    gpuUsed:    usage['GPU']?.[0] ?? 0,
+    gpuTotal:   usage['GPU']?.[1] ?? 0,
+    gpuAllocPct: gpuComputeUtil > 0 ? gpuComputeUtil : (usage['GPU']?.[1] ? (usage['GPU']?.[0] / usage['GPU'][1]) * 100 : 0),
+    gpuUtilPct: gpuRealUtil,
+    gpuActiveCount,
+    gpuTotalCount: gpuTotalCount || (usage['GPU']?.[1] ?? 0),
     memUsedGb:  (usage['memory']?.[0] ?? 0) / 1e9,
     memTotalGb: (usage['memory']?.[1] ?? 0) / 1e9,
     nodesAlive: nodesArr.filter((n: any) => n.raylet?.state === 'ALIVE').length,
@@ -134,7 +159,9 @@ export default function Dashboard() {
   }
 
   const cpuPct = ray ? pct(ray.cpuUsed, ray.cpuTotal) : 0
-  const gpuPct = ray ? pct(ray.gpuUsed, ray.gpuTotal) : 0
+  const hasGpuUtil = ray ? ray.gpuActiveCount > 0 : false
+  const gpuPct = ray ? (hasGpuUtil ? ray.gpuUtilPct : (ray.gpuTotal > 0 ? (ray.gpuUsed / ray.gpuTotal) * 100 : 0)) : 0
+  const gpuDetail = ray ? (hasGpuUtil ? `${Math.round(ray.gpuUtilPct)}% utilized` : `${ray.gpuUsed} / ${ray.gpuTotal} allocated`) : ''
   const memPct = ray ? pct(ray.memUsedGb, ray.memTotalGb) : 0
 
   return (
@@ -222,7 +249,9 @@ export default function Dashboard() {
           {ray ? (
             <div className="space-y-4 flex-1">
               <UtilRow label="CPU Allocation"  p={cpuPct} detail={`${ray.cpuUsed} / ${ray.cpuTotal} cores`} />
-              {ray.gpuTotal > 0 && <UtilRow label="GPU Allocation" p={gpuPct} detail={`${ray.gpuUsed} / ${ray.gpuTotal} GPUs`} />}
+              {ray.gpuTotal > 0 && (
+                <UtilRow label="GPU" p={gpuPct} detail={gpuDetail} />
+              )}
               <UtilRow label="Memory" p={memPct} detail={`${ray.memUsedGb.toFixed(1)} / ${ray.memTotalGb.toFixed(1)} GB`} />
             </div>
           ) : (

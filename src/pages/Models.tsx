@@ -167,6 +167,7 @@ export default function Models() {
   const [logModel, setLogModel] = useState<{ id: string; name: string } | null>(null)
   const [logText, setLogText] = useState('')
   const [logLoading, setLogLoading] = useState(false)
+  const [logCopied, setLogCopied] = useState(false)
   const logRef = useRef<HTMLPreElement>(null)
 
   // Edit modal
@@ -539,6 +540,20 @@ export default function Models() {
                 <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>{logModel.name}</p>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                  onClick={() => {
+                    navigator.clipboard.writeText(logText).then(() => {
+                      setLogCopied(true)
+                      setTimeout(() => setLogCopied(false), 1500)
+                    }).catch(() => { /* clipboard blocked */ })
+                  }}
+                  title="Copy full log to clipboard"
+                >
+                  {logCopied ? <Check size={13} /> : <Copy size={13} />}
+                  {logCopied ? 'Copied' : 'Copy'}
+                </button>
                 <button className="btn btn-secondary btn-sm" onClick={refreshLog}>
                   {logLoading ? <Loader size={13} className="animate-spin" /> : <RefreshCw size={13} />}
                 </button>

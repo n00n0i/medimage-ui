@@ -3,46 +3,46 @@
 
 /* ─── H-Forge Design System ─────────────────────────────────── */
 :root {
-  /* Primary */
-  --primary:        oklch(0.58 0.22 265);
-  --primary-hover:  oklch(0.65 0.22 265);
-  --primary-dim:    oklch(0.58 0.22 265 / 0.14);
-  --primary-border: oklch(0.58 0.22 265 / 0.30);
+  /* Primary — sRGB fallback (oklch override below) */
+  --primary:        rgb(188, 208, 189);
+  --primary-hover:  rgb(201, 218, 200);
+  --primary-dim:    rgba(188, 208, 189, 0.14);
+  --primary-border: rgba(188, 208, 189, 0.30);
 
   /* Semantic */
-  --success:        oklch(0.70 0.17 155);
-  --success-dim:    oklch(0.70 0.17 155 / 0.14);
-  --warning:        oklch(0.74 0.16 68);
-  --warning-dim:    oklch(0.74 0.16 68 / 0.14);
-  --danger:         oklch(0.63 0.21 28);
-  --danger-dim:     oklch(0.63 0.21 28 / 0.14);
-  --info:           oklch(0.68 0.14 235);
-  --info-dim:       oklch(0.68 0.14 235 / 0.14);
+  --success:        rgb(214, 222, 209);
+  --success-dim:    rgba(214, 222, 209, 0.14);
+  --warning:        rgb(255, 206, 216);
+  --warning-dim:    rgba(255, 206, 216, 0.14);
+  --danger:         rgb(255, 180, 201);
+  --danger-dim:     rgba(255, 180, 201, 0.14);
+  --info:           rgb(205, 222, 205);
+  --info-dim:       rgba(205, 222, 205, 0.14);
 
   /* Backgrounds (dark, instrument-panel, cool-tinted) */
-  --bg-base:        oklch(0.09 0.018 265);
-  --bg-surface:     oklch(0.13 0.014 265);
-  --bg-card:        oklch(0.16 0.013 263);
-  --bg-elevated:    oklch(0.19 0.014 260);
-  --bg-input:       oklch(0.11 0.016 265);
+  --bg-base:        rgb(86, 86, 80);
+  --bg-surface:     rgb(106, 100, 96);
+  --bg-card:        rgb(118, 110, 106);
+  --bg-elevated:    rgb(128, 119, 115);
+  --bg-input:       rgb(96, 93, 89);
 
   /* Borders */
-  --border-subtle:  oklch(1 0 0 / 0.05);
-  --border-default: oklch(1 0 0 / 0.09);
-  --border-strong:  oklch(1 0 0 / 0.16);
+  --border-subtle:  rgba(255, 249, 244, 0.05);
+  --border-default: rgba(255, 249, 244, 0.09);
+  --border-strong:  rgba(255, 249, 244, 0.16);
 
   /* Text */
-  --text-primary:   oklch(0.94 0.006 265);
-  --text-secondary: oklch(0.62 0.010 265);
-  --text-muted:     oklch(0.44 0.010 265);
+  --text-primary:   rgb(255, 243, 238);
+  --text-secondary: rgb(223, 202, 198);
+  --text-muted:     rgb(191, 174, 169);
 
   /* Typography */
   --font-ui:        'Inter', system-ui, sans-serif;
   --font-mono:      'Fira Code', monospace;
 
   /* Shadows */
-  --shadow-sm:      0 1px 3px oklch(0 0 0 / 0.45), 0 1px 2px oklch(0 0 0 / 0.30);
-  --shadow-md:      0 4px 14px oklch(0 0 0 / 0.55), 0 2px 4px oklch(0 0 0 / 0.30);
+  --shadow-sm:      0 1px 3px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.30);
+  --shadow-md:      0 4px 14px rgba(0,0,0,0.55), 0 2px 4px rgba(0,0,0,0.30);
 
   /* Z-index scale */
   --z-dropdown: 200;
@@ -53,6 +53,42 @@
   --z-tooltip:  700;
 }
 
+/* ─── oklch override (browsers that support it get P3 gamut) ── */
+@supports (color: oklch(0 0 0)) {
+  :root {
+    --primary:        oklch(0.58 0.22 265);
+    --primary-hover:  oklch(0.65 0.22 265);
+    --primary-dim:    oklch(0.58 0.22 265 / 0.14);
+    --primary-border: oklch(0.58 0.22 265 / 0.30);
+
+    --success:        oklch(0.70 0.17 155);
+    --success-dim:    oklch(0.70 0.17 155 / 0.14);
+    --warning:        oklch(0.74 0.16 68);
+    --warning-dim:    oklch(0.74 0.16 68 / 0.14);
+    --danger:         oklch(0.63 0.21 28);
+    --danger-dim:     oklch(0.63 0.21 28 / 0.14);
+    --info:           oklch(0.68 0.14 235);
+    --info-dim:       oklch(0.68 0.14 235 / 0.14);
+
+    --bg-base:        oklch(0.09 0.018 265);
+    --bg-surface:     oklch(0.13 0.014 265);
+    --bg-card:        oklch(0.16 0.013 263);
+    --bg-elevated:    oklch(0.19 0.014 260);
+    --bg-input:       oklch(0.11 0.016 265);
+
+    --border-subtle:  oklch(1 0 0 / 0.05);
+    --border-default: oklch(1 0 0 / 0.09);
+    --border-strong:  oklch(1 0 0 / 0.16);
+
+    --text-primary:   oklch(0.94 0.006 265);
+    --text-secondary: oklch(0.62 0.010 265);
+    --text-muted:     oklch(0.44 0.010 265);
+
+    --shadow-sm:      0 1px 3px oklch(0 0 0 / 0.45), 0 1px 2px oklch(0 0 0 / 0.30);
+    --shadow-md:      0 4px 14px oklch(0 0 0 / 0.55), 0 2px 4px oklch(0 0 0 / 0.30);
+  }
+}
+
 /* ─── Base ───────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 
@@ -60,6 +96,7 @@ html {
   scroll-behavior: smooth;
   font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
@@ -68,11 +105,17 @@ body {
   min-height: 100vh;
 }
 
-/* ─── Scrollbar ─────────────────────────────────────────────── */
+/* ─── Scrollbar (WebKit) ──────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg-surface); }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) var(--bg-surface);
+}
 
 /* ─── Typography ────────────────────────────────────────────── */
 h1, h2, h3, h4, h5, h6 {
@@ -114,6 +157,7 @@ h1, h2, h3, h4, h5, h6 {
   transition: all 0.18s ease;
   white-space: nowrap;
   user-select: none;
+  -webkit-user-select: none;
   letter-spacing: 0.01em;
 }
 .btn:focus-visible {
@@ -308,9 +352,14 @@ input:focus, textarea:focus, select:focus {
   box-shadow: var(--shadow-md);
   max-width: 360px;
 }
-.toast-success { background: oklch(0.14 0.04 155); color: oklch(0.75 0.17 155); border: 1px solid oklch(0.70 0.17 155 / 0.25); }
-.toast-error   { background: oklch(0.14 0.04 28);  color: oklch(0.75 0.15 28);  border: 1px solid oklch(0.63 0.21 28 / 0.25); }
-.toast-info    { background: oklch(0.14 0.04 265);  color: oklch(0.75 0.14 265); border: 1px solid oklch(0.58 0.22 265 / 0.35); }
+.toast-success { background: rgb(101,107,100); color: rgb(223,228,215); border: 1px solid rgba(214,222,209,0.25); }
+.toast-error   { background: rgb(133,92,101);  color: rgb(255,205,217); border: 1px solid rgba(255,180,201,0.25); }
+.toast-info    { background: rgb(102,107,99);  color: rgb(228,226,214); border: 1px solid rgba(188,208,189,0.35); }
+@supports (color: oklch(0 0 0)) {
+  .toast-success { background: oklch(0.14 0.04 155); color: oklch(0.75 0.17 155); border-color: oklch(0.70 0.17 155 / 0.25); }
+  .toast-error   { background: oklch(0.14 0.04 28);  color: oklch(0.75 0.15 28);  border-color: oklch(0.63 0.21 28 / 0.25); }
+  .toast-info    { background: oklch(0.14 0.04 265);  color: oklch(0.75 0.14 265); border-color: oklch(0.58 0.22 265 / 0.35); }
+}
 @keyframes toastIn {
   from { transform: translateX(110%); opacity: 0; }
   to   { transform: translateX(0);    opacity: 1; }
@@ -324,7 +373,8 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: oklch(0 0 0 / 0.65);
+  background: rgba(0, 0, 0, 0.65);
+  -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
   animation: fadeIn 0.18s ease;
 }

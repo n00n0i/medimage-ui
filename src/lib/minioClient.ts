@@ -5,6 +5,7 @@
  */
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js'
 import { hmac as nobleHmac } from '@noble/hashes/hmac.js'
+import { md5 as nobleMd5 } from '@noble/hashes/legacy.js'
 
 /* ── Config ──────────────────────────────────────────────────── */
 export const MINIO_DEFAULTS = {
@@ -58,8 +59,19 @@ function toHex(buf: ArrayBuffer): string {
 }
 
 function hmac(key: ArrayBuffer | Uint8Array, msg: string): ArrayBuffer {
-  const k = key instanceof Uint8Array ? key : new Uint8Array(key)
+  const k = key instanceof ArrayBuffer ? new Uint8Array(key) : key
   return nobleHmac(nobleSha256, k, new TextEncoder().encode(msg)).buffer as ArrayBuffer
+}
+
+/** Base64-encode a raw byte array (used for S3's Content-MD5 header).
+ *  SubtleCrypto can't MD5 in modern browsers, so we compute MD5 via
+ *  @noble/hashes/legacy and base64-encode here. */
+function md5B64(data: ArrayBuffer | Uint8Array): string {
+  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data
+  const digest = nobleMd5(bytes)
+  let bin = ''
+  for (let i = 0; i < digest.length; i++) bin += String.fromCharCode(digest[i])
+  return btoa(bin)
 }
 
 function signingKey(secret: string, date: string, region: string): ArrayBuffer {
@@ -100,11 +112,19 @@ export async function s3Fetch(
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join('&')
 
+  // S3's multi-object delete (POST /<bucket>?delete=) requires a Content-MD5
+  // header per the S3 spec. SubtleCrypto can't MD5 (it's not in the FIPS
+  // allowlist), so we compute it with @noble/hashes/legacy. The header
+  // MUST be included in the signature — otherwise MinIO rejects the request
+  // with MissingContentMD5 even when the body is otherwise valid.
+  const contentMd5 = body ? md5B64(body) : ''
+
   // Headers included in signature (must match what nginx forwards to MinIO)
   const toSign: Record<string, string> = {
     host:                   minioHost,
     'x-amz-content-sha256': payloadHash,
     'x-amz-date':           amzDate,
+    ...(contentMd5 ? { 'content-md5': contentMd5 } : {}),
     ...Object.fromEntries(Object.entries(extraSignedHeaders).map(([k, v]) => [k.toLowerCase(), v])),
   }
   const sortedKeys      = Object.keys(toSign).sort()
@@ -137,6 +157,7 @@ export async function s3Fetch(
       Authorization:            authHeader,
       'x-amz-date':             amzDate,
       'x-amz-content-sha256':   payloadHash,
+      ...(contentMd5 ? { 'Content-MD5': contentMd5 } : {}),
       ...extraSignedHeaders,
       ...unsignedHeaders,
     },
@@ -157,6 +178,10 @@ export interface ObjectInfo {
   size:         number
   lastModified: string
   etag:         string
+}
+
+export interface DirInfo {
+  prefix: string
 }
 
 /* ── XML helper ──────────────────────────────────────────────── */
@@ -181,16 +206,19 @@ export async function listBuckets(): Promise<Pick<BucketInfo, 'name' | 'creation
   }))
 }
 
-/** List objects in a bucket (handles pagination up to 10 000 objects). */
-export async function listObjects(bucket: string, prefix = ''): Promise<ObjectInfo[]> {
+/** List objects in a bucket (handles pagination up to 10 000 objects).
+ *  When delimiter is set, also returns common prefixes (subdirectories). */
+export async function listObjects(bucket: string, prefix = '', delimiter = ''): Promise<{ objects: ObjectInfo[]; dirs: DirInfo[] }> {
   const all: ObjectInfo[] = []
+  const dirs: DirInfo[] = []
   let token = ''
   let pages = 0
 
   do {
     const q: Record<string, string> = { 'list-type': '2', 'max-keys': '1000' }
-    if (prefix) q.prefix = prefix
-    if (token)  q['continuation-token'] = token
+    if (prefix)    q.prefix = prefix
+    if (delimiter) q.delimiter = delimiter
+    if (token)     q['continuation-token'] = token
 
     const res = await s3Fetch('GET', `/${bucket}`, q)
     if (!res.ok) throw new Error(`ListObjects ${res.status}`)
@@ -205,12 +233,17 @@ export async function listObjects(bucket: string, prefix = ''): Promise<ObjectIn
       })
     }
 
+    for (const cp of doc.querySelectorAll('CommonPrefixes Prefix')) {
+      const p = cp.textContent ?? ''
+      if (p && p !== prefix) dirs.push({ prefix: p })
+    }
+
     const truncated = doc.querySelector('IsTruncated')?.textContent?.toLowerCase() === 'true'
     token = truncated ? (doc.querySelector('NextContinuationToken')?.textContent ?? '') : ''
     pages++
   } while (token && pages < 10)
 
-  return all
+  return { objects: all, dirs }
 }
 
 /** Create a new bucket. */
@@ -254,6 +287,41 @@ export async function deleteObject(bucket: string, key: string): Promise<void> {
   const encodedKey = key.split('/').map(encodeURIComponent).join('/')
   const res = await s3Fetch('DELETE', `/${bucket}/${encodedKey}`)
   if (!res.ok) throw new Error(`DeleteObject ${res.status}`)
+}
+
+/** Delete multiple objects in a single S3 request (max 1000 keys per call). */
+export async function deleteObjects(bucket: string, keys: string[]): Promise<void> {
+  if (keys.length === 0) return
+  // S3 multi-object delete caps at 1000 keys per request.
+  for (let i = 0; i < keys.length; i += 1000) {
+    const chunk = keys.slice(i, i + 1000)
+    const objects = chunk.map(k => `<Object><Key>${k.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Key></Object>`).join('')
+    const body = `<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${objects}</Delete>`
+    const res = await s3Fetch(
+      'POST',
+      `/${bucket}`,
+      { delete: '' },
+      new TextEncoder().encode(body).buffer as ArrayBuffer,
+      { 'content-type': 'application/xml' },
+      {},
+    )
+    if (!res.ok) {
+      const doc = xml(await res.text().catch(() => '<x/>'))
+      const code = doc.querySelector('Code')?.textContent
+      throw new Error(code ?? `DeleteObjects ${res.status}`)
+    }
+  }
+}
+
+/** Recursively delete every object under a directory prefix.
+ *  S3 has no "delete directory" primitive — we list with delimiter='' to
+ *  flatten the subtree, then chunked-delete the resulting keys. */
+export async function deletePrefix(bucket: string, prefix: string): Promise<number> {
+  const normalized = prefix.endsWith('/') ? prefix : prefix + '/'
+  const { objects } = await listObjects(bucket, normalized, '')
+  const keys = objects.map(o => o.key)
+  await deleteObjects(bucket, keys)
+  return keys.length
 }
 
 /** Upload a File to a bucket. */

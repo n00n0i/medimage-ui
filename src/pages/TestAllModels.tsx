@@ -95,6 +95,75 @@ async function pollOnce() {
   }))
 }
 
+// ── Cross-browser sync ───────────────────────────────────────────────────────
+// The state for "in-flight" jobs (activeJobs + moduleRuns) used to be
+// purely client-side. That meant opening the test-all page in a 2nd
+// browser while a bulk run was in progress on the 1st showed an empty
+// table — the 2nd browser had no way to know about the 1st's jobs.
+//
+// We treat the medimage API as source of truth: on mount, fetch every
+// job with status in (running, queued) and inject them into the local
+// tracking structures using the same `key` shape the table renders.
+// The 3s poll loop then keeps these in sync from there on.
+let _initialSyncDone = false
+async function _syncInFlightJobsFromBackend(): Promise<void> {
+  if (_initialSyncDone) return
+  _initialSyncDone = true
+  try {
+    const res = await fetch('/api/jobs?view=jobs')
+    if (!res.ok) return
+    const data = await res.json()
+    const jobs: any[] = data?.jobs ?? []
+    // Snapshot the model rows so the matcher can read .option.model
+    // without capturing stale references.
+    const _rowByKey = new Map<string, ModelRow>()
+    for (const t of TYPE_ORDER) {
+      for (const opt of (TRAINING_MATRIX[t] || []) as TrainOption[]) {
+        _rowByKey.set(`${t}:${opt.value}`, { key: `${t}:${opt.value}`, trainingType: t as TrainingType, option: opt })
+      }
+    }
+    let added = 0
+    for (const j of jobs) {
+      if (j.status !== 'running' && j.status !== 'queued') continue
+      // Find the matching model row by model_name + training_type + engine.
+      // The catalog uses the same `model` field as `timm_name`/`model_name`
+      // in the training payload so the match is direct.
+      let matchedKey: string | null = null
+      for (const r of _rowByKey.values()) {
+        if (r.option.model === j.model
+            && r.trainingType === j.training_type
+            && r.option.engine === j.engine) {
+          matchedKey = r.key
+          break
+        }
+      }
+      if (!matchedKey) continue  // job is for a model this page doesn't list
+      // Don't overwrite a fresher local state (the local browser may
+      // already be tracking this job with a more recent snapshot).
+      const existing = moduleRuns[matchedKey]
+      if (existing && (existing.status === 'running' || existing.status === 'queued')
+          && existing.jobId === j.id) {
+        continue
+      }
+      trackJob(matchedKey, j.id)
+      updateRunFromBackend(matchedKey, {
+        jobId:      j.id,
+        status:     j.status === 'running' ? 'running' : 'queued',
+        error:      null,
+        finishedAt: null,
+        log:        '',
+      })
+      added += 1
+    }
+    if (added > 0) {
+      console.info(`[test-all] synced ${added} in-flight job(s) from backend`)
+    }
+  } catch (e) {
+    console.warn('[test-all] cross-browser sync failed:', e)
+    _initialSyncDone = false  // allow retry on next mount
+  }
+}
+
 function ensurePolling() {
   if (pollInterval !== null) return
   pollInterval = window.setInterval(pollOnce, 3000)
@@ -194,10 +263,36 @@ interface BulkReport {
   log:           string          // human-readable full run log (line per model)
 }
 
+const LS_MODULE_RUNS = 'medimage.testAll.moduleRuns.v1'
+
 // Module-level runs map. Components subscribe to changes via
 // useStoreSnapshot(). Kept outside React state so the polling loop
 // at module scope can mutate it without going through setState.
 const moduleRuns: Record<string, TestRun> = {}
+
+function _persistRuns() {
+  try {
+    // Only persist terminal runs (completed/error) to avoid stale
+    // "running" states surviving a page refresh.
+    const snap: Record<string, TestRun> = {}
+    for (const [k, v] of Object.entries(moduleRuns)) {
+      if (v.status === 'completed' || v.status === 'error') snap[k] = v
+    }
+    localStorage.setItem(LS_MODULE_RUNS, JSON.stringify(snap))
+  } catch { /* quota etc */ }
+}
+
+function _loadPersistedRuns() {
+  try {
+    const raw = localStorage.getItem(LS_MODULE_RUNS)
+    if (!raw) return
+    const saved: Record<string, TestRun> = JSON.parse(raw)
+    for (const [k, v] of Object.entries(saved)) {
+      if (!moduleRuns[k]) moduleRuns[k] = v
+    }
+  } catch { /* ignore */ }
+}
+_loadPersistedRuns()
 
 function getRun(key: string): TestRun | undefined {
   return moduleRuns[key]
@@ -206,13 +301,12 @@ void getRun  // reserved for external introspection (jobs page badge)
 
 function setRunLocal(key: string, run: TestRun) {
   moduleRuns[key] = run
+  _persistRuns()
   notify()
 }
 
 function updateRunFromBackend(key: string, patch: Partial<TestRun> & { jobId: string }) {
   const cur = moduleRuns[key]
-  // Strip the key/jobId from the spread so the explicit fields below
-  // aren't silently overwritten.
   const { jobId, ...rest } = patch
   if (!cur) {
     moduleRuns[key] = {
@@ -229,6 +323,7 @@ function updateRunFromBackend(key: string, patch: Partial<TestRun> & { jobId: st
   } else {
     moduleRuns[key] = { ...cur, jobId, ...rest }
   }
+  _persistRuns()
   notify()
 }
 
@@ -237,11 +332,79 @@ function useStoreSnapshot(): Record<string, TestRun> {
   useEffect(() => {
     const cb = () => force(n => n + 1)
     subscribers.add(cb)
-    // Also re-hydrate any persisted jobs the first time we mount.
+    // Cross-browser sync: pull any in-flight jobs the backend knows
+    // about but this browser hasn't seen yet (e.g. started from a
+    // different browser's bulk run). The poll loop then takes over.
+    void _syncInFlightJobsFromBackend()
     ensurePolling()
     return () => { subscribers.delete(cb) }
   }, [])
   return moduleRuns
+}
+
+// ── Module-level bulk state (survives navigation / re-mount) ──────────────
+const LS_BULK_REPORT = 'medimage.testAll.bulkReport.v1'
+const LS_BULK_RUNNING = 'medimage.testAll.bulkRunning.v1'
+const LS_BULK_PROGRESS = 'medimage.testAll.bulkProgress.v1'
+interface BulkStreamEntry { label: string; status: 'ok' | 'err' | 'deploy' | 'deployed'; error?: string }
+const _bulkState = {
+  running: false,
+  stopRequested: false,
+  progress: null as { current: number; total: number; label: string; stage: 'train' | 'deploy' } | null,
+  report: null as BulkReport | null,
+  stream: [] as BulkStreamEntry[],
+}
+const _bulkSubscribers = new Set<() => void>()
+function _notifyBulk() { for (const cb of _bulkSubscribers) cb() }
+
+function _persistBulkState() {
+  try {
+    localStorage.setItem(LS_BULK_RUNNING, JSON.stringify(_bulkState.running))
+    if (_bulkState.progress) localStorage.setItem(LS_BULK_PROGRESS, JSON.stringify(_bulkState.progress))
+    else localStorage.removeItem(LS_BULK_PROGRESS)
+  } catch { /* ignore */ }
+}
+function _loadBulkRunning() {
+  try {
+    const v = localStorage.getItem(LS_BULK_RUNNING)
+    if (v === 'true') _bulkState.running = true
+  } catch { /* ignore */ }
+}
+_loadBulkRunning()
+
+function _persistBulkReport() {
+  try {
+    if (_bulkState.report) localStorage.setItem(LS_BULK_REPORT, JSON.stringify(_bulkState.report))
+    else localStorage.removeItem(LS_BULK_REPORT)
+  } catch { /* ignore */ }
+}
+function _loadBulkReport() {
+  try {
+    const raw = localStorage.getItem(LS_BULK_REPORT)
+    if (raw) _bulkState.report = JSON.parse(raw)
+  } catch { /* ignore */ }
+}
+_loadBulkReport()
+
+function useBulkState() {
+  const [, force] = useState(0)
+  useEffect(() => {
+    const cb = () => force(n => n + 1)
+    _bulkSubscribers.add(cb)
+    // If the page was refreshed while a bulk run was in progress, the
+    // sequential loop is gone (JS context was destroyed). Check if there
+    // are still active jobs; if not, clear the stale "running" flag so
+    // the Stop button doesn't linger forever.
+    if (_bulkState.running && activeJobs.size === 0) {
+      _bulkState.running = false
+      _bulkState.stopRequested = false
+      _bulkState.progress = null
+      _persistBulkState()
+      _notifyBulk()
+    }
+    return () => { _bulkSubscribers.delete(cb) }
+  }, [])
+  return _bulkState
 }
 
 const TYPE_LABELS: Record<TrainingType, string> = {
@@ -313,31 +476,38 @@ export default function TestAllModels() {
   // already uses the same gpuFreeGb-aware isCompatible function below.
   const [showIncompatible, setShowIncompatible] = useState(true)
 
-  // Mirror TrainModel's dynamic GPU check: pull available system RAM
-  // from the Ray cluster summary and use it as a proxy for free GPU
-  // memory. With 4×H200 @ 50% util (~282 GB free), this lets every
-  // catalog model with `hardware ≤ 282 GB` pass without a stale static
-  // `compatible: false` blocking it.
+  // Pull actual GPU free memory from Ray's per-node `gpus` array
+  // (`memoryTotal - memoryUsed`, in MiB → GiB). This is the CORRECT
+  // signal for "can a model fit on a single GPU" — `node.mem` is
+  // system RAM and can be wildly different (e.g. 140 GB H200 HBM3e vs
+  // 132 GB shared CPU). We track the max across all GPUs because Ray
+  // schedules onto the most-free node, plus the per-model hardware
+  // value in the catalog is the per-GPU requirement.
   const [gpuFreeGb, setGpuFreeGb] = useState<number | null>(null)
+  const [gpuTotalGb, setGpuTotalGb] = useState<number | null>(null)
   useEffect(() => {
     fetch('/api/ray/nodes?view=summary')
       .then(r => r.json())
       .then(data => {
         const nodes: any[] = data?.data?.summary ?? []
-        let maxFreeGb = 0
+        let maxFreeGiB = 0
+        let maxTotalGiB = 0
         for (const node of nodes) {
-          if (Array.isArray(node.mem) && node.mem.length >= 2) {
-            const availBytes = Number(node.mem[1] ?? 0)
-            if (availBytes > 0) {
-              const availGb = availBytes / (1024 ** 3)
-              if (availGb > maxFreeGb) maxFreeGb = availGb
-            }
+          for (const g of (node.gpus || []) as any[]) {
+            const total = Number(g.memoryTotal ?? 0)  // MiB
+            const used  = Number(g.memoryUsed  ?? 0)  // MiB
+            if (total <= 0) continue
+            const freeGiB = (total - used) / 1024
+            if (freeGiB > maxFreeGiB) maxFreeGiB = freeGiB
+            const totalGiB = total / 1024
+            if (totalGiB > maxTotalGiB) maxTotalGiB = totalGiB
           }
         }
-        if (maxFreeGb > 0) setGpuFreeGb(Math.floor(maxFreeGb))
-        else setGpuFreeGb(64)  // généreus fallback
+        if (maxFreeGiB > 0)  setGpuFreeGb(Math.floor(maxFreeGiB))
+        else                  setGpuFreeGb(null)
+        if (maxTotalGiB > 0) setGpuTotalGb(Math.floor(maxTotalGiB))
       })
-      .catch(() => setGpuFreeGb(64))
+      .catch(() => {})
   }, [])
 
   function parseRequiredGb(hardware: string): number {
@@ -346,34 +516,50 @@ export default function TestAllModels() {
   }
 
   function isCompatible(opt: TrainOption): boolean {
+    // BOTH conditions must be true:
+    //   - opt.compatible: catalog says this model is supported on this
+    //     backend (e.g. covidnet-cxr-3 is flagged compatible:false because
+    //     it needs TF 1.15 which is EOL; the hardware check alone would
+    //     wrongly include it whenever the cluster has enough VRAM)
+    //   - hardware fits in current free GPU memory
+    if (!opt.compatible) return false
     if (gpuFreeGb !== null) return parseRequiredGb(opt.hardware) <= gpuFreeGb
-    return opt.compatible
+    return true
   }
 
   // Test runs (keyed by model row key) — backed by module store so the
   // poll loop keeps working even when the user navigates away.
   const runs = useStoreSnapshot()
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // Per-row "copied" feedback so the Copy icon next to the training log
+  // can flash a check for 1.5s after the user clicks it.
+  const [copiedRowLog, setCopiedRowLog] = useState<Set<string>>(new Set())
 
   // Bulk run control — also module-scoped so the bulk loop survives
   // navigation. We mirror into useState for re-render.
-  const [bulkRunning, setBulkRunning] = useState(false)
-  const [bulkStopRequested, setBulkStopRequested] = useState(false)
-  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string; stage: 'train' | 'deploy' } | null>(null)
-  // Snapshot of the last completed bulk run — surfaces failed models
-  // + a copyable/exportable log so the user can follow up on each error.
-  const [bulkReport, setBulkReport] = useState<BulkReport | null>(null)
-  // Live stream of failures + statuses while the run is in progress, so
-  // the user sees what's failing in real time instead of waiting for the
-  // whole pass to finish.
-  const [bulkStream, setBulkStream] = useState<{ label: string; status: 'ok' | 'err' | 'deploy' | 'deployed'; error?: string }[]>([])
+  const bulk = useBulkState()
+  // Convenience aliases — the setters update module state + notify subscribers
+  const setBulkRunning    = (v: boolean) => { _bulkState.running = v; _persistBulkState(); _notifyBulk() }
+  const setBulkStopRequested = (v: boolean) => { _bulkState.stopRequested = v; _notifyBulk() }
+  const setBulkProgress   = (v: typeof bulk.progress) => { _bulkState.progress = v; _persistBulkState(); _notifyBulk() }
+  const setBulkReport     = (v: BulkReport | null) => { _bulkState.report = v; _persistBulkReport(); _notifyBulk() }
+  const setBulkStream     = (v: BulkStreamEntry[] | ((prev: BulkStreamEntry[]) => BulkStreamEntry[])) => {
+    bulk.stream = typeof v === 'function' ? v(bulk.stream) : v; _notifyBulk()
+  }
+  const bulkRunning       = bulk.running
+  const bulkProgress      = bulk.progress
+  const bulkReport        = bulk.report
+  const bulkStream        = bulk.stream
 
   // Pre-run config — picked once before the bulk loop starts
   const [bulkProvider, setBulkProvider] = useState<'ray' | 'modal'>('ray')
   const [bulkDeployEnabled, setBulkDeployEnabled] = useState(true)
+  // GPUs per training job — e.g. 1 = sequential, 2-4 = data-parallel within
+  // a single job (less jobs fit on the cluster at once but each trains
+  // faster). Capped at 4 (cluster size on 4×H200 deployments).
+  const [bulkGpusPerJob, setBulkGpusPerJob] = useState<number>(1)
   // Stop the loop the moment any step fails so the user can debug
-  // the broken model before running the rest (otherwise the loop
-  // continues past failures and the report grows huge).
+  // the broken model before running the rest.
   const [bulkStopOnError, setBulkStopOnError] = useState(false)
 
   // Keep latest runs in a ref so the bulk loop always reads the current
@@ -541,6 +727,7 @@ export default function TestAllModels() {
         imgsz:         640,
         notes:         `test-all run · ${row.option.label}`,
         cluster:       provider,
+        num_gpus:      bulkGpusPerJob,
         text_dataset:  needsTextDataset(row.trainingType) ? String(ds.id) : '',
       }
       const r = await fetch(`/api/train/${ds.id}`, {
@@ -567,18 +754,19 @@ export default function TestAllModels() {
         ...cur, status: 'error', error: e.message, finishedAt: Date.now() / 1000,
       })
     }
-  }, [effectiveDataset, validateBeforeSubmit, bulkProvider])
+  }, [effectiveDataset, validateBeforeSubmit, bulkProvider, bulkGpusPerJob])
 
   // ── Deploy a freshly-trained model. Used by the bulk loop right after
   //    a successful training job completes (per-model train → deploy →
   //    next flow). Mirrors the DeployModels page's POST to /api/deploy. ─
-  const deployModel = useCallback(async (row: ModelRow, provider: 'ray' | 'modal'): Promise<{ ok: boolean; url?: string; error?: string; elapsedSec: number }> => {
+  const deployModel = useCallback(async (row: ModelRow, provider: 'ray' | 'modal', jobId?: string | null): Promise<{ ok: boolean; url?: string; error?: string; elapsedSec: number }> => {
     const t0 = Date.now() / 1000
     try {
       const r = await fetch('/api/deploy', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
+          job_id:     jobId ?? null,
           model_id:   row.option.value,
           model_name: row.option.model,
           provider,
@@ -600,6 +788,29 @@ export default function TestAllModels() {
     }
   }, [])
 
+  // ── Stop a previously-deployed model actor on the Ray cluster ──────────
+  // Used by the bulk loop to free the GPU that a previous deploy is
+  // holding — otherwise after 4 deploys (on a 4-GPU cluster) every
+  // subsequent training job gets stuck in PENDING waiting for resources
+  // and the reconcile watchdog has to kill it. See _ray_serve_state
+  // cleanup in the backend (POST /api/jobs/{job_id}/deploy-ray/stop).
+  const stopDeploy = useCallback(async (jobId: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/deploy-ray/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (!r.ok) {
+        let detail = `HTTP ${r.status}`
+        try { const d = await r.json(); detail = d?.detail || detail } catch {}
+        return { ok: false, error: detail }
+      }
+      return { ok: true }
+    } catch (e: any) {
+      return { ok: false, error: e.message }
+    }
+  }, [])
+
   // ── Polling is now handled by the module-level ensurePolling() ──
   //    The background poll loop fires every 3s while any job is tracked
   //    and updates the store regardless of whether this component is
@@ -613,17 +824,13 @@ export default function TestAllModels() {
   const waitForCompletion = useCallback(async (key: string, timeoutMs = 600_000): Promise<void> => {
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
-      if (bulkStopRequestedRef.current) return
+      if (bulk.stopRequested) return
       const cur = moduleRuns[key]
       if (cur && (cur.status === 'completed' || cur.status === 'error')) return
       if (cur && cur.status === 'idle' && cur.error) return
       await new Promise(r => setTimeout(r, 2000))
     }
   }, [])
-
-  // Keep latest bulkStopRequested in a ref so waitForCompletion sees it
-  const bulkStopRequestedRef = useRef(bulkStopRequested)
-  useEffect(() => { bulkStopRequestedRef.current = bulkStopRequested }, [bulkStopRequested])
 
   // ── Run all compatible — strictly sequential: per-model TRAIN →
   //    DEPLOY → NEXT. The user picks Ray vs Modal once before the loop
@@ -632,7 +839,6 @@ export default function TestAllModels() {
     if (bulkRunning) return
     setBulkRunning(true)
     setBulkStopRequested(false)
-    bulkStopRequestedRef.current = false
     setBulkStream([])
     setBulkReport(null)
 
@@ -645,11 +851,43 @@ export default function TestAllModels() {
     let stopped = false
     const logLines: string[] = []
 
+    // Track the previous iteration's deployed job_id so we can stop its
+    // Ray Serve actor before the next training job starts. Each deploy
+    // holds 1 GPU for the lifetime of its actor — on a 4-GPU cluster
+    // the 5th train would otherwise sit PENDING forever waiting for
+    // resources. The current deploy stays alive so the user can keep
+    // poking its endpoint until the next iteration replaces it.
+    let prevDeployedJobId: string | null = null
+
+    // Pre-flight: stop any deploys left over from a previous bulk run
+    // (or from manual deployments via the DeployModels page). The user
+    // can always re-deploy manually after the test-all finishes.
+    if (bulkDeployEnabled) {
+      try {
+        const r = await fetch('/api/ray/serve/stop-all', { method: 'POST' })
+        const d = r.ok ? await r.json() : null
+        if (d) {
+          logLines.push(`[pre-flight] Stopped ${d.stopped ?? 0} leftover deploys (${d.failed ?? 0} failed)`)
+        }
+      } catch (e: any) {
+        logLines.push(`[pre-flight] stop-all failed: ${e.message}`)
+      }
+    }
+
     let idx = 0
     for (const row of targets) {
-      if (bulkStopRequestedRef.current) { stopped = true; break }
+      if (bulk.stopRequested) { stopped = true; break }
       idx += 1
       setBulkProgress({ current: idx, total: targets.length, label: row.option.label, stage: 'train' })
+
+      // Free the GPU that the previous deploy is holding (if any) so
+      // this training job can be scheduled. We do this BEFORE the train
+      // submit so the autoscaler sees a free GPU when placing the job.
+      if (bulkDeployEnabled && prevDeployedJobId) {
+        const stop = await stopDeploy(prevDeployedJobId)
+        logLines.push(`[${idx}/${targets.length}]  ↻  stopped prev deploy ${prevDeployedJobId.slice(0, 8)}… (${stop.ok ? 'ok' : 'fail'})`)
+        prevDeployedJobId = null
+      }
 
       // Skip rows that already finished in a previous run, but re-run
       // anything that errored so the user can retry without resetting
@@ -684,20 +922,22 @@ export default function TestAllModels() {
           stage:        'train',
         })
         logLines.push(`[${idx}/${targets.length}]  ✗  TRAIN  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
+        if (final?.log) logLines.push(final.log.split('\n').slice(-30).join('\n'))
         setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `TRAIN: ${errMsg}` }])
         if (bulkStopOnError) { stopped = true; break }
         continue
       }
       ok += 1
       logLines.push(`[${idx}/${targets.length}]  ✓  TRAIN  ${row.option.label}`)
+      if (final?.log) logLines.push(final.log.split('\n').slice(-20).join('\n'))
       setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
 
       // TRAIN → DEPLOY step (skip if user disabled it)
       if (bulkDeployEnabled) {
-        if (bulkStopRequestedRef.current) { stopped = true; break }
+        if (bulk.stopRequested) { stopped = true; break }
         setBulkProgress({ current: idx, total: targets.length, label: row.option.label, stage: 'deploy' })
         setBulkStream(s => [...s, { label: row.option.label, status: 'deploy' }])
-        const dep = await deployModel(row, bulkProvider)
+        const dep = await deployModel(row, bulkProvider, final?.jobId)
         if (dep.ok) {
           deployedOk += 1
           deployed.push({
@@ -709,6 +949,9 @@ export default function TestAllModels() {
           })
           logLines.push(`[${idx}/${targets.length}]  ✓  DEPLOY  ${row.option.label}  →  ${dep.url}  (${dep.elapsedSec}s)`)
           setBulkStream(s => [...s, { label: row.option.label, status: 'deployed' }])
+          // Remember the deployed jobId so the next iteration can stop
+          // it (and free its GPU) before starting the next training job.
+          if (final?.jobId) prevDeployedJobId = final.jobId
         } else {
           const errMsg = (dep.error ?? 'Unknown deploy error').slice(0, 500)
           failures.push({
@@ -723,6 +966,7 @@ export default function TestAllModels() {
           })
           logLines.push(`[${idx}/${targets.length}]  ✗  DEPLOY  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
           setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `DEPLOY: ${errMsg}` }])
+          if (bulkStopOnError) { stopped = true; break }
         }
       }
     }
@@ -745,7 +989,6 @@ export default function TestAllModels() {
     setBulkProgress(null)
     setBulkRunning(false)
     setBulkStopRequested(false)
-    bulkStopRequestedRef.current = false
   }
 
   // ── Aggregate stats ──
@@ -783,14 +1026,28 @@ export default function TestAllModels() {
           {/* Live stream — surfaces each model's status as it completes
               so the user sees failures in real time during long runs. */}
           {bulkStream.length > 0 && bulkRunning && (
-            <div style={{ marginTop: 10, maxHeight: 140, overflowY: 'auto', padding: '8px 10px', borderRadius: 6, background: 'var(--bg-elevated)', fontSize: 11.5, fontFamily: 'var(--font-mono)' }}>
+            <div style={{ marginTop: 10, borderRadius: 6, background: 'var(--bg-elevated)' }}>
+              <div style={{ display: 'flex', gap: 12, padding: '6px 10px', fontSize: 10.5, color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={10} color="var(--success)" /> train OK</span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Rocket size={10} color="#3b82f6" /> deploying</span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><CheckCircle2 size={10} color="#3b82f6" /> deployed</span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><XCircle size={10} color="var(--danger)" /> error</span>
+              </div>
+              <div style={{ maxHeight: 120, overflowY: 'auto', padding: '6px 10px', fontSize: 11.5, fontFamily: 'var(--font-mono)' }}>
               {bulkStream.slice(-20).map((s, i) => (
                 <div key={`${s.label}-${i}`} style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '1px 0' }}>
                   {s.status === 'ok'
                     ? <CheckCircle2 size={11} color="var(--success)" />
-                    : <XCircle      size={11} color="var(--danger)"  />}
-                  <span style={{ color: s.status === 'ok' ? 'var(--text-secondary)' : 'var(--danger)', flex: 1 }}>{s.label}</span>
-                  {s.error && (
+                    : s.status === 'deploy'
+                    ? <Rocket size={11} color="#3b82f6" />
+                    : s.status === 'deployed'
+                    ? <CheckCircle2 size={11} color="#3b82f6" />
+                    : <XCircle size={11} color="var(--danger)" />}
+                  <span style={{ color: s.status === 'ok' ? 'var(--text-secondary)' : s.status === 'err' ? 'var(--danger)' : 'var(--text-primary)', flex: 1 }}>{s.label}</span>
+                  {s.status === 'ok' && <span style={{ color: 'var(--success)', fontSize: 10 }}>train ✓</span>}
+                  {s.status === 'deploy' && <span style={{ color: '#3b82f6', fontSize: 10 }}>deploying…</span>}
+                  {s.status === 'deployed' && <span style={{ color: '#3b82f6', fontSize: 10 }}>deployed ✓</span>}
+                  {s.status === 'err' && s.error && (
                     <span style={{ color: 'var(--text-muted)', fontSize: 10.5, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {s.error.slice(0, 80)}
                     </span>
@@ -802,6 +1059,7 @@ export default function TestAllModels() {
                   … +{bulkStream.length - 20} earlier
                 </div>
               )}
+              </div>
             </div>
           )}
 
@@ -856,6 +1114,53 @@ export default function TestAllModels() {
               <span style={{ fontWeight: 500 }}>Train → Deploy → Next</span>
               <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>(auto-deploy after each train OK)</span>
             </label>
+            <div style={{ width: 1, height: 22, background: 'var(--border-subtle)' }} />
+
+            {/* GPUs per job — 1 = sequential, 2-4 = data-parallel within job */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+              <Cpu size={12} />
+              <span style={{ fontWeight: 600 }}>GPUs/job:</span>
+            </div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {[1, 2, 4].map(n => {
+                const active = bulkGpusPerJob === n
+                return (
+                  <button
+                    key={n}
+                    onClick={() => setBulkGpusPerJob(n)}
+                    style={{
+                      padding: '5px 10px', borderRadius: 6,
+                      border: `1px solid ${active ? 'var(--primary)' : 'var(--border-default)'}`,
+                      background: active ? 'var(--primary-dim)' : 'transparent',
+                      color: active ? 'var(--primary-hover)' : 'var(--text-secondary)',
+                      cursor: 'pointer',
+                      fontSize: 11.5, fontWeight: 500,
+                      fontFamily: 'var(--font-mono)', minWidth: 32,
+                    }}
+                    title={
+                      n === 1 ? 'Sequential — one job at a time' :
+                      n === 2 ? 'Data-parallel — 2 GPUs per job (half the jobs fit at once)' :
+                      'Data-parallel — 4 GPUs per job (only ~1 job fits at a time)'
+                    }
+                  >
+                    {n}
+                  </button>
+                )
+              })}
+            </div>
+            <div style={{ width: 1, height: 22, background: 'var(--border-subtle)' }} />
+
+            {/* Stop on first error — debug the broken model before running the rest */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer', userSelect: 'none' }}>
+              <input
+                type="checkbox"
+                checked={bulkStopOnError}
+                onChange={e => setBulkStopOnError(e.target.checked)}
+                style={{ width: 13, height: 13, cursor: 'pointer', accentColor: 'var(--primary)' }}
+              />
+              <span style={{ fontWeight: 500 }}>Stop on first error</span>
+            </label>
+
             {/* Push actions to the right */}
             <div style={{ flex: 1 }} />
             <button
@@ -863,6 +1168,7 @@ export default function TestAllModels() {
               style={{ display: 'flex', alignItems: 'center', gap: 6 }}
               onClick={() => {
                 for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
+                localStorage.removeItem(LS_MODULE_RUNS)
                 for (const jobId of [...activeJobs.keys()]) untrackJob(jobId)
                 notify()
               }}
@@ -871,6 +1177,25 @@ export default function TestAllModels() {
             >
               <RefreshCw size={14} /> Reset
             </button>
+            {gpuFreeGb !== null && (
+              <div
+                title={
+                  gpuTotalGb
+                    ? `Largest GPU on the Ray cluster has ${gpuFreeGb} GB free out of ${gpuTotalGb} GB total — drives the isCompatible() check`
+                    : `Largest GPU on the Ray cluster has ${gpuFreeGb} GB free — drives the isCompatible() check`
+                }
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 4,
+                  padding: '4px 9px', borderRadius: 14,
+                  background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
+                  fontSize: 11, fontFamily: 'var(--font-mono)',
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                <Cpu size={11} />
+                <span><strong style={{ color: 'var(--text-primary)' }}>{gpuFreeGb}</strong> GB GPU free</span>
+              </div>
+            )}
             <button
               className="btn btn-primary"
               style={{ display: 'flex', alignItems: 'center', gap: 6 }}
@@ -1018,7 +1343,7 @@ export default function TestAllModels() {
           const isIncompatible = !isCompatible(row.option)
 
           return (
-            <div key={row.key} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+            <div key={row.key} data-row-key={row.key} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: '32px 1.6fr 1fr 2fr 130px 110px 90px',
@@ -1143,6 +1468,19 @@ export default function TestAllModels() {
                       <div style={{ gridColumn: '1 / -1' }}>
                         <div style={{ color: 'var(--text-muted)', fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
                           <Terminal size={11} /> Training Log
+                          <button
+                            className="btn-icon"
+                            style={{ marginLeft: 'auto', padding: 2, color: 'var(--text-muted)' }}
+                            title="Copy log to clipboard"
+                            onClick={() => {
+                              navigator.clipboard.writeText(run.log).then(() => {
+                                setCopiedRowLog(prev => new Set(prev).add(row.key))
+                                setTimeout(() => setCopiedRowLog(prev => { const n = new Set(prev); n.delete(row.key); return n }), 1500)
+                              }).catch(() => { /* clipboard blocked */ })
+                            }}
+                          >
+                            {copiedRowLog.has(row.key) ? <Check size={11} /> : <Copy size={11} />}
+                          </button>
                         </div>
                         <pre style={{ background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 6, padding: 8, fontSize: 10.5, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto', margin: 0 }}>
                           {run.log.slice(-2000) || '(empty)'}
@@ -1295,6 +1633,7 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
   onClose:    () => void
 }) {
   const [copied, setCopied] = useState(false)
+  const [copiedRunLog, setCopiedRunLog] = useState(false)
 
   // Build a single-line summary of each failed model for copy/export
   const failureLines = report.failures.map(f =>
@@ -1364,14 +1703,24 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
             </span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, fontSize: 12, color: 'var(--text-secondary)' }}>
-            <span><strong style={{ color: 'var(--success)' }}>{report.ok}</strong> OK</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <strong style={{ color: 'var(--success)' }}>{report.ok}</strong>
+              {' '}OK
+              <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>(training passed)</span>
+            </span>
             {report.deployEnabled && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <Rocket size={11} color="var(--info, #3b82f6)" />
-                <strong style={{ color: 'var(--info, #3b82f6)' }}>{report.deployedCount}</strong> deployed
+                <strong style={{ color: 'var(--info, #3b82f6)' }}>{report.deployedCount}</strong>
+                {' '}deployed
+                <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>(serving via {report.provider})</span>
               </span>
             )}
-            <span><strong style={{ color: 'var(--danger)'  }}>{report.failed}</strong> failed</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <strong style={{ color: 'var(--danger)' }}>{report.failed}</strong>
+              {' '}failed
+              <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>(training or deploy error)</span>
+            </span>
             <span style={{ color: 'var(--text-muted)' }}>{okPct}% success</span>
           </div>
         </div>
@@ -1473,7 +1822,17 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
                   <button
                     className="btn btn-secondary btn-sm"
                     style={{ fontSize: 11, padding: '3px 8px', flexShrink: 0 }}
-                    onClick={() => setExpanded(prev => new Set(prev).add(f.key))}
+                    onClick={() => {
+                      setExpanded(prev => new Set(prev).add(f.key))
+                      // Scroll the matching row into view — the table is
+                      // far below the report panel, so just expanding
+                      // without scrolling leaves the user staring at
+                      // "nothing happened".
+                      setTimeout(() => {
+                        const el = document.querySelector(`[data-row-key="${f.key}"]`)
+                        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                      }, 50)
+                    }}
                     title="Open the row in the table below to see the full training log"
                   >
                     View log
@@ -1500,6 +1859,19 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
             <Terminal size={11} />
             Run log
             <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>({report.log.split('\n').filter(Boolean).length} lines)</span>
+            <button
+              className="btn-icon"
+              style={{ marginLeft: 'auto', padding: 2, color: 'var(--text-muted)' }}
+              title="Copy run log to clipboard"
+              onClick={() => {
+                navigator.clipboard.writeText(report.log).then(() => {
+                  setCopiedRunLog(true)
+                  setTimeout(() => setCopiedRunLog(false), 1500)
+                }).catch(() => { /* clipboard blocked */ })
+              }}
+            >
+              {copiedRunLog ? <Check size={11} /> : <Copy size={11} />}
+            </button>
           </div>
           <pre style={{
             margin: 0, padding: 10, flex: 1, overflowY: 'auto',
