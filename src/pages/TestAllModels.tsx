@@ -270,6 +270,11 @@ function _notifyModuleRuns() { for (const cb of _moduleRunsSubscribers) cb() }
 // would resurrect the report and the model statuses for one render
 // before the next (empty) push finally cleared them — visible flicker.
 let _resetInFlight = 0
+// Set to true while a bulk loop is actively iterating in the current
+// JS context. The hydrate uses this to know when NOT to overwrite the
+// loop's progress object (label / current / stage) with stale
+// snapshot-derived values — the loop is the source of truth mid-run.
+let _bulkLoopActive = false
 
 function _rebuildModuleRunsFromSnapshot(snap: BulkSnapshot) {
   // While a Reset is in flight, ignore any non-empty snapshot push —
@@ -512,7 +517,15 @@ function _hydrateBulkState() {
     _bulkState.dismissedRunId = null
     _writeDismissedRunId(null)
   }
-  if (_bulkState.running) {
+  if (_bulkState.running && !_bulkLoopActive) {
+    // Only hydrate the progress object when there's no in-flight loop
+    // in THIS JS context. If the loop is active, the loop is the
+    // source of truth — it sets { current: idx, label, stage: 'deploy'/'train' }
+    // and the hydrate (with label: '', stage: 'train') would clobber
+    // those every 1-2s, causing the model name to flicker to empty.
+    // On a fresh page load (no loop in this context), the loop is gone
+    // and the hydrate is the only way to seed the progress from the
+    // server snapshot.
     _bulkState.progress = {
       current: Math.min(done + 1, latest.total || 0),
       total:   latest.total || 0,
@@ -1068,6 +1081,10 @@ export default function TestAllModels() {
     let deployedOk = 0
     let stopped = false
     const logLines: string[] = []
+    // Mark the loop as active so the hydrate stops overwriting our
+    // progress object with a stale (label='', stage='train') snapshot
+    // value every 1-2s. Cleared in the finally block below.
+    _bulkLoopActive = true
 
     // Track the previous iteration's deployed job_id so we can stop its
     // Ray Serve actor before the next training job starts.
@@ -1234,6 +1251,7 @@ export default function TestAllModels() {
     _bulkState.progress = null
     _bulkState.running = false
     _bulkState.stopRequested = false
+    _bulkLoopActive = false
     _notifyBulk()
   }
 
