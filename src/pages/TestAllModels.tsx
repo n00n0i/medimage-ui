@@ -410,7 +410,24 @@ function useStoreSnapshot(): Record<string, TestRun> {
     // push will catch up within ≤2s, but we don't want the row to
     // freeze for 2s on every click — or forever if the WS is dead.
     const offLocal = subscribeModuleRuns(() => force(n => n + 1))
-    return () => { offSnap(); offLocal() }
+    // Polling fallback: the WS push can go silent (expired token,
+    // network blip, server restart, etc.) and the user is then
+    // stuck on whatever the last push delivered. As a safety net,
+    // fetch /api/bulk-runs/latest every 2s. The WS path (when
+    // alive) will still be faster; polling just guarantees the row
+    // status catches up with the actual jobs table.
+    const pollId = setInterval(async () => {
+      try {
+        const r = await fetch('/api/bulk-runs/latest', { headers: { Accept: 'application/json' } })
+        if (!r.ok) return
+        const d = await r.json()
+        // Apply via _applySnapshot so the same rebuild path runs.
+        // _applySnapshot triggers the WS subscriber chain, which
+        // calls _rebuildModuleRunsFromSnapshot and force().
+        _applySnapshot(d)
+      } catch { /* network blip — next tick will retry */ }
+    }, 2000)
+    return () => { offSnap(); offLocal(); clearInterval(pollId) }
   }, [])
   return moduleRuns
 }
