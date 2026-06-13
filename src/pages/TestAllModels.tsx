@@ -1118,7 +1118,7 @@ export default function TestAllModels() {
       }
 
       const existing = moduleRuns[row.key]
-      if (existing && (existing.status === 'queued' || existing.status === 'running' || existing.status === 'submitting')) {
+      if (existing && existing.jobId && (existing.status === 'queued' || existing.status === 'running' || existing.status === 'submitting')) {
         await waitForCompletion(row.key)
       } else if (existing && existing.status === 'completed') {
         logLines.push(`[${idx}/${targets.length}]  ✓  ${row.option.label}  (cached)`)
@@ -1126,6 +1126,10 @@ export default function TestAllModels() {
         setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
         continue
       } else {
+        if (existing && existing.status === 'submitting' && !existing.jobId) {
+          logLines.push(`[${idx}/${targets.length}]  ↻  re-submitting ${row.option.label} (orphaned 'submitting' with no jobId)`)
+          setRunLocal(row.key, { ...existing, status: 'idle', error: null, startedAt: null, finishedAt: null })
+        }
         await submitTest(row, bulkProvider)
         await waitForCompletion(row.key)
       }
