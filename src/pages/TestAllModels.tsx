@@ -253,6 +253,14 @@ interface BulkReport {
 // useStoreSnapshot(). The map is a derived view of the WebSocket
 // snapshot — pure renderer state, no writes from React.
 const moduleRuns: Record<string, TestRun> = {}
+// Subscribers for local-mutation notifications. The WS push triggers
+// _applySnapshot which fires these + the snapshot subscribers. But
+// setRunLocal mutates moduleRuns synchronously (e.g. status='submitting'
+// before the POST returns) without going through the WS — so we need
+// a separate notification path to re-render React. Without this, a
+// dead WS leaves the user staring at the pre-click state forever.
+const _moduleRunsSubscribers = new Set<() => void>()
+function _notifyModuleRuns() { for (const cb of _moduleRunsSubscribers) cb() }
 
 // Reset-in-flight counter. While > 0, both _rebuildModuleRunsFromSnapshot
 // and _hydrateBulkState treat incoming snapshots as stale (because the
@@ -277,6 +285,7 @@ function _rebuildModuleRunsFromSnapshot(snap: BulkSnapshot) {
     // "deployed" that the older "completed/error/no-jobId" filter
     // would have leaked through.
     for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
+    _notifyModuleRuns()
     return
   }
   // Merge jobs from ALL runs in the snapshot, not just runs[0]. A single
@@ -315,6 +324,11 @@ function _rebuildModuleRunsFromSnapshot(snap: BulkSnapshot) {
     }
   }
   _currentRunId = latest.id
+  // Force a re-render so React picks up the in-place mutations above
+  // — the useStoreSnapshot hook also subscribes to the WS push which
+  // already does this, but calling both is idempotent and belt-and-
+  // braces against any future code path that mutates without pushing.
+  _notifyModuleRuns()
 }
 
 function getRun(key: string): TestRun | undefined {
@@ -324,6 +338,13 @@ void getRun  // reserved for external introspection (jobs page badge)
 
 function setRunLocal(key: string, run: TestRun) {
   moduleRuns[key] = run
+  // Notify React subscribers so the row re-renders immediately. This
+  // covers the gap between the local mutation and the next WS push
+  // (≤2s) — without it, status='submitting' and the immediate
+  // 'queued'+jobId update would only become visible after the next
+  // snapshot arrives, and would silently never appear if the WS is
+  // dead (expired token, network blip, etc.).
+  _notifyModuleRuns()
   // Mirror to the server so the snapshot reflects the new state. If
   // we don't have a current bulk_run yet (single-model Test, not a
   // "Run all" pass), lazily create one so the row state still syncs
@@ -371,12 +392,23 @@ function useStoreSnapshot(): Record<string, TestRun> {
   const [, force] = useState(0)
   useEffect(() => {
     _rebuildModuleRunsFromSnapshot(getSnapshot())
-    return subscribeBulk(() => {
+    const offSnap = subscribeBulk(() => {
       _rebuildModuleRunsFromSnapshot(getSnapshot())
       force(n => n + 1)
     })
+    // Local-mutation path: setRunLocal (status='submitting' before
+    // the POST returns, etc.) mutates moduleRuns synchronously. The WS
+    // push will catch up within ≤2s, but we don't want the row to
+    // freeze for 2s on every click — or forever if the WS is dead.
+    const offLocal = subscribeModuleRuns(() => force(n => n + 1))
+    return () => { offSnap(); offLocal() }
   }, [])
   return moduleRuns
+}
+
+function subscribeModuleRuns(cb: () => void): () => void {
+  _moduleRunsSubscribers.add(cb)
+  return () => { _moduleRunsSubscribers.delete(cb) }
 }
 
 // ── Bulk state (progress + report) — derived from server snapshot ─────────
