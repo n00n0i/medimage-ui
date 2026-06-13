@@ -1,174 +1,144 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 
-// ─── Module-level background store ────────────────────────────────────────────
+// ─── Backend-authoritative state (SQLite + WebSocket) ─────────────────────────
 //
-// The Test All page can spend 30+ minutes running 30+ training jobs
-// sequentially. We don't want to:
-//
-//   • stop polling when the user navigates to /jobs or /models
-//   • lose the run state if the user reloads the page
-//   • duplicate a poll loop every time the component remounts
-//
-// So we keep the canonical state and the poll loop at module scope.
-// Components subscribe to changes and render the latest snapshot.
+// All Test-All run state lives on the server in `bulk_runs` and
+// `bulk_run_jobs` tables. The /ws/testall WebSocket pushes a fresh
+// snapshot every 2s. There is no localStorage, no module-level map, and
+// no client-side polling — the page is a pure renderer of the server
+// state. Any tab, any browser, any reload sees the same data.
 
-interface ActiveJobRef {
-  key: string
-  jobId: string
-  startedAt: number
+import keycloak from '../keycloak'
+import { getPref, setPref, deletePref, subscribePrefs, refreshPrefs } from '../lib/userPrefs'
+
+function wsTestAllUrl(): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = keycloak.token || ''
+  const base = `${proto}//${window.location.host}/ws/testall`
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base
 }
 
-const LS_ACTIVE_JOBS = 'medimage.testAll.activeJobs.v1'
-
-const activeJobs = new Map<string, ActiveJobRef>()           // jobId → ref
-const subscribers = new Set<() => void>()
-let pollInterval: number | null = null
-
-function loadPersistedJobs() {
-  try {
-    const raw = localStorage.getItem(LS_ACTIVE_JOBS)
-    if (!raw) return
-    const list: ActiveJobRef[] = JSON.parse(raw)
-    for (const r of list) activeJobs.set(r.jobId, r)
-  } catch { /* ignore */ }
+// In-memory mirror of the server state. Components subscribe to changes
+// and re-render. The store is filled by the WebSocket; mutations go back
+// to the server via REST.
+interface BulkJobRow {
+  row_key: string
+  job_id: string | null
+  status: string
+  error: string | null
+  elapsed_sec: number
+  deployed: number
+  deploy_url: string | null
 }
-function persistJobs() {
-  try {
-    localStorage.setItem(LS_ACTIVE_JOBS, JSON.stringify([...activeJobs.values()]))
-  } catch { /* ignore */ }
-}
-loadPersistedJobs()
-
-function notify() { for (const cb of subscribers) cb() }
-
-function trackJob(key: string, jobId: string) {
-  activeJobs.set(jobId, { key, jobId, startedAt: Date.now() / 1000 })
-  persistJobs()
-  ensurePolling()
-  notify()
+interface BulkRunRow {
+  id: string
+  started_at: number
+  finished_at: number | null
+  stopped: number
+  provider: string
+  deploy_enabled: number
+  total: number
+  ok: number
+  failed: number
+  deployed_count: number
 }
 
-function untrackJob(jobId: string) {
-  activeJobs.delete(jobId)
-  persistJobs()
-  if (activeJobs.size === 0 && pollInterval !== null) {
-    window.clearInterval(pollInterval)
-    pollInterval = null
+interface BulkSnapshot {
+  runs: BulkRunRow[]
+  jobs_by_run: Record<string, BulkJobRow[]>
+}
+
+const _snapshot: BulkSnapshot = { runs: [], jobs_by_run: {} }
+const _subs = new Set<() => void>()
+let _ws: WebSocket | null = null
+let _wsRetry: ReturnType<typeof setTimeout> | null = null
+let _currentRunId: string | null = null
+let _connected = false
+
+function _applySnapshot(snap: BulkSnapshot) {
+  Object.assign(_snapshot, snap)
+  for (const cb of _subs) cb()
+}
+
+function _connect() {
+  if (_ws && _ws.readyState <= 1) return
+  const ws = new WebSocket(wsTestAllUrl())
+  _ws = ws
+  ws.onopen  = () => { _connected = true; for (const cb of _subs) cb() }
+  ws.onclose = () => {
+    _connected = false
+    for (const cb of _subs) cb()
+    if (_wsRetry) clearTimeout(_wsRetry)
+    _wsRetry = setTimeout(_connect, 3000)
   }
-  notify()
-}
-
-function isJobTracked(jobId: string): boolean {
-  return activeJobs.has(jobId)
-}
-void isJobTracked  // reserved for future "is running elsewhere" badge
-
-function getTrackedJobs(): ActiveJobRef[] {
-  return [...activeJobs.values()]
-}
-
-async function pollOnce() {
-  const refs = getTrackedJobs()
-  if (refs.length === 0) return
-  await Promise.all(refs.map(async ref => {
+  ws.onerror = () => ws.close()
+  ws.onmessage = (e) => {
     try {
-      const res = await fetch(`/api/jobs/${ref.jobId}`)
-      if (!res.ok) return
-      const j = await res.json()
-      const status: TestRun['status'] =
-        j.status === 'completed' ? 'completed' :
-        j.status === 'error'     ? 'error' :
-        j.status === 'running'   ? 'running' : 'queued'
-      const finishedAt = (j.status === 'completed' || j.status === 'error')
-        ? (j.finished_at ?? Date.now() / 1000) : null
-      updateRunFromBackend(ref.key, {
-        jobId:      ref.jobId,
-        status,
-        error:      j.status === 'error' ? (j.error || 'Unknown error') : null,
-        finishedAt,
-        log:        j.log,
-      })
-      if (status === 'completed' || status === 'error') {
-        untrackJob(ref.jobId)
+      const msg = JSON.parse(e.data)
+      if (msg.type === 'bulk_snapshot' && msg.data) {
+        _applySnapshot(msg.data)
       }
     } catch { /* ignore */ }
-  }))
-}
-
-// ── Cross-browser sync ───────────────────────────────────────────────────────
-// The state for "in-flight" jobs (activeJobs + moduleRuns) used to be
-// purely client-side. That meant opening the test-all page in a 2nd
-// browser while a bulk run was in progress on the 1st showed an empty
-// table — the 2nd browser had no way to know about the 1st's jobs.
-//
-// We treat the medimage API as source of truth: on mount, fetch every
-// job with status in (running, queued) and inject them into the local
-// tracking structures using the same `key` shape the table renders.
-// The 3s poll loop then keeps these in sync from there on.
-let _initialSyncDone = false
-async function _syncInFlightJobsFromBackend(): Promise<void> {
-  if (_initialSyncDone) return
-  _initialSyncDone = true
-  try {
-    const res = await fetch('/api/jobs?view=jobs')
-    if (!res.ok) return
-    const data = await res.json()
-    const jobs: any[] = data?.jobs ?? []
-    // Snapshot the model rows so the matcher can read .option.model
-    // without capturing stale references.
-    const _rowByKey = new Map<string, ModelRow>()
-    for (const t of TYPE_ORDER) {
-      for (const opt of (TRAINING_MATRIX[t] || []) as TrainOption[]) {
-        _rowByKey.set(`${t}:${opt.value}`, { key: `${t}:${opt.value}`, trainingType: t as TrainingType, option: opt })
-      }
-    }
-    let added = 0
-    for (const j of jobs) {
-      if (j.status !== 'running' && j.status !== 'queued') continue
-      // Find the matching model row by model_name + training_type + engine.
-      // The catalog uses the same `model` field as `timm_name`/`model_name`
-      // in the training payload so the match is direct.
-      let matchedKey: string | null = null
-      for (const r of _rowByKey.values()) {
-        if (r.option.model === j.model
-            && r.trainingType === j.training_type
-            && r.option.engine === j.engine) {
-          matchedKey = r.key
-          break
-        }
-      }
-      if (!matchedKey) continue  // job is for a model this page doesn't list
-      // Don't overwrite a fresher local state (the local browser may
-      // already be tracking this job with a more recent snapshot).
-      const existing = moduleRuns[matchedKey]
-      if (existing && (existing.status === 'running' || existing.status === 'queued')
-          && existing.jobId === j.id) {
-        continue
-      }
-      trackJob(matchedKey, j.id)
-      updateRunFromBackend(matchedKey, {
-        jobId:      j.id,
-        status:     j.status === 'running' ? 'running' : 'queued',
-        error:      null,
-        finishedAt: null,
-        log:        '',
-      })
-      added += 1
-    }
-    if (added > 0) {
-      console.info(`[test-all] synced ${added} in-flight job(s) from backend`)
-    }
-  } catch (e) {
-    console.warn('[test-all] cross-browser sync failed:', e)
-    _initialSyncDone = false  // allow retry on next mount
   }
 }
 
-function ensurePolling() {
-  if (pollInterval !== null) return
-  pollInterval = window.setInterval(pollOnce, 3000)
-  // Kick off an immediate poll so the UI updates without waiting 3s
-  void pollOnce()
+_connect()
+
+function isTestAllConnected(): boolean { return _connected }
+void isTestAllConnected  // reserved for future connection-status badge
+
+function getSnapshot(): BulkSnapshot { return _snapshot }
+
+function subscribeBulk(cb: () => void): () => void {
+  _subs.add(cb)
+  return () => { _subs.delete(cb) }
+}
+
+// ── REST helpers ──────────────────────────────────────────────────────────────
+async function apiCreateBulkRun(provider: string, deployEnabled: boolean, total: number): Promise<string> {
+  const r = await fetch('/api/bulk-runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, deploy_enabled: deployEnabled, total }),
+  })
+  if (!r.ok) throw new Error(`create bulk run HTTP ${r.status}`)
+  const d = await r.json()
+  return d.id
+}
+
+async function apiUpdateBulkRun(rid: string, patch: Record<string, any>) {
+  const r = await fetch(`/api/bulk-runs/${rid}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  if (!r.ok) throw new Error(`update bulk run HTTP ${r.status}`)
+}
+
+async function apiStopBulkRun(rid: string): Promise<{ updated: number }> {
+  // Mark the bulk run as stopped on the server. Idempotent — safe to
+  // call repeatedly and safe when the run is already finished.
+  const r = await fetch(`/api/bulk-runs/${rid}/stop`, { method: 'POST' })
+  if (!r.ok) throw new Error(`stop bulk run HTTP ${r.status}`)
+  return r.json()
+}
+
+async function apiUpsertBulkJob(rid: string, row_key: string, patch: Record<string, any>) {
+  const r = await fetch(`/api/bulk-runs/${rid}/jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ row_key, ...patch }),
+  })
+  if (!r.ok) throw new Error(`upsert bulk job HTTP ${r.status}`)
+}
+
+async function _apiFetchJob(jobId: string): Promise<{ status: string; error: string | null; finished_at: number | null; log: string } | null> {
+  try {
+    const r = await fetch(`/api/jobs/${jobId}`)
+    if (!r.ok) return null
+    const j = await r.json()
+    return { status: j.status, error: j.error, finished_at: j.finished_at, log: j.log || '' }
+  } catch { return null }
 }
 import {
   FlaskConical, Play, RefreshCw, Loader2, CheckCircle2, XCircle, Clock,
@@ -180,7 +150,7 @@ import { TRAINING_MATRIX } from './TrainModel'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
+type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text' | 'anomaly-detection'
 
 interface TrainOption {
   value: string
@@ -216,7 +186,7 @@ interface TextDataset {
 interface TestRun {
   key: string
   jobId: string | null
-  status: 'idle' | 'submitting' | 'queued' | 'running' | 'completed' | 'error'
+  status: 'idle' | 'submitting' | 'queued' | 'running' | 'deploying' | 'deployed' | 'completed' | 'error'
   error: string | null
   startedAt: number | null
   finishedAt: number | null
@@ -263,36 +233,73 @@ interface BulkReport {
   log:           string          // human-readable full run log (line per model)
 }
 
-const LS_MODULE_RUNS = 'medimage.testAll.moduleRuns.v1'
-
 // Module-level runs map. Components subscribe to changes via
-// useStoreSnapshot(). Kept outside React state so the polling loop
-// at module scope can mutate it without going through setState.
+// useStoreSnapshot(). The map is a derived view of the WebSocket
+// snapshot — pure renderer state, no writes from React.
 const moduleRuns: Record<string, TestRun> = {}
 
-function _persistRuns() {
-  try {
-    // Only persist terminal runs (completed/error) to avoid stale
-    // "running" states surviving a page refresh.
-    const snap: Record<string, TestRun> = {}
-    for (const [k, v] of Object.entries(moduleRuns)) {
-      if (v.status === 'completed' || v.status === 'error') snap[k] = v
-    }
-    localStorage.setItem(LS_MODULE_RUNS, JSON.stringify(snap))
-  } catch { /* quota etc */ }
-}
+// Reset-in-flight counter. While > 0, both _rebuildModuleRunsFromSnapshot
+// and _hydrateBulkState treat incoming snapshots as stale (because the
+// server's DELETE for the reset is still in flight and a WS push may
+// still carry the old rows). Without this guard, the Reset button
+// would clear the UI, then a 2s-late WS push with the old snapshot
+// would resurrect the report and the model statuses for one render
+// before the next (empty) push finally cleared them — visible flicker.
+let _resetInFlight = 0
 
-function _loadPersistedRuns() {
-  try {
-    const raw = localStorage.getItem(LS_MODULE_RUNS)
-    if (!raw) return
-    const saved: Record<string, TestRun> = JSON.parse(raw)
-    for (const [k, v] of Object.entries(saved)) {
-      if (!moduleRuns[k]) moduleRuns[k] = v
+function _rebuildModuleRunsFromSnapshot(snap: BulkSnapshot) {
+  // While a Reset is in flight, ignore any non-empty snapshot push —
+  // it's almost certainly the pre-DELETE data, and merging it would
+  // resurrect rows the user just cleared. The post-DELETE empty
+  // snapshot (handled below) still works and finishes the clear.
+  if (_resetInFlight > 0 && snap.runs.length > 0) return
+  const latest = snap.runs[0]
+  if (!latest) {
+    // Empty snapshot — the server has no bulk_runs for this user
+    // (e.g. fresh page load, or a Reset just deleted them). Clear
+    // ALL local rows including terminal-but-with-jobId states like
+    // "deployed" that the older "completed/error/no-jobId" filter
+    // would have leaked through.
+    for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
+    return
+  }
+  // Merge jobs from ALL runs in the snapshot, not just runs[0]. A single
+  // Test gets attached to whatever _currentRunId was at submit time —
+  // if a "Run all compatible" started afterwards, runs[0] is the bulk
+  // run and the single Test's row sits in an older run. We need to see
+  // both. The latest run still wins for the "current" pointer.
+  for (const rid of Object.keys(snap.jobs_by_run)) {
+    const runRow = snap.runs.find(r => r.id === rid)
+    const runStarted  = runRow?.started_at  ?? latest.started_at
+    const runFinished = runRow?.finished_at ?? null
+    for (const j of snap.jobs_by_run[rid] || []) {
+      const status = (
+        j.status === 'completed' ? 'completed' :
+        j.status === 'error'     ? 'error' :
+        j.status === 'running'   ? 'running' :
+        j.status === 'deploying' ? 'deploying' :
+        j.status === 'deployed'  ? 'deployed' :
+        j.status === 'queued'    ? 'queued' :
+        j.status === 'submitting' ? 'submitting' : 'idle'
+      ) as TestRun['status']
+      moduleRuns[j.row_key] = {
+        key:          j.row_key,
+        jobId:        j.job_id,
+        status,
+        error:        j.error,
+        // Per-job times, not the bulk-run times — the Elapsed column
+        // should track the individual model's training duration, not
+        // how long ago the whole bulk run started. The backend overlays
+        // the live started_at/finished_at from the `jobs` table.
+        startedAt:    (j as any).started_at ?? runStarted,
+        finishedAt:   (status === 'completed' || status === 'error' || status === 'deployed') ? ((j as any).finished_at ?? runFinished) : null,
+        log:          '',
+        datasetLabel: '',
+      }
     }
-  } catch { /* ignore */ }
+  }
+  _currentRunId = latest.id
 }
-_loadPersistedRuns()
 
 function getRun(key: string): TestRun | undefined {
   return moduleRuns[key]
@@ -301,51 +308,62 @@ void getRun  // reserved for external introspection (jobs page badge)
 
 function setRunLocal(key: string, run: TestRun) {
   moduleRuns[key] = run
-  _persistRuns()
-  notify()
+  // Mirror to the server so the snapshot reflects the new state. If
+  // we don't have a current bulk_run yet (single-model Test, not a
+  // "Run all" pass), lazily create one so the row state still syncs
+  // and survives reloads / other tabs.
+  if (_currentRunId) {
+    void _pushRowToServer(_currentRunId, key, run)
+  } else {
+    void _ensureSingleRunId().then(rid => {
+      if (rid) void _pushRowToServer(rid, key, run)
+    })
+  }
 }
 
-function updateRunFromBackend(key: string, patch: Partial<TestRun> & { jobId: string }) {
-  const cur = moduleRuns[key]
-  const { jobId, ...rest } = patch
-  if (!cur) {
-    moduleRuns[key] = {
-      key,
-      jobId,
-      status:     'submitting',
-      error:      null,
-      startedAt:  null,
-      finishedAt: null,
-      log:        '',
-      datasetLabel: '',
-      ...rest,
-    }
-  } else {
-    moduleRuns[key] = { ...cur, jobId, ...rest }
-  }
-  _persistRuns()
-  notify()
+let _ensuringRun: Promise<string | null> | null = null
+async function _ensureSingleRunId(): Promise<string | null> {
+  // setRunLocal is called twice in quick succession for a single Test
+  // (status='submitting' before the POST returns, then status='queued'
+  // with jobId after). Both calls would otherwise race to create
+  // separate bulk_runs and leave the job attached to one of them. Cache
+  // the in-flight promise so the second call awaits the first.
+  if (_ensuringRun) return _ensuringRun
+  _ensuringRun = (async () => {
+    try {
+      const rid = await apiCreateBulkRun('ray', false, 1)
+      _currentRunId = rid
+      return rid
+    } catch { return null }
+    finally { _ensuringRun = null }
+  })()
+  return _ensuringRun
+}
+
+function _pushRowToServer(rid: string, key: string, run: TestRun) {
+  return apiUpsertBulkJob(rid, key, {
+    job_id:     run.jobId,
+    status:     run.status,
+    error:      run.error,
+    elapsed_sec: 0,
+    deployed:   false,
+    deploy_url: null,
+  })
 }
 
 function useStoreSnapshot(): Record<string, TestRun> {
   const [, force] = useState(0)
   useEffect(() => {
-    const cb = () => force(n => n + 1)
-    subscribers.add(cb)
-    // Cross-browser sync: pull any in-flight jobs the backend knows
-    // about but this browser hasn't seen yet (e.g. started from a
-    // different browser's bulk run). The poll loop then takes over.
-    void _syncInFlightJobsFromBackend()
-    ensurePolling()
-    return () => { subscribers.delete(cb) }
+    _rebuildModuleRunsFromSnapshot(getSnapshot())
+    return subscribeBulk(() => {
+      _rebuildModuleRunsFromSnapshot(getSnapshot())
+      force(n => n + 1)
+    })
   }, [])
   return moduleRuns
 }
 
-// ── Module-level bulk state (survives navigation / re-mount) ──────────────
-const LS_BULK_REPORT = 'medimage.testAll.bulkReport.v1'
-const LS_BULK_RUNNING = 'medimage.testAll.bulkRunning.v1'
-const LS_BULK_PROGRESS = 'medimage.testAll.bulkProgress.v1'
+// ── Bulk state (progress + report) — derived from server snapshot ─────────
 interface BulkStreamEntry { label: string; status: 'ok' | 'err' | 'deploy' | 'deployed'; error?: string }
 const _bulkState = {
   running: false,
@@ -353,56 +371,143 @@ const _bulkState = {
   progress: null as { current: number; total: number; label: string; stage: 'train' | 'deploy' } | null,
   report: null as BulkReport | null,
   stream: [] as BulkStreamEntry[],
+  // When the user dismisses the "Bulk run stopped/finished" panel we
+  // remember the started_at of the run they dismissed so a follow-up
+  // WS push doesn't immediately re-create the report. Reset when a NEW
+  // run starts (different started_at). Persisted to user_prefs (server-
+  // side, per-user) so a page refresh — in any browser, any tab, any
+  // device — doesn't resurrect the dismissed report.
+  dismissedRunId: _readDismissedRunId(),
 }
 const _bulkSubscribers = new Set<() => void>()
 function _notifyBulk() { for (const cb of _bulkSubscribers) cb() }
 
-function _persistBulkState() {
-  try {
-    localStorage.setItem(LS_BULK_RUNNING, JSON.stringify(_bulkState.running))
-    if (_bulkState.progress) localStorage.setItem(LS_BULK_PROGRESS, JSON.stringify(_bulkState.progress))
-    else localStorage.removeItem(LS_BULK_PROGRESS)
-  } catch { /* ignore */ }
+// Persisted "user dismissed this run's report" flag. Stored server-side
+// in the user_prefs table (per-user) so the dismissal survives a page
+// refresh AND any browser/tab/device the same user logs in from. Read
+// synchronously from the in-memory mirror — once the mirror is loaded
+// the value is stable for this session.
+const _BULK_DISMISS_KEY = 'medimage.bulkReport.dismissedRunId'
+// Set true the first time the prefs mirror populates (or first write
+// that creates the entry). Until then, _hydrateBulkState() must NOT
+// build a report — otherwise the report would flash on screen and then
+// get hidden once prefs arrive.
+let _prefsReady = false
+function _readDismissedRunId(): string | null {
+  const v = getPref(_BULK_DISMISS_KEY)
+  return v ?? null
 }
-function _loadBulkRunning() {
-  try {
-    const v = localStorage.getItem(LS_BULK_RUNNING)
-    if (v === 'true') _bulkState.running = true
-  } catch { /* ignore */ }
+function _writeDismissedRunId(id: string | null) {
+  _prefsReady = true
+  if (id == null) void deletePref(_BULK_DISMISS_KEY)
+  else void setPref(_BULK_DISMISS_KEY, id)
 }
-_loadBulkRunning()
 
-function _persistBulkReport() {
-  try {
-    if (_bulkState.report) localStorage.setItem(LS_BULK_REPORT, JSON.stringify(_bulkState.report))
-    else localStorage.removeItem(LS_BULK_REPORT)
-  } catch { /* ignore */ }
+function _hydrateBulkState() {
+  const snap = getSnapshot()
+  const latest = snap.runs[0]
+  if (!latest) return
+  // While a Reset is in flight, ignore non-empty snapshots so the
+  // just-cleared report doesn't get resurrected from a stale WS push.
+  // The local `report = null` written by the Reset handler stays in
+  // place until the post-DELETE empty snapshot (handled by the early
+  // return above) is received.
+  if (_resetInFlight > 0) {
+    _bulkState.report = null
+    return
+  }
+  const jobs = snap.jobs_by_run[latest.id] || []
+  const done = jobs.filter(j => j.status === 'completed' || j.status === 'error').length
+  _bulkState.running = latest.finished_at == null
+  // Match dismissal by started_at (stable unix timestamp). This is more
+  // robust than the run UUID because the timestamp is identical between
+  // dismiss time and the next page load, regardless of snapshot state.
+  const latestKey = String(latest.started_at)
+  // Re-read the dismissed flag from the prefs mirror every hydrate —
+  // the mirror loads asynchronously after module init, so the value
+  // set in the _bulkState initializer may be stale. This is the
+  // server-side source of truth (per-user, survives any client storage
+  // being cleared).
+  const fromPrefs = _readDismissedRunId()
+  if (fromPrefs !== _bulkState.dismissedRunId) {
+    _bulkState.dismissedRunId = fromPrefs
+  }
+  // When a new run starts (different started_at), clear the dismissed
+  // flag so the user can see its report when it finishes.
+  if (_bulkState.dismissedRunId && _bulkState.dismissedRunId !== latestKey) {
+    _bulkState.dismissedRunId = null
+    _writeDismissedRunId(null)
+  }
+  if (_bulkState.running) {
+    _bulkState.progress = {
+      current: Math.min(done + 1, latest.total || 0),
+      total:   latest.total || 0,
+      label:   '',
+      stage:   'train',
+    }
+  }
+  // Only (re)build the report if the run finished AND the user hasn't
+  // dismissed this run's report yet. If the user *has* dismissed it,
+  // make sure any stale report is cleared.
+  //
+  // Wait for the prefs mirror to load before deciding — without this
+  // guard, the report would flash on every page load (briefly shown
+  // while dismissedRunId is still null, then hidden once prefs arrive).
+  if (!_prefsReady) return
+  if (latest.finished_at != null && _bulkState.dismissedRunId === latestKey) {
+    _bulkState.report = null
+  } else if (latest.finished_at != null) {
+    _bulkState.report = {
+      startedAt:     latest.started_at,
+      finishedAt:    latest.finished_at,
+      total:         latest.total,
+      ok:            latest.ok,
+      failed:        latest.failed,
+      deployedCount: latest.deployed_count,
+      stopped:       !!latest.stopped,
+      provider:      latest.provider as 'ray' | 'modal' | null,
+      deployEnabled: !!latest.deploy_enabled,
+      failures: jobs.filter(j => j.status === 'error').map(j => ({
+        key: j.row_key, label: j.row_key, trainingType: 'classification' as TrainingType,
+        engine: '', model: '', error: j.error || 'unknown', jobId: j.job_id, stage: 'train' as const,
+      })),
+      deployed: jobs.filter(j => j.deployed).map(j => ({
+        key: j.row_key, label: j.row_key, provider: 'ray' as const,
+        url: j.deploy_url || '', elapsedSec: j.elapsed_sec,
+      })),
+      log: '',
+    }
+  }
 }
-function _loadBulkReport() {
-  try {
-    const raw = localStorage.getItem(LS_BULK_REPORT)
-    if (raw) _bulkState.report = JSON.parse(raw)
-  } catch { /* ignore */ }
-}
-_loadBulkReport()
 
 function useBulkState() {
   const [, force] = useState(0)
   useEffect(() => {
-    const cb = () => force(n => n + 1)
-    _bulkSubscribers.add(cb)
-    // If the page was refreshed while a bulk run was in progress, the
-    // sequential loop is gone (JS context was destroyed). Check if there
-    // are still active jobs; if not, clear the stale "running" flag so
-    // the Stop button doesn't linger forever.
-    if (_bulkState.running && activeJobs.size === 0) {
-      _bulkState.running = false
-      _bulkState.stopRequested = false
-      _bulkState.progress = null
-      _persistBulkState()
+    // userPrefs doesn't auto-load on import (would race keycloak init
+    // and 401). Trigger the load now — this useEffect runs after the
+    // component mounts, which is after keycloak is ready, so the
+    // patched fetch can inject the Bearer token. Once the mirror is
+    // populated, subscribePrefs will fire and re-hydrate the bulk state
+    // with the correct dismissed flag (and flip _prefsReady so the
+    // hydrate stops guarding on the uninitialised mirror).
+    void refreshPrefs()
+    _hydrateBulkState()
+    const offSnap = subscribeBulk(() => {
+      _hydrateBulkState()
       _notifyBulk()
-    }
-    return () => { _bulkSubscribers.delete(cb) }
+      force(n => n + 1)
+    })
+    // Also re-hydrate when the user-prefs mirror updates. The dismissed
+    // flag is read from the mirror, so when prefs load asynchronously
+    // we need to re-check the dismissed flag and (if it now matches the
+    // latest run) clear the report.
+    const offPrefs = subscribePrefs(() => {
+      _prefsReady = true
+      _hydrateBulkState()
+      _notifyBulk()
+      force(n => n + 1)
+    })
+    return () => { offSnap(); offPrefs() }
   }, [])
   return _bulkState
 }
@@ -414,6 +519,7 @@ const TYPE_LABELS: Record<TrainingType, string> = {
   'llm-text':          'LLM',
   'vlm-finetune':      'VLM',
   'self-supervised':   'Self-Sup',
+  'anomaly-detection': 'Anomaly',
 }
 
 const TYPE_COLORS: Record<TrainingType, string> = {
@@ -423,9 +529,10 @@ const TYPE_COLORS: Record<TrainingType, string> = {
   'llm-text':          '#8b5cf6',
   'vlm-finetune':      '#3b82f6',
   'self-supervised':   '#14b8a6',
+  'anomaly-detection': '#ef4444',
 }
 
-const TYPE_ORDER: TrainingType[] = ['classification', 'detection', 'segmentation', 'llm-text', 'vlm-finetune', 'self-supervised']
+const TYPE_ORDER: TrainingType[] = ['classification', 'detection', 'segmentation', 'anomaly-detection', 'llm-text', 'vlm-finetune', 'self-supervised']
 
 const LS_TOKEN = 'medimage-ls-token-2026'
 
@@ -534,15 +641,19 @@ export default function TestAllModels() {
   // Per-row "copied" feedback so the Copy icon next to the training log
   // can flash a check for 1.5s after the user clicks it.
   const [copiedRowLog, setCopiedRowLog] = useState<Set<string>>(new Set())
+  // Per-row training log fetched on-demand. The bulk-run WS snapshot
+  // intentionally omits the log (bandwidth — 78 jobs × multi-KB each
+  // every 2s would explode). When the user expands a row, we poll
+  // /api/jobs/{jobId} every 2s and cache the result here so the
+  // expanded panel can render the latest output.
+  const [rowLogs, setRowLogs] = useState<Record<string, string>>({})
 
-  // Bulk run control — also module-scoped so the bulk loop survives
-  // navigation. We mirror into useState for re-render.
+  // Bulk run control — derived from the WebSocket snapshot (running,
+  // progress, report). stopRequested is local-only (it lives for the
+  // current browser session and is cleared when the loop ends).
   const bulk = useBulkState()
-  // Convenience aliases — the setters update module state + notify subscribers
-  const setBulkRunning    = (v: boolean) => { _bulkState.running = v; _persistBulkState(); _notifyBulk() }
+  // Local-only — not persisted
   const setBulkStopRequested = (v: boolean) => { _bulkState.stopRequested = v; _notifyBulk() }
-  const setBulkProgress   = (v: typeof bulk.progress) => { _bulkState.progress = v; _persistBulkState(); _notifyBulk() }
-  const setBulkReport     = (v: BulkReport | null) => { _bulkState.report = v; _persistBulkReport(); _notifyBulk() }
   const setBulkStream     = (v: BulkStreamEntry[] | ((prev: BulkStreamEntry[]) => BulkStreamEntry[])) => {
     bulk.stream = typeof v === 'function' ? v(bulk.stream) : v; _notifyBulk()
   }
@@ -550,6 +661,27 @@ export default function TestAllModels() {
   const bulkProgress      = bulk.progress
   const bulkReport        = bulk.report
   const bulkStream        = bulk.stream
+
+  // Poll /api/jobs/{jobId} for every expanded row so the Training Log
+  // panel shows live output for running jobs. The bulk-run WS snapshot
+  // doesn't carry logs (intentional — would be too much data per push),
+  // so we fetch on demand only for rows the user is actually looking at.
+  useEffect(() => {
+    const timers: ReturnType<typeof setInterval>[] = []
+    for (const key of expanded) {
+      const jobId = moduleRuns[key]?.jobId
+      if (!jobId) continue
+      const poll = async () => {
+        const job = await _apiFetchJob(jobId)
+        if (job && job.log != null) {
+          setRowLogs(prev => prev[key] === job.log ? prev : { ...prev, [key]: job.log })
+        }
+      }
+      void poll()
+      timers.push(setInterval(poll, 2000))
+    }
+    return () => { for (const t of timers) clearInterval(t) }
+  }, [expanded])
 
   // Pre-run config — picked once before the bulk loop starts
   const [bulkProvider, setBulkProvider] = useState<'ray' | 'modal'>('ray')
@@ -696,6 +828,10 @@ export default function TestAllModels() {
     if (row.trainingType === 'detection' && row.option.engine === 'Ultralytics' && p.finished_task_number < 5) {
       return `Project "${p.title}" only has ${p.finished_task_number} labeled tasks — detection needs ≥5 to be useful`
     }
+    // Anomaly detection only needs 1+ normal image; labels are optional
+    if (row.trainingType === 'anomaly-detection' && p.finished_task_number < 1) {
+      return `Project "${p.title}" has 0 images — anomaly detection needs ≥1 normal image`
+    }
     return null
   }, [lsProjects, textDatasets])
 
@@ -745,9 +881,9 @@ export default function TestAllModels() {
       setRunLocal(row.key, {
         ...cur, jobId: job_id, status: 'queued', startedAt: Date.now() / 1000,
       })
-      // Track at module scope so the background poll loop will pick
-      // it up even if the user navigates away.
-      trackJob(row.key, job_id)
+      // The bulk-run snapshot is updated by setRunLocal (which calls
+      // apiUpsertBulkJob). The /ws/testall WebSocket will push the
+      // updated state back within 2s.
     } catch (e: any) {
       const cur = moduleRuns[row.key]
       setRunLocal(row.key, {
@@ -811,11 +947,9 @@ export default function TestAllModels() {
     }
   }, [])
 
-  // ── Polling is now handled by the module-level ensurePolling() ──
-  //    The background poll loop fires every 3s while any job is tracked
-  //    and updates the store regardless of whether this component is
-  //    mounted. The useStoreSnapshot() hook above re-renders this view
-  //    whenever the store changes.
+  // ── Real-time updates: handled by the /ws/testall WebSocket at the
+  //    top of this file. The server pushes a fresh snapshot every 2s
+  //    and useStoreSnapshot() re-renders this view whenever it changes.
 
   // ── Wait until a given run reaches a terminal state (OK or error).
   //    Polls the job endpoint every 2s; resolves as soon as the run is
@@ -837,13 +971,23 @@ export default function TestAllModels() {
   //    starts; every model goes to the same provider. ──────────────────
   const runAllCompatible = async () => {
     if (bulkRunning) return
-    setBulkRunning(true)
     setBulkStopRequested(false)
     setBulkStream([])
-    setBulkReport(null)
+
+    // Create the bulk_runs row first so the server knows we're starting
+    // a new run. From this point on, every per-model state change goes
+    // to /api/bulk-runs/{id}/jobs and the WebSocket will broadcast.
+    let runId: string
+    try {
+      const targets = filteredRows.filter(r => isCompatible(r.option))
+      runId = await apiCreateBulkRun(bulkProvider, bulkDeployEnabled, targets.length)
+      _currentRunId = runId
+    } catch (e: any) {
+      alert(`Could not start bulk run: ${e.message}`)
+      return
+    }
 
     const targets = filteredRows.filter(r => isCompatible(r.option))
-    const startedAt = Date.now() / 1000
     const failures: BulkFailure[] = []
     const deployed: BulkDeployed[] = []
     let ok = 0
@@ -852,16 +996,10 @@ export default function TestAllModels() {
     const logLines: string[] = []
 
     // Track the previous iteration's deployed job_id so we can stop its
-    // Ray Serve actor before the next training job starts. Each deploy
-    // holds 1 GPU for the lifetime of its actor — on a 4-GPU cluster
-    // the 5th train would otherwise sit PENDING forever waiting for
-    // resources. The current deploy stays alive so the user can keep
-    // poking its endpoint until the next iteration replaces it.
+    // Ray Serve actor before the next training job starts.
     let prevDeployedJobId: string | null = null
 
     // Pre-flight: stop any deploys left over from a previous bulk run
-    // (or from manual deployments via the DeployModels page). The user
-    // can always re-deploy manually after the test-all finishes.
     if (bulkDeployEnabled) {
       try {
         const r = await fetch('/api/ray/serve/stop-all', { method: 'POST' })
@@ -878,23 +1016,18 @@ export default function TestAllModels() {
     for (const row of targets) {
       if (bulk.stopRequested) { stopped = true; break }
       idx += 1
-      setBulkProgress({ current: idx, total: targets.length, label: row.option.label, stage: 'train' })
+      _bulkState.progress = { current: idx, total: targets.length, label: row.option.label, stage: 'train' }
+      _notifyBulk()
 
-      // Free the GPU that the previous deploy is holding (if any) so
-      // this training job can be scheduled. We do this BEFORE the train
-      // submit so the autoscaler sees a free GPU when placing the job.
+      // Free the GPU that the previous deploy is holding
       if (bulkDeployEnabled && prevDeployedJobId) {
         const stop = await stopDeploy(prevDeployedJobId)
         logLines.push(`[${idx}/${targets.length}]  ↻  stopped prev deploy ${prevDeployedJobId.slice(0, 8)}… (${stop.ok ? 'ok' : 'fail'})`)
         prevDeployedJobId = null
       }
 
-      // Skip rows that already finished in a previous run, but re-run
-      // anything that errored so the user can retry without resetting
-      // the whole table.
       const existing = moduleRuns[row.key]
       if (existing && (existing.status === 'queued' || existing.status === 'running' || existing.status === 'submitting')) {
-        // Wait for the in-flight one first
         await waitForCompletion(row.key)
       } else if (existing && existing.status === 'completed') {
         logLines.push(`[${idx}/${targets.length}]  ✓  ${row.option.label}  (cached)`)
@@ -906,8 +1039,6 @@ export default function TestAllModels() {
         await waitForCompletion(row.key)
       }
 
-      // Read the final state from the module store (the polling loop
-      // has already attributed the job's status to this row key).
       const final = moduleRuns[row.key]
       if (final?.status !== 'completed') {
         const errMsg = (final?.error ?? 'Unknown error').slice(0, 500)
@@ -922,21 +1053,38 @@ export default function TestAllModels() {
           stage:        'train',
         })
         logLines.push(`[${idx}/${targets.length}]  ✗  TRAIN  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
-        if (final?.log) logLines.push(final.log.split('\n').slice(-30).join('\n'))
         setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `TRAIN: ${errMsg}` }])
         if (bulkStopOnError) { stopped = true; break }
         continue
       }
       ok += 1
       logLines.push(`[${idx}/${targets.length}]  ✓  TRAIN  ${row.option.label}`)
-      if (final?.log) logLines.push(final.log.split('\n').slice(-20).join('\n'))
       setBulkStream(s => [...s, { label: row.option.label, status: 'ok' }])
 
-      // TRAIN → DEPLOY step (skip if user disabled it)
+      // Update server-side counts
+      void apiUpdateBulkRun(runId, { ok, failed: failures.length })
+
+      // TRAIN → DEPLOY step
       if (bulkDeployEnabled) {
         if (bulk.stopRequested) { stopped = true; break }
-        setBulkProgress({ current: idx, total: targets.length, label: row.option.label, stage: 'deploy' })
+        _bulkState.progress = { current: idx, total: targets.length, label: row.option.label, stage: 'deploy' }
+        _notifyBulk()
         setBulkStream(s => [...s, { label: row.option.label, status: 'deploy' }])
+        // Mark the row as "deploying" so the StatusCell shows the
+        // rocket/spinner state and the per-row badge matches the
+        // bulk-progress header.
+        const existingRun = moduleRuns[row.key]
+        if (existingRun) {
+          setRunLocal(row.key, { ...existingRun, status: 'deploying' })
+        }
+        void apiUpsertBulkJob(runId, row.key, {
+          job_id:      final?.jobId ?? null,
+          status:      'deploying',
+          error:       null,
+          elapsed_sec: 0,
+          deployed:    0,
+          deploy_url:  null,
+        })
         const dep = await deployModel(row, bulkProvider, final?.jobId)
         if (dep.ok) {
           deployedOk += 1
@@ -949,8 +1097,22 @@ export default function TestAllModels() {
           })
           logLines.push(`[${idx}/${targets.length}]  ✓  DEPLOY  ${row.option.label}  →  ${dep.url}  (${dep.elapsedSec}s)`)
           setBulkStream(s => [...s, { label: row.option.label, status: 'deployed' }])
-          // Remember the deployed jobId so the next iteration can stop
-          // it (and free its GPU) before starting the next training job.
+          // Persist the deploy result to the server with the new
+          // 'deployed' status so subsequent WS pushes keep the row
+          // in that state (not collapsed back to 'completed').
+          const deployedRun = moduleRuns[row.key]
+          if (deployedRun) {
+            setRunLocal(row.key, { ...deployedRun, status: 'deployed' })
+          }
+          void apiUpsertBulkJob(runId, row.key, {
+            job_id:      final?.jobId ?? null,
+            status:      'deployed',
+            error:       null,
+            elapsed_sec: dep.elapsedSec,
+            deployed:    1,
+            deploy_url:  dep.url ?? null,
+          })
+          void apiUpdateBulkRun(runId, { deployed_count: deployedOk })
           if (final?.jobId) prevDeployedJobId = final.jobId
         } else {
           const errMsg = (dep.error ?? 'Unknown deploy error').slice(0, 500)
@@ -966,41 +1128,56 @@ export default function TestAllModels() {
           })
           logLines.push(`[${idx}/${targets.length}]  ✗  DEPLOY  ${row.option.label}  —  ${errMsg.slice(0, 120)}`)
           setBulkStream(s => [...s, { label: row.option.label, status: 'err', error: `DEPLOY: ${errMsg}` }])
+          const errRun = moduleRuns[row.key]
+          if (errRun) {
+            setRunLocal(row.key, { ...errRun, status: 'error', error: errMsg, finishedAt: Date.now() / 1000 })
+          }
+          void apiUpsertBulkJob(runId, row.key, {
+            job_id:      final?.jobId ?? null,
+            status:      'error',
+            error:       errMsg,
+            elapsed_sec: 0,
+            deployed:    0,
+            deploy_url:  null,
+          })
           if (bulkStopOnError) { stopped = true; break }
         }
       }
     }
 
-    const report: BulkReport = {
-      startedAt,
-      finishedAt:  Date.now() / 1000,
-      total:       targets.length,
-      ok,
-      deployedCount: deployedOk,
-      failed:      failures.length,
-      stopped,
-      provider:    bulkDeployEnabled ? bulkProvider : null,
-      deployEnabled: bulkDeployEnabled,
-      failures,
-      deployed,
-      log:         logLines.join('\n'),
-    }
-    setBulkReport(report)
-    setBulkProgress(null)
-    setBulkRunning(false)
-    setBulkStopRequested(false)
+    // Persist final state to the server. The next WS push will rebuild
+    // _bulkState from these authoritative rows.
+    try {
+      await apiUpdateBulkRun(runId, {
+        finished_at: Date.now() / 1000,
+        stopped:     stopped,
+        total:       targets.length,
+        ok,
+        failed:      failures.length,
+        deployed_count: deployedOk,
+      })
+    } catch { /* best-effort */ }
+    _bulkState.progress = null
+    _bulkState.running = false
+    _bulkState.stopRequested = false
+    _notifyBulk()
   }
 
   // ── Aggregate stats ──
-  const stats = useMemo(() => {
+  // NOTE: not wrapped in useMemo — `runs` is `moduleRuns` which is
+  // mutated in place by _rebuildModuleRunsFromSnapshot(), so its object
+  // reference never changes and useMemo([runs]) would never recompute.
+  // The calculation is O(N) over the row count (≤~80 in practice), so
+  // recomputing on every render is fine.
+  const stats = (() => {
     const list = Object.values(runs)
     return {
       total:     list.length,
-      pending:   list.filter(r => r.status === 'submitting' || r.status === 'queued' || r.status === 'running').length,
-      ok:        list.filter(r => r.status === 'completed').length,
+      pending:   list.filter(r => r.status === 'submitting' || r.status === 'queued' || r.status === 'running' || r.status === 'deploying').length,
+      ok:        list.filter(r => r.status === 'completed' || r.status === 'deployed').length,
       err:       list.filter(r => r.status === 'error').length,
     }
-  }, [runs])
+  })()
 
   const toggleExpand = (key: string) => {
     setExpanded(prev => {
@@ -1064,7 +1241,18 @@ export default function TestAllModels() {
           )}
 
           {/* Post-run report — summary card + failed-list + export. */}
-          {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} setExpanded={setExpanded} onClose={() => setBulkReport(null)} />}
+          {bulkReport && !bulkRunning && <BulkReportPanel report={bulkReport} setExpanded={setExpanded} onClose={() => {
+            // Remember which run this report belongs to so a follow-up
+            // WS push doesn't re-hydrate it from the snapshot. Persist
+            // to localStorage so the dismissal survives a page refresh.
+            // Key by startedAt (unix seconds) — stable across snapshot
+            // re-emissions and identical to what _hydrateBulkState matches
+            // against on the next page load.
+            _bulkState.dismissedRunId = String(bulkReport.startedAt)
+            _writeDismissedRunId(_bulkState.dismissedRunId)
+            _bulkState.report = null
+            _notifyBulk()
+          }} />}
         </div>
 
         {/* Pre-run config + actions — all in one card row:
@@ -1166,11 +1354,28 @@ export default function TestAllModels() {
             <button
               className="btn btn-secondary"
               style={{ display: 'flex', alignItems: 'center', gap: 6 }}
-              onClick={() => {
-                for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
-                localStorage.removeItem(LS_MODULE_RUNS)
-                for (const jobId of [...activeJobs.keys()]) untrackJob(jobId)
-                notify()
+              onClick={async () => {
+                // Race-safe reset:
+                //   1. Bump _resetInFlight so the next 1-2 WS pushes
+                //      (which may still carry the pre-DELETE rows)
+                //      are ignored by both _rebuildModuleRunsFromSnapshot
+                //      and _hydrateBulkState.
+                //   2. Clear local state immediately for snappy feedback.
+                //   3. DELETE the server-side rows. Once this resolves
+                //      (≤200ms typical), the next WS push will be empty
+                //      and the rebuild will land in the "empty snapshot"
+                //      branch which clears everything.
+                //   4. Drop the flag.
+                _resetInFlight++
+                try {
+                  for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
+                  _bulkState.report = null
+                  _bulkState.progress = null
+                  _bulkState.stream = []
+                  _notifyBulk()
+                  await fetch('/api/bulk-runs', { method: 'DELETE' })
+                } catch { /* best-effort — local state is already cleared */ }
+                finally { _resetInFlight-- }
               }}
               disabled={bulkRunning}
               title="Clear all results"
@@ -1237,7 +1442,28 @@ export default function TestAllModels() {
             <button
               className="btn btn-sm"
               style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
-              onClick={() => setBulkStopRequested(true)}
+              onClick={async () => {
+                // Three things, in order of responsiveness:
+                //   1. Tell the server right now — survives a page
+                //      refresh, tab close, or a crashed JS loop. The
+                //      next WS push will reflect the stopped state and
+                //      unstick the UI even if the in-browser loop is
+                //      not running anymore.
+                //   2. Flip the local stop flag — the in-browser
+                //      runAllCompatible loop checks it every iteration
+                //      and every 2s inside waitForCompletion, so it
+                //      breaks within ~2s and finalises the report.
+                //   3. Clear the progress bar so the user sees
+                //      immediate feedback that the stop was registered
+                //      (the next WS push replaces it with the
+                //      finished-report card).
+                if (_currentRunId) {
+                  try { await apiStopBulkRun(_currentRunId) } catch { /* best-effort */ }
+                }
+                _bulkState.stopRequested = true
+                _bulkState.progress = null
+                _notifyBulk()
+              }}
             >
               <StopCircle size={14} /> Stop Bulk
             </button>
@@ -1464,7 +1690,7 @@ export default function TestAllModels() {
                         </pre>
                       </div>
                     )}
-                    {run?.log && (
+                    {(run?.log || rowLogs[row.key]) && (
                       <div style={{ gridColumn: '1 / -1' }}>
                         <div style={{ color: 'var(--text-muted)', fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
                           <Terminal size={11} /> Training Log
@@ -1473,7 +1699,8 @@ export default function TestAllModels() {
                             style={{ marginLeft: 'auto', padding: 2, color: 'var(--text-muted)' }}
                             title="Copy log to clipboard"
                             onClick={() => {
-                              navigator.clipboard.writeText(run.log).then(() => {
+                              const logText = rowLogs[row.key] ?? run.log
+                              navigator.clipboard.writeText(logText).then(() => {
                                 setCopiedRowLog(prev => new Set(prev).add(row.key))
                                 setTimeout(() => setCopiedRowLog(prev => { const n = new Set(prev); n.delete(row.key); return n }), 1500)
                               }).catch(() => { /* clipboard blocked */ })
@@ -1483,7 +1710,7 @@ export default function TestAllModels() {
                           </button>
                         </div>
                         <pre style={{ background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 6, padding: 8, fontSize: 10.5, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto', margin: 0 }}>
-                          {run.log.slice(-2000) || '(empty)'}
+                          {(rowLogs[row.key] ?? run.log ?? '').slice(-2000) || '(empty)'}
                         </pre>
                       </div>
                     )}
@@ -1607,12 +1834,14 @@ function StatusCell({ run }: { run: TestRun | undefined }) {
     submitting: { icon: Loader2,       color: 'var(--primary)',        label: 'Submitting' },
     queued:     { icon: Clock,         color: 'var(--warning)',        label: 'Queued' },
     running:    { icon: Loader2,       color: 'var(--primary)',        label: 'Running' },
+    deploying:  { icon: Rocket,        color: '#3b82f6',               label: 'Deploying' },
+    deployed:   { icon: Rocket,        color: 'var(--success)',        label: 'Deployed' },
     completed:  { icon: CheckCircle2,  color: 'var(--success)',        label: 'OK' },
     error:      { icon: XCircle,       color: 'var(--danger)',         label: 'Error' },
   }
   const c = map[run.status]
   const Icon = c.icon
-  const isAnim = run.status === 'submitting' || run.status === 'running'
+  const isAnim = run.status === 'submitting' || run.status === 'running' || run.status === 'deploying'
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 5,
@@ -1673,22 +1902,105 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
 
   const elapsedSec = Math.round(report.finishedAt - report.startedAt)
   const okPct = report.total > 0 ? Math.round((report.ok / report.total) * 100) : 0
+  // 3 disjoint categories that always sum to `total`:
+  //   • Failed       — red
+  //   • OK           — green (includes the deployed subset)
+  //   • Not completed — gray (only non-zero when stopped early)
+  // Deployed is a *subset* of OK, not a separate bar segment — shown
+  // as a sub-label on the OK chip when > 0 so the legend never
+  // disappears (e.g. "all OK, no deploy" or "all deployed" both show
+  // an OK chip, just with a different sub-text).
+  const notCompleted = Math.max(0, report.total - report.ok - report.failed)
+  const seg = (n: number) => report.total > 0 ? (n / report.total) * 100 : 0
 
   return (
     <div style={{
       marginTop: 14, padding: 16, borderRadius: 10,
-      border: `1px solid ${report.failed > 0 ? 'rgba(239,68,68,0.35)' : 'rgba(16,185,129,0.35)'}`,
-      background: report.failed > 0 ? 'rgba(239,68,68,0.04)' : 'rgba(16,185,129,0.04)',
+      background: 'var(--bg-card)',
+      border: '1px solid var(--border-subtle)',
     }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+      {/* ── Stacked progress bar — 3 segments (Failed | OK | gray track).
+            Deployed is a sub-state of OK and not a separate color band
+            (would shrink the green bar visually for no informational
+            gain — the count is in the legend). ── */}
+      <div
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={report.total}
+        aria-valuenow={report.ok + report.failed}
+        aria-label={`Bulk run outcome: ${report.ok} trained, ${report.deployedCount} deployed, ${report.failed} failed, of ${report.total}`}
+        style={{
+          height: 8, borderRadius: 4, overflow: 'hidden',
+          background: 'var(--bg-elevated)',
+          display: 'flex', flexDirection: 'row',
+        }}
+      >
+        {report.failed > 0 && (
+          <div style={{ width: `${seg(report.failed)}%`, background: 'var(--danger)' }} />
+        )}
+        {report.ok > 0 && (
+          <div style={{ width: `${seg(report.ok)}%`, background: 'var(--success)' }} />
+        )}
+        {/* The unfilled "not completed" portion is the bar's own background. */}
+      </div>
+
+      {/* ── Legend row — 3 category chips. Each is hidden if its count
+            is 0 EXCEPT the OK chip, which always shows when the run
+            produced any successes (so "all OK" never leaves an empty
+            legend). Deployed count rides along as a sub-label on the
+            OK chip. ── */}
+      <div style={{
+        marginTop: 10, display: 'flex', flexWrap: 'wrap', alignItems: 'center',
+        gap: '4px 18px', fontSize: 11.5, color: 'var(--text-secondary)',
+        fontVariantNumeric: 'tabular-nums',
+      }}>
+        {report.failed > 0 && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--danger)', flexShrink: 0 }} />
+            <span style={{ color: 'var(--text-muted)' }}>Failed</span>
+            <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{report.failed}</strong>
+          </span>
+        )}
+        {report.ok > 0 && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--success)', flexShrink: 0 }} />
+            <span style={{ color: 'var(--text-muted)' }}>OK</span>
+            <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{report.ok}</strong>
+            {report.deployedCount > 0 && (
+              <span style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>
+                ({report.deployedCount} deployed)
+              </span>
+            )}
+          </span>
+        )}
+        {notCompleted > 0 && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', flexShrink: 0 }} />
+            <span style={{ color: 'var(--text-muted)' }}>Not completed</span>
+            <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{notCompleted}</strong>
+          </span>
+        )}
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ color: 'var(--text-muted)' }}>Total</span>
+          <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{report.total}</strong>
+          <span style={{ color: 'var(--text-muted)' }}>·</span>
+          <span style={{ color: 'var(--text-muted)' }}>{elapsedSec}s</span>
+          <span style={{ color: 'var(--text-muted)' }}>·</span>
+          <span style={{ color: okPct >= 80 ? 'var(--success)' : okPct >= 50 ? 'var(--warning)' : 'var(--danger)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>
+            {okPct}% success
+          </span>
+        </span>
+      </div>
+
+      {/* ── Header row: title + actions. ── */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginTop: 14 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             {report.failed > 0
-              ? <XCircle size={18} color="var(--danger)" />
+              ? <XCircle size={16} color="var(--danger)" />
               : report.deployEnabled && report.deployedCount > 0
-                ? <Rocket size={18} color="var(--success)" />
-                : <CheckCircle2 size={18} color="var(--success)" />}
+                ? <Rocket size={16} color="var(--info)" />
+                : <CheckCircle2 size={16} color="var(--success)" />}
             <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>
               {report.stopped
                 ? `Bulk run stopped · ${report.ok} OK${report.deployEnabled ? `, ${report.deployedCount} deployed` : ''}, ${report.failed} failed (out of ${report.total} started)`
@@ -1698,30 +2010,6 @@ function BulkReportPanel({ report, setExpanded, onClose }: {
                     ? `Bulk run finished · all ${report.total} trained + ${report.deployedCount} deployed to ${report.provider}`
                     : `Bulk run finished · all ${report.ok} models OK`}
             </span>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-              ({elapsedSec}s)
-            </span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, fontSize: 12, color: 'var(--text-secondary)' }}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <strong style={{ color: 'var(--success)' }}>{report.ok}</strong>
-              {' '}OK
-              <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>(training passed)</span>
-            </span>
-            {report.deployEnabled && (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <Rocket size={11} color="var(--info, #3b82f6)" />
-                <strong style={{ color: 'var(--info, #3b82f6)' }}>{report.deployedCount}</strong>
-                {' '}deployed
-                <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>(serving via {report.provider})</span>
-              </span>
-            )}
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <strong style={{ color: 'var(--danger)' }}>{report.failed}</strong>
-              {' '}failed
-              <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>(training or deploy error)</span>
-            </span>
-            <span style={{ color: 'var(--text-muted)' }}>{okPct}% success</span>
           </div>
         </div>
         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
