@@ -319,7 +319,7 @@ function _rebuildModuleRunsFromSnapshot(snap: BulkSnapshot) {
         j.status === 'deploying' ? 'deploying' :
         j.status === 'deployed'  ? 'deployed' :
         j.status === 'queued'    ? 'queued' :
-        j.status === 'submitting' ? 'submitting' : 'idle'
+        j.status === 'submitting' ? (_bulkLoopActive ? 'submitting' : 'idle') : 'idle'
       ) as TestRun['status']
       moduleRuns[j.row_key] = {
         key:          j.row_key,
