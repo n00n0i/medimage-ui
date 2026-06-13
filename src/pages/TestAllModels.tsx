@@ -279,13 +279,22 @@ function _rebuildModuleRunsFromSnapshot(snap: BulkSnapshot) {
   if (_resetInFlight > 0 && snap.runs.length > 0) return
   const latest = snap.runs[0]
   if (!latest) {
-    // Empty snapshot — the server has no bulk_runs for this user
-    // (e.g. fresh page load, or a Reset just deleted them). Clear
-    // ALL local rows including terminal-but-with-jobId states like
-    // "deployed" that the older "completed/error/no-jobId" filter
-    // would have leaked through.
-    for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
-    _notifyModuleRuns()
+    // Empty snapshot — DO NOT clear moduleRuns here. Reasons:
+    //   1. The Reset button already clears local state explicitly
+    //      (lines below) before sending the DELETE, so a clean Reset
+    //      leaves nothing for this branch to do.
+    //   2. A brief empty snapshot can arrive in normal use — e.g.
+    //      the user clicks Test on a fresh page, _ensureSingleRunId
+    //      fires async, the WS broadcasts a snapshot from the same
+    //      cycle before the new bulk_run is committed. If we cleared
+    //      the user's just-set 'queued' row here, the row would
+    //      visually disappear until the next (2s) push arrives.
+    //   3. The moduleRuns map is also written-to by setRunLocal —
+    //      letting any rebuild nuke that is a race-condition waiting
+    //      to happen.
+    // The trade-off: stale local rows survive across navigations
+    // until the next snapshot has them. The Reset button is the
+    // user-facing escape hatch.
     return
   }
   // Merge jobs from ALL runs in the snapshot, not just runs[0]. A single
