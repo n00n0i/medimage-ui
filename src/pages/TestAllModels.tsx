@@ -18,6 +18,18 @@ function wsTestAllUrl(): string {
   return token ? `${base}?token=${encodeURIComponent(token)}` : base
 }
 
+async function _refreshKeycloakToken(): Promise<void> {
+  // Keycloak access tokens expire (~5min default). keycloak.token holds
+  // the raw value — it stays as the expired value until updateToken()
+  // is called. Without this, a long-lived tab's WS reconnects would
+  // reuse the stale token, the backend would reject the handshake
+  // (4001), and the user would silently stop receiving snapshot
+  // updates. Refresh before each (re)connect so the URL always
+  // carries a valid token.
+  if (!keycloak.token) return
+  try { await keycloak.updateToken(30) } catch { /* refresh failed — try with what we have */ }
+}
+
 // In-memory mirror of the server state. Components subscribe to changes
 // and re-render. The store is filled by the WebSocket; mutations go back
 // to the server via REST.
@@ -62,24 +74,28 @@ function _applySnapshot(snap: BulkSnapshot) {
 
 function _connect() {
   if (_ws && _ws.readyState <= 1) return
-  const ws = new WebSocket(wsTestAllUrl())
-  _ws = ws
-  ws.onopen  = () => { _connected = true; for (const cb of _subs) cb() }
-  ws.onclose = () => {
-    _connected = false
-    for (const cb of _subs) cb()
-    if (_wsRetry) clearTimeout(_wsRetry)
-    _wsRetry = setTimeout(_connect, 3000)
-  }
-  ws.onerror = () => ws.close()
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data)
-      if (msg.type === 'bulk_snapshot' && msg.data) {
-        _applySnapshot(msg.data)
-      }
-    } catch { /* ignore */ }
-  }
+  // Refresh the Keycloak token first so the URL query param is valid
+  // for the handshake (the access token expires ~5min after issue).
+  void _refreshKeycloakToken().then(() => {
+    const ws = new WebSocket(wsTestAllUrl())
+    _ws = ws
+    ws.onopen  = () => { _connected = true; for (const cb of _subs) cb() }
+    ws.onclose = () => {
+      _connected = false
+      for (const cb of _subs) cb()
+      if (_wsRetry) clearTimeout(_wsRetry)
+      _wsRetry = setTimeout(_connect, 3000)
+    }
+    ws.onerror = () => ws.close()
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data)
+        if (msg.type === 'bulk_snapshot' && msg.data) {
+          _applySnapshot(msg.data)
+        }
+      } catch { /* ignore */ }
+    }
+  })
 }
 
 _connect()
