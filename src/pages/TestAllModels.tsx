@@ -1255,8 +1255,50 @@ export default function TestAllModels() {
           }} />}
         </div>
 
-        {/* Pre-run config + actions — all in one card row:
-              [Provider: Ray/Modal] · [Train→Deploy checkbox] ··· [Reset] [Run N] */}
+        {/* Always-visible toolbar (when not running) — just Reset.
+              Split out from the pre-run config below so the button
+              stays reachable when a report card is showing. */}
+        {!bulkRunning && (
+          <div style={{
+            marginTop: 14, padding: 8, borderRadius: 8,
+            background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
+            display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8,
+          }}>
+            <button
+              className="btn btn-secondary"
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+              onClick={async () => {
+                // Race-safe reset:
+                //   1. Bump _resetInFlight so the next 1-2 WS pushes
+                //      (which may still carry the pre-DELETE rows)
+                //      are ignored by both _rebuildModuleRunsFromSnapshot
+                //      and _hydrateBulkState.
+                //   2. Clear local state immediately for snappy feedback.
+                //   3. DELETE the server-side rows. Once this resolves
+                //      (≤200ms typical), the next WS push will be empty
+                //      and the rebuild will land in the "empty snapshot"
+                //      branch which clears everything.
+                //   4. Drop the flag.
+                _resetInFlight++
+                try {
+                  for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
+                  _bulkState.report = null
+                  _bulkState.progress = null
+                  _bulkState.stream = []
+                  _notifyBulk()
+                  await fetch('/api/bulk-runs', { method: 'DELETE' })
+                } catch { /* best-effort — local state is already cleared */ }
+                finally { _resetInFlight-- }
+              }}
+              title="Clear all results"
+            >
+              <RefreshCw size={14} /> Reset
+            </button>
+          </div>
+        )}
+
+        {/* Pre-run config + Run button — hidden when a report is
+              showing (user has to dismiss the report or reset first). */}
         {!bulkRunning && !bulkReport && (
           <div style={{
             marginTop: 14, padding: 12, borderRadius: 8,
@@ -1351,37 +1393,6 @@ export default function TestAllModels() {
 
             {/* Push actions to the right */}
             <div style={{ flex: 1 }} />
-            <button
-              className="btn btn-secondary"
-              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
-              onClick={async () => {
-                // Race-safe reset:
-                //   1. Bump _resetInFlight so the next 1-2 WS pushes
-                //      (which may still carry the pre-DELETE rows)
-                //      are ignored by both _rebuildModuleRunsFromSnapshot
-                //      and _hydrateBulkState.
-                //   2. Clear local state immediately for snappy feedback.
-                //   3. DELETE the server-side rows. Once this resolves
-                //      (≤200ms typical), the next WS push will be empty
-                //      and the rebuild will land in the "empty snapshot"
-                //      branch which clears everything.
-                //   4. Drop the flag.
-                _resetInFlight++
-                try {
-                  for (const k of Object.keys(moduleRuns)) delete moduleRuns[k]
-                  _bulkState.report = null
-                  _bulkState.progress = null
-                  _bulkState.stream = []
-                  _notifyBulk()
-                  await fetch('/api/bulk-runs', { method: 'DELETE' })
-                } catch { /* best-effort — local state is already cleared */ }
-                finally { _resetInFlight-- }
-              }}
-              disabled={bulkRunning}
-              title="Clear all results"
-            >
-              <RefreshCw size={14} /> Reset
-            </button>
             {gpuFreeGb !== null && (
               <div
                 title={
