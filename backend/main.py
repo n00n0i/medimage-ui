@@ -3964,6 +3964,21 @@ def _run_on_ray_cluster(job: dict) -> None:
     print(f"[opencv-fix] cv2 check: {r_check.stdout.strip()} {r_check.stderr.strip()}", flush=True)
     for k, v in env_vars_arg.items():
         _os.environ[k] = v
+    # Force unbuffered stdout/stderr in the exec'd training script so
+    # Ray's log endpoint (and the API's 15x log-fetch loop) see
+    # crash output as it happens. Without this, a failing script
+    # buffers everything until exit — by which time the log fetcher
+    # has already given up and reported an empty "15/15 empty" log.
+    _os.environ["PYTHONUNBUFFERED"] = "1"
+    # Synchronous CUDA errors. Default is async, so a device-side
+    # assert is reported at some later random API call and the
+    # traceback points to a line that has nothing to do with the
+    # real failure. CUDA_LAUNCH_BLOCKING=1 makes each kernel report
+    # its own error inline, so the traceback matches the real crash
+    # site (yolov8n, monai-unet, etc. all hit "Log fetch 15/15 empty"
+    # because the async assert never made it back before the script
+    # was killed by the next crash).
+    _os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     captured = _StringIO()
     _orig_out, _orig_err = _sys.stdout, _sys.stderr
     _sys.stdout = _sys.stderr = captured
