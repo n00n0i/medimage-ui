@@ -1371,6 +1371,8 @@ def _convert_ls_json_to_yolo_zip(json_data: list, ls_url: str, ls_token: str,
     Used by main()'s JSON→YOLO branch in the dataset prep stage. Lives
     at module top level (rather than inside the _VISION_TRAIN_SCRIPT
     raw string) so the API container can call it directly at runtime.
+    ls_url/ls_token come from the caller (typically LS_PUBLIC_URL
+    and LS_TOKEN env vars or the local consts in main.py).
 
     task='detect'  → cls + cx cy w h (normalised, 5 cols per line)
     task='segment' → cls + polygon points (variable cols; rectanglelabels
@@ -3737,7 +3739,7 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
             _yolo_task = "segment" if training_type == "segmentation" else "detect"
             try:
                 export_data = _convert_ls_json_to_yolo_zip(
-                    json_data, ls_url, ls_token,
+                    json_data, LS_API_URL, LS_TOKEN,
                     task=_yolo_task, image_bytes_map=_image_bytes_map,
                 )
             except RuntimeError as _prep_err:
