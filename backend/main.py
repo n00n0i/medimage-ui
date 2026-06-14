@@ -2566,22 +2566,37 @@ def train_self_supervised(img_dir, model_name, epochs, imgsz, batch, lr, job_id,
 
 
 def _move_batch_to_device(batch, device):
-    """Recursively move every tensor inside a batch dict/list to ``device``.
+    """Recursively move every tensor inside a batch dict/list/BatchFeature to ``device``.
 
-    HuggingFace detection pipelines return a dict like
+    HuggingFace detection pipelines return a BatchFeature like
     ``{"pixel_values": Tensor, "labels": [{"boxes": Tensor, "class_labels": Tensor}, ...]}``
-    where ``labels`` is a list of per-image dicts. The simple top-level
-    ``{k: v.to(device) ...}`` loop only handles flat Tensor values and
-    leaves nested tensors on CPU, which then crashes the matcher with
-    ``Expected all tensors to be on the same device, but found at least
-    two devices, cuda:0 and cpu!``.
+    where ``labels`` is a list of per-image dicts. BatchFeature's own
+    ``.to()`` is shallow — it moves the top-level Tensor values
+    (``pixel_values``) but does NOT descend into the nested list-of-dicts
+    in ``labels``. The Hungarian matcher then crashes at
+    ``torch.cdist(out_bbox, target_bbox, p=1)`` with
+    "Expected all tensors to be on the same device, but found at least
+    two devices, cuda:0 and cpu!".
 
-    Uses duck-typing on ``.to`` so this helper works even when called
-    from a context where ``torch`` itself isn't imported yet (avoids the
-    NameError that crashed when the helper was hoisted to module top
-    level for clarity).
+    Implementation:
+    - Detect BatchFeature (duck-typed: has ``data`` dict attribute) and
+      unwrap to that dict, so we recursively walk the same way.
+    - Duck-type ``Tensor`` as anything with a ``.to(device)`` method.
+    - Recurse into dicts, lists, tuples.
+    - Leaves everything else (strs, ints, None) untouched.
+
+    Using duck-typing for the tensor check also lets the helper work
+    before ``torch`` is imported at module top level — calling
+    ``isinstance(batch, torch.Tensor)`` from inside the _VISION_TRAIN_SCRIPT
+    string would NameError because the helper runs before any
+    ``import torch`` statement executes.
     """
+    # Unwrap BatchFeature: it has a `.data` dict but its own shallow .to()
+    if hasattr(batch, "data") and isinstance(getattr(batch, "data", None), dict) \
+            and not isinstance(batch, dict):
+        return _move_batch_to_device(dict(batch.data), device)
     if hasattr(batch, "to") and callable(batch.to):
+        # Real Tensor / numpy / etc. Try to move; fall back to original on error.
         try:
             return batch.to(device)
         except Exception:
