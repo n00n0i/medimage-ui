@@ -2,10 +2,14 @@
  * MinIO S3-compatible client using AWS Signature V4.
  * Uses @noble/hashes (pure JS) so it works in both secure and non-secure contexts.
  * Signs requests in the browser and routes them through the /api/minio proxy.
+ *
+ * Config is persisted server-side in the user_prefs table (per-user)
+ * via the shared userPrefs hook — no more localStorage.
  */
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js'
 import { hmac as nobleHmac } from '@noble/hashes/hmac.js'
 import { md5 as nobleMd5 } from '@noble/hashes/legacy.js'
+import { getPrefOr, deletePref } from './userPrefs'
 
 /* ── Config ──────────────────────────────────────────────────── */
 export const MINIO_DEFAULTS = {
@@ -27,25 +31,43 @@ const MINIO_KEYS  = ['minio_api_url', 'minio_access_key', 'minio_secret_key', 'm
 
 export function loadMinioConfig(): MinioConfig {
   // Migrate: clear any credential that points to a stale/internal host
+  // (defensive — also done if a user manually copies a stale URL into
+  // a server-side pref)
   const stale = MINIO_KEYS.some(k => {
-    const v = localStorage.getItem(k) ?? ''
+    const v = getPrefOr(k, '')
     return STALE_HOSTS.some(h => v.includes(h))
   })
-  if (stale) MINIO_KEYS.forEach(k => localStorage.removeItem(k))
+  if (stale) {
+    MINIO_KEYS.forEach(k => { void deletePref(k) })
+  }
 
   return {
-    apiUrl:     localStorage.getItem('minio_api_url')     ?? MINIO_DEFAULTS.apiUrl,
-    accessKey:  localStorage.getItem('minio_access_key')  ?? MINIO_DEFAULTS.accessKey,
-    secretKey:  localStorage.getItem('minio_secret_key')  ?? MINIO_DEFAULTS.secretKey,
-    consoleUrl: localStorage.getItem('minio_console_url') ?? MINIO_DEFAULTS.consoleUrl,
+    apiUrl:     getPrefOr('minio_api_url',     MINIO_DEFAULTS.apiUrl),
+    accessKey:  getPrefOr('minio_access_key',  MINIO_DEFAULTS.accessKey),
+    secretKey:  getPrefOr('minio_secret_key',  MINIO_DEFAULTS.secretKey),
+    consoleUrl: getPrefOr('minio_console_url', MINIO_DEFAULTS.consoleUrl),
   }
 }
 
 export function saveMinioConfig(cfg: Partial<MinioConfig>): void {
-  if (cfg.apiUrl     != null) localStorage.setItem('minio_api_url',     cfg.apiUrl)
-  if (cfg.accessKey  != null) localStorage.setItem('minio_access_key',  cfg.accessKey)
-  if (cfg.secretKey  != null) localStorage.setItem('minio_secret_key',  cfg.secretKey)
-  if (cfg.consoleUrl != null) localStorage.setItem('minio_console_url', cfg.consoleUrl)
+  // Persist via the shared hook — each call PUTs to /api/user-prefs/{key}
+  // and updates the in-memory mirror so loadMinioConfig() sees it instantly.
+  void import('./userPrefs').then(() => {
+    // We can't call useUserPref from a non-React module, so we use the
+    // mirror mutator directly:
+    const writes: Array<[string, string | null]> = []
+    if (cfg.apiUrl     != null) writes.push(['minio_api_url',     cfg.apiUrl])
+    if (cfg.accessKey  != null) writes.push(['minio_access_key',  cfg.accessKey])
+    if (cfg.secretKey  != null) writes.push(['minio_secret_key',  cfg.secretKey])
+    if (cfg.consoleUrl != null) writes.push(['minio_console_url', cfg.consoleUrl])
+    for (const [key, value] of writes) {
+      void fetch(`/api/user-prefs/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      })
+    }
+  })
 }
 
 /* ── Crypto helpers ──────────────────────────────────────────── */

@@ -1,7 +1,8 @@
-
-import { useState, useEffect, useRef } from 'react'
-import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square, Wifi, Database, Send, Brain, Save, Package, ShieldCheck, RotateCcw, Copy, Check, StopCircle } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { ListChecks, Clock, CheckCircle2, XCircle, Loader, RefreshCw, Terminal, Trash2, CheckSquare, Square, Wifi, Database, Send, Brain, Save, Package, ShieldCheck, RotateCcw, Copy, Check, StopCircle, WifiOff } from 'lucide-react'
 import GpuMonitor from '../components/GpuMonitor'
+import keycloak from '../keycloak'
+import { useUserPref } from '../lib/userPrefs'
 
 interface Job {
   id: string
@@ -21,7 +22,6 @@ interface Job {
   batch_size: number
 }
 
-// Pipeline definitions per job type
 type StepDef = { key: string; label: string; icon: React.ElementType }
 
 const TRAIN_STEPS: StepDef[] = [
@@ -40,7 +40,6 @@ const IMPORT_STEPS: StepDef[] = [
 ]
 
 function getPipelineSteps(job: Job): StepDef[] {
-  // import jobs have source = 'pretrained' or training_type = 'import'
   if (job.training_type === 'import' || ['validate', 'register'].includes(job.pipeline_step)) {
     return IMPORT_STEPS
   }
@@ -51,7 +50,6 @@ function PipelineStepper({ job }: { job: Job }) {
   const steps = getPipelineSteps(job)
   const currentKey = job.pipeline_step || (job.status === 'queued' ? '' : '')
   const currentIdx = steps.findIndex(s => s.key === currentKey)
-  // If completed → all done; if error → highlight current as error
   const allDone = job.status === 'completed'
   const hasError = job.status === 'error'
 
@@ -122,16 +120,25 @@ function elapsed(startTs: number | null, finishTs: number | null): string {
   const ms = end - start
   const h = Math.floor(ms / 3600000)
   const m = Math.floor((ms % 3600000) / 60000)
-  return h > 0 ? `${h}h ${m}m` : `${m}m`
+  const s = Math.floor((ms % 60000) / 1000)
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+
+function wsUrl(): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = keycloak.token || ''
+  const base = `${proto}//${window.location.host}/ws/jobs`
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base
 }
 
 export default function Jobs() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [filter, setFilter] = useState<string>('all')
+  const [filter, setFilter] = useUserPref('jobs_filter', 'all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [deletingBulk, setDeletingBulk] = useState(false)
+  const [stoppingBulk, setStoppingBulk] = useState(false)
   const [retrying, setRetrying] = useState<Set<string>>(new Set())
   const [stopping, setStopping] = useState<Set<string>>(new Set())
   const [copiedError, setCopiedError] = useState<string | null>(null)
@@ -140,9 +147,40 @@ export default function Jobs() {
   const [logLoading, setLogLoading] = useState(false)
   const [logCopied, setLogCopied] = useState(false)
   const logRef = useRef<HTMLPreElement>(null)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const wsRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [wsConnected, setWsConnected] = useState(false)
 
-  const fetchJobs = async (quiet = false) => {
+  const connectWs = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState <= 1) return
+    const ws = new WebSocket(wsUrl())
+    ws.onopen = () => setWsConnected(true)
+    ws.onclose = () => {
+      setWsConnected(false)
+      wsRetryRef.current = setTimeout(connectWs, 3000)
+    }
+    ws.onerror = () => ws.close()
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data)
+        if (msg.type === 'jobs' && Array.isArray(msg.data)) {
+          setJobs(msg.data)
+          setLoading(false)
+        }
+      } catch { /* ignore bad messages */ }
+    }
+    wsRef.current = ws
+  }, [])
+
+  useEffect(() => {
+    connectWs()
+    return () => {
+      if (wsRetryRef.current) clearTimeout(wsRetryRef.current)
+      wsRef.current?.close()
+    }
+  }, [connectWs])
+
+  const fetchJobs = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true)
     setError(null)
     try {
@@ -155,16 +193,28 @@ export default function Jobs() {
     } finally {
       if (!quiet) setLoading(false)
     }
-  }
-
-  // Auto-refresh when any job is running
-  useEffect(() => {
-    fetchJobs()
-    pollRef.current = setInterval(() => {
-      fetchJobs(true)
-    }, 3000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [])
+
+  useEffect(() => { fetchJobs() }, [fetchJobs])
+
+  // Low-rate REST poll as a WS-broadcast fallback. The WS push loop
+  // runs every 2s but a single missed push (network blip, tab backgrounded,
+  // WS reconnect) leaves the list with a stale "running" spinner on a
+  // job whose training has actually finished. A 5s REST refetch
+  // backstops the WS without spamming the server, and is paused while
+  // the tab is hidden (Page Visibility API) to avoid wasted requests.
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval> | null = null
+    const start = () => {
+      if (interval) return
+      interval = setInterval(() => { if (!document.hidden) fetchJobs(true) }, 5000)
+    }
+    const stop = () => { if (interval) { clearInterval(interval); interval = null } }
+    const onVis = () => { if (document.hidden) stop(); else { fetchJobs(true); start() } }
+    document.addEventListener('visibilitychange', onVis)
+    if (!document.hidden) start()
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis) }
+  }, [fetchJobs])
 
   const fetchLog = async (jobId: string) => {
     setLogLoading(true)
@@ -173,6 +223,22 @@ export default function Jobs() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       setLogText(data.log || '(no output yet)')
+      // Also patch the job's status into the list — /api/jobs/{id}
+      // returns the authoritative DB row. The WS push should already
+      // have done this, but the WS broadcast loop is 2s and can miss
+      // status flips on slow networks / WS reconnects. Without this
+      // patch, the user opens the log, sees "✓ Training complete"
+      // (REST fetch), but the list keeps the spinner until either
+      // the next WS push or a manual page refresh.
+      setJobs(prev => prev.map(j => j.id === jobId ? {
+        ...j,
+        status: data.status,
+        error: data.error ?? j.error,
+        progress: data.progress ?? j.progress,
+        pipeline_step: data.pipeline_step ?? j.pipeline_step,
+        finished_at: data.finished_at ?? j.finished_at,
+        started_at: data.started_at ?? j.started_at,
+      } : j))
       setTimeout(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight) }, 50)
     } catch (e: any) {
       setLogText(`Error: ${e.message}`)
@@ -219,7 +285,7 @@ export default function Jobs() {
 
   const stopJob = async (jobId: string) => {
     const job = jobs.find((j: Job) => j.id === jobId)
-    if (!confirm(`หยุยก job "${job?.name ?? jobId}"?\n\nJob จะถูกตั้งสถานะเป็น error (Cancelled by user)`)) return
+    if (!confirm(`หยุด job "${job?.name ?? jobId}"?\n\nJob จะถูกตั้งสถานะเป็น error (Cancelled by user)`)) return
     setStopping(prev => new Set([...prev, jobId]))
     try {
       const res = await fetch(`/api/jobs/${jobId}?from_view=jobs`, { method: 'DELETE' })
@@ -233,6 +299,34 @@ export default function Jobs() {
     } finally {
       setStopping(prev => { const s = new Set(prev); s.delete(jobId); return s })
     }
+  }
+
+  const stopSelected = async () => {
+    const stoppable = [...selected].filter(id => {
+      const j = jobs.find((j: Job) => j.id === id)
+      return j && (j.status === 'running' || j.status === 'queued')
+    })
+    if (stoppable.length === 0) { alert('ไม่มี job ที่กำลังรันหรือคิวอยู่ที่เลือกไว้'); return }
+    if (!confirm(`หยุด ${stoppable.length} job ที่เลือก?`)) return
+    setStoppingBulk(true)
+    await Promise.all(stoppable.map(id => fetch(`/api/jobs/${id}?from_view=jobs`, { method: 'DELETE' })))
+    setSelected(new Set())
+    setStoppingBulk(false)
+    fetchJobs(true)
+  }
+
+  const deleteSelected = async () => {
+    const deletable = [...selected].filter(id => {
+      const j = jobs.find((j: Job) => j.id === id)
+      return j && j.status !== 'running' && j.status !== 'queued'
+    })
+    if (deletable.length === 0) { alert('ไม่มี job ที่สามารถลบได้ที่เลือกไว้ (job ที่กำลังรันต้องหยุดก่อน)'); return }
+    if (!confirm(`ลบ ${deletable.length} job ที่เลือก?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
+    setDeletingBulk(true)
+    await Promise.all(deletable.map(id => fetch(`/api/jobs/${id}?from_view=jobs`, { method: 'DELETE' })))
+    setSelected(new Set())
+    setDeletingBulk(false)
+    fetchJobs(true)
   }
 
   const toggleSelect = (id: string) => {
@@ -249,20 +343,18 @@ export default function Jobs() {
     setSelected(allSelected ? new Set() : new Set(ids))
   }
 
-  const deleteSelected = async () => {
-    if (!confirm(`ลบ ${selected.size} job ที่เลือก?\n\nการกระทำนี้ไม่สามารถย้อนกลับได้`)) return
-    setDeletingBulk(true)
-    await Promise.all([...selected].map(id => fetch(`/api/jobs/${id}?from_view=jobs`, { method: 'DELETE' })))
-    setSelected(new Set())
-    setDeletingBulk(false)
-    fetchJobs(true)
-  }
-
-  useEffect(() => { fetchJobs() }, [])
-
   const filtered = filter === 'all'
     ? jobs
     : jobs.filter((j: Job) => j.status === filter)
+
+  const hasRunningSelected = [...selected].some(id => {
+    const j = jobs.find((j: Job) => j.id === id)
+    return j && (j.status === 'running' || j.status === 'queued')
+  })
+  const hasStoppedSelected = [...selected].some(id => {
+    const j = jobs.find((j: Job) => j.id === id)
+    return j && j.status !== 'running' && j.status !== 'queued'
+  })
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -270,7 +362,11 @@ export default function Jobs() {
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
         <div>
           <h1 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>Training Jobs</h1>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>ติดตามสถานะ training jobs · auto-refresh ทุก 3s</p>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
+            ติดตามสถานะ training jobs · <span style={{ color: wsConnected ? 'var(--success, #22c55e)' : 'var(--danger)', fontWeight: 500 }}>
+              {wsConnected ? <><Wifi size={12} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 2 }} /> Live</> : <><WifiOff size={12} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 2 }} /> Polling</>}
+            </span>
+          </p>
         </div>
         <div className="flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto">
           <div style={{ display: 'flex', gap: 2, background: 'var(--bg-elevated)', borderRadius: 8, padding: 4 }}>
@@ -308,19 +404,32 @@ export default function Jobs() {
             เลือกไว้ {selected.size} job
           </span>
           <button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())}>ยกเลิก</button>
-          <button
-            className="btn btn-sm"
-            style={{ background: 'var(--danger)', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: 6 }}
-            onClick={deleteSelected}
-            disabled={deletingBulk}
-          >
-            {deletingBulk ? <Loader size={13} className="animate-spin" /> : <Trash2 size={13} />}
-            Delete {selected.size}
-          </button>
+          {hasRunningSelected && (
+            <button
+              className="btn btn-sm"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--warning, #f59e0b)', color: '#fff', border: 'none' }}
+              onClick={stopSelected}
+              disabled={stoppingBulk}
+            >
+              {stoppingBulk ? <Loader size={13} className="animate-spin" /> : <StopCircle size={13} />}
+              Stop {selected.size}
+            </button>
+          )}
+          {hasStoppedSelected && (
+            <button
+              className="btn btn-sm"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--danger)', color: '#fff', border: 'none' }}
+              onClick={deleteSelected}
+              disabled={deletingBulk}
+            >
+              {deletingBulk ? <Loader size={13} className="animate-spin" /> : <Trash2 size={13} />}
+              Delete {selected.size}
+            </button>
+          )}
         </div>
       )}
 
-      {/* Live GPU Monitor — show when a job is running */}
+      {/* Live GPU Monitor */}
       {jobs.some(j => j.status === 'running' || j.status === 'queued') && (
         <div className="card mb-6" style={{ padding: '16px 20px' }}>
           <GpuMonitor active={jobs.some(j => j.status === 'running')} />
@@ -344,7 +453,6 @@ export default function Jobs() {
       {/* Jobs list */}
       {!loading && (
         <div className="space-y-3">
-          {/* Select-all row */}
           {filtered.length > 0 && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 8 }}>
               <button
@@ -390,7 +498,7 @@ export default function Jobs() {
                   <span className={`badge ${cfg.badge} flex-shrink-0`}>{cfg.label}</span>
                 </div>
 
-                {/* Pipeline stepper for running / completed / error */}
+                {/* Pipeline stepper */}
                 {(job.status === 'running' || job.status === 'completed' || (job.status === 'error' && job.pipeline_step)) && (
                   <PipelineStepper job={job} />
                 )}

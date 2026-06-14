@@ -1,36 +1,49 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal, Loader } from 'lucide-react'
+import { getPrefOr, useUserPref } from '../lib/userPrefs'
 
 const DEFAULT_RAY_URL = 'http://100.68.53.118:8265'
-const STORAGE_KEY     = 'ray_head_url'
+const PREF_KEY        = 'ray_head_url'
 const MAX_HISTORY     = 40  // 40 × 10 s ≈ 6.7 min
 const SETTINGS_API    = '/api/settings'
 
-// ──────────────── Persistent settings (backend SQLite → localStorage cache) ────
+// ──────────────── Persistent settings (SQLite user_prefs) ────────────────
+// Migrated from localStorage. The URL lives in the user_prefs table
+// (scoped per Keycloak user). The in-memory mirror in userPrefs.ts is
+// populated on mount so reads are sync.
 
 async function loadRayUrl(): Promise<string> {
+  // Backwards-compat: migrate from old global /api/settings to per-user
+  // /api/user-prefs if the legacy row exists.
   try {
     const res = await fetch(`${SETTINGS_API}/ray_head_url`)
     if (res.ok) {
       const d = await res.json()
       if (d?.value) {
-        localStorage.setItem(STORAGE_KEY, d.value)
+        // Save into per-user prefs and remove the global row
+        try {
+          await fetch(`/api/user-prefs/${PREF_KEY}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: d.value }),
+          })
+        } catch { /* best-effort */ }
         return d.value
       }
     }
-  } catch { /* backend down — fall through to cache */ }
-  return localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL
+  } catch { /* ignore */ }
+  return getPrefOr(PREF_KEY, DEFAULT_RAY_URL)
 }
 
 async function saveRayUrl(url: string): Promise<void> {
-  localStorage.setItem(STORAGE_KEY, url)   // instant cache
+  // Persist to per-user prefs via the shared hook
   try {
-    await fetch(`${SETTINGS_API}/ray_head_url`, {
-      method: 'POST',
+    await fetch(`/api/user-prefs/${PREF_KEY}`, {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value: url }),
     })
-  } catch { /* offline — localStorage is the fallback */ }
+  } catch { /* best-effort */ }
 }
 
 // ──────────────── Ray Dashboard REST API types ────────────────
@@ -554,10 +567,10 @@ function SettingsModal({
 // ──────────────────────────────────────────────────────────────
 
 export default function RayCluster() {
-  // Init synchronously from localStorage cache; async override from backend on mount
-  const [rayUrl, setRayUrl] = useState<string>(
-    () => localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL
-  )
+  // Init from the in-memory prefs mirror; mirror is populated on mount
+  // by GET /api/user-prefs. The hook re-renders us when it loads.
+  const [storedUrl, setStoredUrl] = useUserPref(PREF_KEY, DEFAULT_RAY_URL)
+  const [rayUrl, setRayUrl] = useState<string>(storedUrl)
   const [result, setResult] = useState<RayClusterData | null>(null)
   const [nodes, setNodes] = useState<RayNodeSummary[]>([])
   const [gpuStatsData, setGpuStatsData] = useState<any>(null)
@@ -571,12 +584,14 @@ export default function RayCluster() {
   const historyRef = useRef<MetricPoint[]>([])
   const [history, setHistory] = useState<MetricPoint[]>([])
 
-  // Load authoritative URL from backend on mount
+  // Sync rayUrl with the prefs mirror once the user-prefs load finishes,
+  // and migrate any legacy global /api/settings value to per-user.
   useEffect(() => {
-    loadRayUrl().then(url => {
-      if (url !== (localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL)) setRayUrl(url)
+    if (storedUrl) setRayUrl(storedUrl)
+    void loadRayUrl().then(url => {
+      if (url && url !== rayUrl) setRayUrl(url)
     })
-  }, [])
+  }, [storedUrl])
 
   const fetchData = useCallback(async (manual = false) => {
     if (manual) setRefreshing(true)
@@ -697,6 +712,7 @@ export default function RayCluster() {
 
   const handleSaveUrl = (url: string) => {
     setRayUrl(url)
+    setStoredUrl(url)   // sync to user_prefs so other tabs/devices see it
     setShowSettings(false)
   }
 

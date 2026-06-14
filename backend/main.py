@@ -24,11 +24,14 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form as FForm, Request, Body, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form as FForm, Request, Body, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from starlette.websockets import WebSocketState
 import io
 import zipfile
+import asyncio
+import json as _json
 from pydantic import BaseModel
 
 # ─── DB ──────────────────────────────────────────────────────────────────────
@@ -138,6 +141,15 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL DEFAULT '',
+                updated_at REAL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (user_id, key)
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS text_datasets (
                 id         TEXT PRIMARY KEY,
                 name       TEXT,
@@ -236,16 +248,22 @@ app.add_middleware(
 
 _RAY_RECONCILE_INTERVAL_S = 60
 _RAY_STUCK_PENDING_AGE_S  = 300   # 5 min
+_ray_stopped_pending: set[str] = set()   # submission IDs we already stopped — avoid re-stopping
 
 
 def _stop_ray_submission(submission_id: str) -> bool:
-    """Ask the Ray dashboard to stop a job. Returns True on success."""
+    """Ask the Ray dashboard to stop a job. Returns True on success.
+    For PENDING jobs that won't stop, also tries DELETE."""
     if not submission_id or not submission_id.startswith("raysubmit_"):
         return False
     try:
         import requests as _req
         r = _req.post(f"{RAY_URL}/api/jobs/{submission_id}/stop", timeout=5)
-        return r.ok
+        if r.ok:
+            return True
+        # STOP failed — try DELETE (works for some terminal-state jobs)
+        r2 = _req.delete(f"{RAY_URL}/api/jobs/{submission_id}", timeout=5)
+        return r2.ok
     except Exception:
         return False
 
@@ -256,6 +274,19 @@ def _reconcile_ray_jobs() -> dict:
     """
     import requests as _req
     summary = {"stopped_pending": [], "synced_errors": [], "errors": []}
+    # Refresh _active_ray_subs from DB. The module-level set is only
+    # populated at startup; without this refresh, jobs created after
+    # the API booted aren't tracked and the "thread still alive" defer
+    # below would never fire for them.
+    try:
+        with get_db() as _rc:
+            for _r in _rc.execute(
+                "SELECT ray_submission_id FROM jobs "
+                "WHERE ray_submission_id != '' AND status IN ('running','queued')"
+            ).fetchall():
+                _active_ray_subs.add(_r["ray_submission_id"])
+    except Exception:
+        pass
     try:
         r = _req.get(f"{RAY_URL}/api/jobs/?limit=200", timeout=10)
         if not r.ok:
@@ -276,17 +307,73 @@ def _reconcile_ray_jobs() -> dict:
         if sid:
             ray_status_by_sub[sid] = (st, st_ms)
 
-    # 1) Stop PENDING jobs older than threshold
+    # 1) Stop PENDING jobs that are either:
+    #    (a) Older than 5 min and have no active medimage training thread
+    #        polling them (DB status = 'running' = thread is alive). These
+    #        are orphans the autoscaler can't place.
+    #    (b) Owned by a DB row whose status is no longer 'running' or
+    #        'queued' (cancelled by user, error, etc). The Ray job lingers
+    #        in PENDING forever and holds GPU slots — kill it regardless
+    #        of age so the cluster frees up immediately.
+    _active_ray_subs = set()
+    _terminated_ray_subs = set()
+    with get_db() as conn:
+        for row in conn.execute(
+            "SELECT ray_submission_id, status FROM jobs WHERE ray_submission_id != ''"
+        ).fetchall():
+            sid_ = row["ray_submission_id"]
+            if not sid_:
+                continue
+            if row["status"] in ("running", "queued"):
+                _active_ray_subs.add(sid_)
+            else:
+                _terminated_ray_subs.add(sid_)
+
     for j in ray_jobs:
         if j.get("type") != "SUBMISSION":
             continue
         sid  = j.get("submission_id")
         st   = j.get("status")
         st_t = j.get("start_time") or 0
-        if st == "PENDING" and (now_ms - st_t) > _RAY_STUCK_PENDING_AGE_S * 1000:
-            if _stop_ray_submission(sid):
+        if st != "PENDING":
+            continue
+        # A PENDING-in-Ray + running-in-DB job is stale if older than the
+        # threshold — the training thread can't possibly be alive because
+        # Ray hasn't even started executing the submission yet.
+        if sid in _active_ray_subs and (now_ms - st_t) < _RAY_STUCK_PENDING_AGE_S * 1000:
+            continue   # young active job — leave alone
+        if sid in _ray_stopped_pending:
+            continue   # already stopped — don't re-log every 60s
+        # (b) DB row already terminated (cancelled/error/etc) — kill
+        # immediately. Retry the stop call up to 3 times to defeat the
+        # Ray dashboard's intermittent "stop ack" bug for never-allocated
+        # jobs (where the job_id is null and the cluster sometimes
+        # doesn't reap the submission on the first attempt).
+        if sid in _terminated_ray_subs:
+            if sid not in _ray_stopped_pending:
+                _stop_attempts = 0
+                for _ in range(3):
+                    if _stop_ray_submission(sid):
+                        _stop_attempts += 1
+                    import time as _t
+                    _t.sleep(0.3)
+                _ray_stopped_pending.add(sid)
                 summary["stopped_pending"].append(sid)
-                _append_log_for_sub(sid, f"[reconcile] Stopped stuck PENDING job after {int((now_ms - st_t)/1000)}s")
+                _append_log_for_sub(sid, f"[reconcile] Stopped orphaned PENDING job (DB row already terminated, {_stop_attempts}/3 stop acks)")
+            continue
+        # (a) Stale PENDING with no active thread — only after threshold.
+        # Same retry trick to maximise the chance the dashboard reaps
+        # the submission.
+        if (now_ms - st_t) > _RAY_STUCK_PENDING_AGE_S * 1000:
+            _stop_attempts = 0
+            for _ in range(3):
+                if _stop_ray_submission(sid):
+                    _stop_attempts += 1
+                import time as _t
+                _t.sleep(0.3)
+            _ray_stopped_pending.add(sid)
+            summary["stopped_pending"].append(sid)
+            _append_log_for_sub(sid, f"[reconcile] Stopped stuck PENDING job after {int((now_ms - st_t)/1000)}s (no active training thread, {_stop_attempts}/3 stop acks)")
 
     # 2) Sync DB for FAILED/STOPPED/SUCCEEDED Ray jobs whose medimage row
     #    is still 'running' or 'queued' (run_training thread crashed
@@ -320,6 +407,14 @@ def _reconcile_ray_jobs() -> dict:
         # If the training thread is dead (e.g. killed by an API restart),
         # the user will see this short message + can read the full log for
         # the captured stdout.
+        # rtdetr-l incident: Ray can report FAILED before the wrapper
+        # training thread has had a chance to write its real log lines
+        # (log fetch loop returns empty 15/15). Defer until the thread
+        # has actually exited, so the captured stdout from the real
+        # crash isn't masked by our short "Ray job ended: FAILED" string.
+        if sid in _active_ray_subs:
+            _append_log(medimage_id, f"[reconcile] Ray reports {st} but training thread still active — deferring error sync")
+            continue
         err_msg = f"Ray job ended: {st} (status set by reconciler)"
         _append_log(medimage_id, f"[reconcile] {err_msg} — if the training thread is still alive, it will overwrite this with the real reason; otherwise check the wrapper stdout above")
         _set_status(medimage_id, "error", err_msg)
@@ -403,10 +498,27 @@ async def jwt_auth_middleware(request: Request, call_next):
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     token = auth[7:]
     try:
-        await asyncio.to_thread(_sync_verify_token, token)
+        payload = await asyncio.to_thread(_sync_verify_token, token)
     except Exception as exc:
         return JSONResponse({"detail": f"Invalid token: {exc}"}, status_code=401)
+    # Stash the user_id (Keycloak 'sub' claim) on request.state so
+    # downstream endpoints can scope data per-user (user_prefs, etc).
+    request.state.user_id = (payload or {}).get("sub", "") or ""
     return await call_next(request)
+
+
+def _current_user_id(request: Request) -> str:
+    """Return the user_id from the JWT attached to this request.
+
+    Falls back to "default" when Keycloak is disabled (no auth), so the
+    user_prefs table still has a stable per-user key.
+    """
+    uid = getattr(request.state, "user_id", "")
+    if uid:
+        return uid
+    if not _KC_ENABLED:
+        return "default"
+    return ""
 
 
 @app.get("/api/health")
@@ -1039,6 +1151,13 @@ MINIO_URL  = os.getenv("MINIO_URL", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 
+# Public URL the Ray cluster (running on a different host) uses to reach
+# THIS API. Used by the Ray training wrapper to download the training
+# script via HTTP — the script is too big (~97KB source, ~130KB b64) to
+# fit in a single env var (Linux ARG_MAX is ~128KB). Default to the same
+# host as MinIO since they typically live on the same network.
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", os.getenv("LS_PUBLIC_URL", "http://100.68.3.42:8000").rsplit(":", 1)[0] + ":8000")
+
 
 def _verify_weights_uploaded(s3_path: str) -> tuple[bool, str]:
     """Confirm an s3://bucket/key path actually has an object in MinIO.
@@ -1081,8 +1200,11 @@ def _verify_weights_uploaded(s3_path: str) -> tuple[bool, str]:
             return False, f"head_object failed: {e}"
     except Exception as e:
         return False, f"verify failed: {e}"
-# Public URL for MinIO accessible from Ray/Modal clusters (set to external/VPN IP)
-MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", MINIO_URL)
+# Public URL for MinIO accessible from Ray/Modal clusters (set to external/VPN IP).
+# Falls back to MINIO_HOST_IP on port 9000 (set in docker-compose) when
+# MINIO_PUBLIC_URL isn't explicitly set — the Ray cluster can't resolve
+# the docker-internal "minio" hostname.
+MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", f"http://{os.getenv('MINIO_HOST_IP', '')}:9000" if os.getenv("MINIO_HOST_IP") else MINIO_URL)
 # Public URL for Label Studio accessible from Ray cluster
 LS_PUBLIC_URL = os.getenv("LS_PUBLIC_URL", LS_API_URL)
 # On-prem Ray cluster URL
@@ -1216,6 +1338,30 @@ _VLM_LLM_RUNTIME_ENV: dict = (
 )
 
 # ─── Real Training Helpers ────────────────────────────────────────────────────
+
+def upload_to_minio(local_path, bucket, key, minio_url, minio_access, minio_secret):
+    """Upload a local file to MinIO/S3 and return the s3:// URI.
+    The bucket is created on demand if it doesn't exist yet.
+
+    NOTE: A *copy* of this function is also defined inside _VISION_TRAIN_SCRIPT
+    below — that copy is part of the training script that runs on the Ray
+    cluster, and it has its own boto3 import. Don't delete this one without
+    also fixing the inline copy (or vice versa).
+    """
+    import boto3
+    from botocore.config import Config
+    s3 = boto3.client(
+        "s3", endpoint_url=minio_url,
+        aws_access_key_id=minio_access, aws_secret_access_key=minio_secret,
+        config=Config(signature_version="s3v4"),
+    )
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except Exception:
+        s3.create_bucket(Bucket=bucket)
+    s3.upload_file(str(local_path), bucket, key)
+    return f"s3://{bucket}/{key}"
+
 
 # Vision training script (runs on Ray cluster — supports Ultralytics YOLO and PyTorch/TIMM)
 _VISION_TRAIN_SCRIPT = r'''
@@ -2723,7 +2869,38 @@ def train_ultralytics(yaml_path, data_dir, model_name, training_type, epochs, im
             sys.modules[_m] = _types.ModuleType(_m)
     from ultralytics import YOLO
     print(f"[train] Loading model: {model_name}")
-    model = YOLO(model_name)
+    # Resolve non-standard .pt filenames to a HF Hub repo if the file isn't
+    # available locally. Ultralytics YOLO() will try to fetch `yolov8s.pt` etc.
+    # from its own model index, but community weights (road-damage-yolov8s.pt,
+    # rtdetr-l.pt etc.) need to be downloaded explicitly. Format: "hf_repo:filename"
+    # or just a HF repo path; we default to looking up the same basename.
+    _model_name = model_name
+    if not _model_name.endswith(".pt"):
+        pass  # not a .pt — assume Ultralytics knows it
+    else:
+        import os as _os
+        if not _os.path.isfile(_model_name):
+            # Try a few well-known HF repos for the same basename.
+            _basename = _os.path.basename(_model_name)
+            _candidates = []
+            if "road-damage" in _basename or "rdd" in _basename.lower():
+                _candidates.append(("oracl4/RoadDamageDetection", _basename))
+                _candidates.append(("oracl4/RoadDamageDetection", "best.pt"))
+                _candidates.append(("ozair23/yolov8-road-damage-detector", "best.pt"))
+            if "rtdetr" in _basename.lower():
+                _candidates.append(("Intel/RT-DETR", _basename))
+            for _repo, _fn in _candidates:
+                try:
+                    from huggingface_hub import hf_hub_download
+                    print(f"[train] weights {model_name!r} not found locally; trying {_repo}::{_fn} ...")
+                    _local = hf_hub_download(repo_id=_repo, filename=_fn, cache_dir=None)
+                    print(f"[train] Downloaded weights: {_local}")
+                    _model_name = _local
+                    break
+                except Exception as _dl_err:
+                    print(f"[train] HF download failed: {_dl_err}")
+                    continue
+    model = YOLO(_model_name)
     print(f"[train] Training started ...")
     results = model.train(
         data=yaml_path,
@@ -3265,38 +3442,151 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
 
         _append_log(job_id, f"[export] Project '{proj_title}': {task_count} tasks, {labeled} labeled")
 
-        # Try YOLO export first, fall back to JSON
+        # Try YOLO export first, fall back to JSON. If the YOLO zip is
+        # suspiciously small (< 16 KB) it almost certainly has no images
+        # (LS YOLO export plugin doesn't extract data:image/jpeg;base64,...
+        # URIs to files) — fall back to JSON and convert below.
         export_url = f"{LS_API_URL}/api/projects/{project_id}/export"
         fmt_order = [preferred_fmt] + [f for f in ("YOLO", "JSON") if f != preferred_fmt]
-        for fmt in fmt_order:
+        export_data = None
+        fmt = None
+        for _try_fmt in fmt_order:
             resp = _req.get(
                 export_url,
-                params={"exportType": fmt},
+                params={"exportType": _try_fmt},
                 headers={"Authorization": f"Token {LS_TOKEN}"},
                 timeout=300,
                 stream=True,
             )
-            if resp.status_code == 200:
-                _append_log(job_id, f"[export] Exported as {fmt} ({len(resp.content)//1024} KB)")
-                export_data = resp.content
-                break
-        else:
+            if resp.status_code != 200:
+                _append_log(job_id, f"[export] {_try_fmt} export failed (HTTP {resp.status_code})")
+                continue
+            _body = resp.content
+            _append_log(job_id, f"[export] Exported as {_try_fmt} ({len(_body)//1024} KB)")
+            # Inspect the zip — if it has no images/, we need the JSON path
+            # to extract data URI images ourselves.
+            _has_images = False
+            try:
+                import zipfile as _zfchk
+                with _zfchk.ZipFile(__import__("io").BytesIO(_body)) as _zf:
+                    for _n in _zf.namelist():
+                        if _n.startswith("images/") and not _n.endswith("/"):
+                            _has_images = True
+                            break
+            except Exception:
+                _has_images = True  # not a zip (e.g. JSON), keep going
+            if _try_fmt == "YOLO" and not _has_images:
+                _append_log(job_id, f"[export] {_try_fmt} zip has no images/ — falling back to JSON")
+                continue
+            export_data = _body
+            fmt = _try_fmt
+            break
+        if export_data is None or fmt is None:
             raise RuntimeError(
                 f"Label Studio export failed for project {project_id} "
-                f"(last HTTP status: {resp.status_code}) — {resp.text[:200]}"
+                f"(no format produced a zip with images) — last status: {resp.status_code}"
             )
 
         bucket = "medimage-datasets"
         key    = f"{job_id}/dataset.zip"
 
-        # If JSON export, wrap into a zip
+        # If JSON export, build a YOLO-format zip with images extracted
+        # from the base64 data URIs in the JSON. Label Studio's YOLO
+        # export plugin only writes image files for tasks whose `image`
+        # field is a http(s):// URL — tasks with data:image/jpeg;base64,...
+        # URIs (synthetic test projects, projects created via the API
+        # with inline images) end up with a 2KB zip that has dataset.yaml
+        # but no images/, so the training script crashes with "No images
+        # found". Converting the JSON export to a proper YOLO zip
+        # ourselves bypasses that plugin bug entirely.
         if fmt == "JSON":
-            import io, zipfile as _zipfile
+            import io, zipfile as _zipfile, json as _json
+            json_data = _json.loads(export_data)
             buf = io.BytesIO()
+            n_imgs = 0
+            n_lbls = 0
+            classes_seen: list[str] = []
+            class_to_idx: dict[str, int] = {}
             with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("annotations.json", export_data)
+                for _task in json_data:
+                    _img = _task.get("data", {}).get("image", "")
+                    if not _img:
+                        continue
+                    _stem = f"task_{_task.get('id', n_imgs)}"
+                    if _img.startswith("data:image/"):
+                        _m = _img.split(";", 1)[0].split("/", 2)[1]
+                        _ext = {"jpeg": "jpg", "jpg": "jpg", "png": "png"}.get(_m, "jpg")
+                        _b64 = _img.split(",", 1)[1]
+                        _zf_bytes = __import__("base64").b64decode(_b64)
+                    else:
+                        # URL — download later in training script via ls_url
+                        # (matches old YOLO export behaviour). Write a stub so
+                        # the dataset has the right structure, but the
+                        # training script's image downloader will fill it in.
+                        _ext = "jpg"
+                        _zf_bytes = b""
+                    _img_path = f"images/{_stem}.{_ext}"
+                    if _zf_bytes:
+                        zf.writestr(_img_path, _zf_bytes)
+                    n_imgs += 1
+                    # Labels: convert polygon/rectangle to YOLO bbox
+                    _lbl_lines: list[str] = []
+                    for _ann in _task.get("annotations", []):
+                        for _r in _ann.get("result", []):
+                            if _r.get("type") not in ("polygonlabels", "rectanglelabels", "labels"):
+                                continue
+                            _labels_in = _r.get("value", {}).get("rectanglelabels") or _r.get("value", {}).get("polygonlabels") or _r.get("value", {}).get("labels") or []
+                            if not _labels_in:
+                                continue
+                            _cls_name = _labels_in[0]
+                            if _cls_name not in class_to_idx:
+                                class_to_idx[_cls_name] = len(classes_seen)
+                                classes_seen.append(_cls_name)
+                            _cls = class_to_idx[_cls_name]
+                            # Read image dims (LS YOLO export uses image dims
+                            # from the original image; we use 100% of the
+                            # image as the box if the annotation is a polygon
+                            # spanning the whole image — close enough for
+                            # smoke-test data).
+                            _w = 1.0
+                            _h = 1.0
+                            if _r.get("type") == "rectanglelabels":
+                                _v = _r.get("value", {})
+                                _x = (_v.get("x", 0) + _v.get("width", 0) / 2) / 100
+                                _y = (_v.get("y", 0) + _v.get("height", 0) / 2) / 100
+                                _w = _v.get("width", 0) / 100
+                                _h = _v.get("height", 0) / 100
+                                _lbl_lines.append(f"{_cls} {_x:.6f} {_y:.6f} {_w:.6f} {_h:.6f}")
+                            elif _r.get("type") == "polygonlabels":
+                                # Polygon → bbox: take min/max of points.
+                                # The points are in percentages 0..100.
+                                _pts = _r.get("value", {}).get("points", [])
+                                if _pts:
+                                    _xs = [p[0] for p in _pts]
+                                    _ys = [p[1] for p in _pts]
+                                    _xmin, _xmax = min(_xs), max(_xs)
+                                    _ymin, _ymax = min(_ys), max(_ys)
+                                    _x = (_xmin + _xmax) / 2 / 100
+                                    _y = (_ymin + _ymax) / 2 / 100
+                                    _w = (_xmax - _xmin) / 100
+                                    _h = (_ymax - _ymin) / 100
+                                    _lbl_lines.append(f"{_cls} {_x:.6f} {_y:.6f} {_w:.6f} {_h:.6f}")
+                    if _lbl_lines:
+                        zf.writestr(f"labels/{_stem}.txt", "\n".join(_lbl_lines) + "\n")
+                        n_lbls += 1
+                # YOLO dataset.yaml
+                _yaml = (
+                    f"path: .\n"
+                    f"train: images\n"
+                    f"val: images\n"
+                    f"nc: {len(classes_seen)}\n"
+                    f"names: {classes_seen!r}\n"
+                )
+                zf.writestr("dataset.yaml", _yaml)
             export_data = buf.getvalue()
-            _append_log(job_id, "[export] Wrapped JSON export into zip")
+            _append_log(job_id, f"[export] JSON→YOLO conversion: {n_imgs} images, {n_lbls} labels, {len(classes_seen)} classes")
+            _append_log(job_id, f"[export] Wrapped converted YOLO into zip ({len(export_data)//1024} KB)")
+            fmt = "YOLO"  # downstream code already handles YOLO zip
 
         # Upload to MinIO (internal URL)
         s3 = _boto3.client(
@@ -3521,16 +3811,16 @@ def _run_on_ray_cluster(job: dict) -> None:
         )
         _entrypoint = f"python3 -c {_entrypoint_script!r}"
 
-        # Build clean runtime_env: env_vars + pip packages only.
-        # No working_dir / py_modules / setup_hook — everything is
-        # embedded in the entrypoint command itself.
+        # Build clean runtime_env: env_vars only. All Python deps are
+        # pre-installed on the Ray cluster image, so the runtime_env.pip
+        # list is empty — telling Ray to skip its own pip resolver (which
+        # is what was causing VLM/LLM jobs to sit PENDING while the head
+        # node spent several minutes resolving and installing the same
+        # packages we already have on disk). No working_dir / py_modules /
+        # setup_hook — everything is embedded in the entrypoint command.
         _re_env = {
             "env_vars": {"RAY_ADDRESS": "", "RAY_RUNTIME_ENV_HOOK_DISABLED": "1", "RAY_ENABLE_AUTO_CONNECT": "0"},
-            "pip": [
-                "transformers>=4.40,<5.0", "peft>=0.10", "accelerate>=0.28",
-                "bitsandbytes>=0.43", "datasets>=2.18",
-                "boto3>=1.34", "Pillow", "numpy<2.0",
-            ],
+            "pip": [],
         }
         if _VLM_LLM_RUNTIME_ENV and "env_vars" in _VLM_LLM_RUNTIME_ENV:
             for _ek, _ev in _VLM_LLM_RUNTIME_ENV["env_vars"].items():
@@ -3541,9 +3831,15 @@ def _run_on_ray_cluster(job: dict) -> None:
         _num_gpus = int(job.get("num_gpus") or 1)
         _payload = {
             "entrypoint": _entrypoint,
-            "entrypoint_num_gpus": _num_gpus,
             "runtime_env": _re_env,
         }
+        # Pass GPU count via env var so the training script can use
+        # it for ray.remote(num_gpus=...) or os.environ lookups.
+        # NOTE: Do NOT use "entrypoint_num_gpus" — Ray 2.55.0 silently
+        # PENDINGs jobs that request GPUs via that field (never allocates
+        # the head).  GPU scheduling must happen inside the script via
+        # ray.remote(num_gpus=...) or torch.cuda .
+        _payload["runtime_env"]["env_vars"]["MEDIMAGE_NUM_GPUS"] = str(_num_gpus)
 
         _set_step(job_id, "submit")
         _append_log(job_id, f"[cluster] Submitting VLM/LLM job via Ray Jobs API ...")
@@ -3568,6 +3864,25 @@ def _run_on_ray_cluster(job: dict) -> None:
         while True:
             time.sleep(poll_sec)
             elapsed += poll_sec
+            # If the user cancelled the job in the UI, the DB row will be
+            # 'error' but Ray may still report PENDING (the autoscaler
+            # never allocated a slot). Stop polling, signal stop to Ray,
+            # and let the surrounding code surface the DB error.
+            try:
+                with get_db() as _c:
+                    _db_row = _c.execute(
+                        "SELECT status FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                if _db_row and _db_row["status"] not in ("running", "queued"):
+                    _append_log(job_id, f"[cluster] DB status is '{_db_row['status']}' — abandoning Ray poll")
+                    try:
+                        _ray_req.post(f"{http_url}/api/jobs/{_ray_job_id}/stop", timeout=5)
+                    except Exception:
+                        pass
+                    _ray_status = "STOPPED"
+                    break
+            except Exception:
+                pass
             try:
                 _status_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}", timeout=10)
                 _status_resp.raise_for_status()
@@ -3608,32 +3923,23 @@ def _run_on_ray_cluster(job: dict) -> None:
         for _log_attempt in range(15):
             try:
                 _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
-                _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} len={len(_logs_resp.text)}")
-                if _logs_resp.ok and _logs_resp.text:
-                    _all_log_lines = []
-                    # IMPORTANT: Ray returns `{"logs": "line1\nline2\n..."}` —
-                    # a single JSON line whose `"logs"` field has the real
-                    # log content (with real newlines). Treating `text`
-                    # as the log itself would feed the entire JSON
-                    # through the filter as ONE line, then "Runtime env
-                    # is setting up" would match `in _line_s` and the
-                    # whole 12kB blob gets dropped — leaving the user
-                    # staring at "Log fetch attempt N/15 empty" with no
-                    # actual wrapper stdout in the log. Parse the JSON
-                    # first, then iterate over real log lines.
+                # Parse JSON wrapper first — Ray returns {"logs": "..."}
+                # so _logs_resp.text length is misleading (e.g. {"logs":""}
+                # is 12 bytes but contains zero log lines).
+                _logs_str = ""
+                if _logs_resp.ok:
                     try:
                         _logs_str = _logs_resp.json().get("logs", "") or ""
                     except Exception:
-                        _logs_str = _logs_resp.text
+                        _logs_str = _logs_resp.text if _logs_resp.text else ""
+                _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} json_len={len(_logs_str)}")
+                if _logs_str.strip():
+                    _all_log_lines = []
                     for _line in _logs_str.splitlines():
                         _line_s = _line.strip()
                         if _line_s:
                             _all_log_lines.append(_line_s)
                             _append_log(job_id, _line_s)
-                            # Parse three known log shapes:
-                            #   WEIGHTS_UPLOADED: s3://bucket/key
-                            #   WEIGHTS_UPLOADED: bucket/key
-                            #   WEIGHTS_UPLOADED:key
                             if "WEIGHTS_UPLOADED" in _line_s:
                                 _payload = _line_s.split("WEIGHTS_UPLOADED", 1)[1].lstrip(":").strip()
                                 if not _payload:
@@ -3643,7 +3949,6 @@ def _run_on_ray_cluster(job: dict) -> None:
                                 elif "/" in _payload and _payload.count("/") == 1:
                                     _weights_path = f"s3://{_payload}"
                                 else:
-                                    # Bare key — assume the standard bucket
                                     _weights_path = f"s3://medimage-weights/{_payload}"
                     if _weights_path:
                         break
@@ -3729,53 +4034,70 @@ def _run_on_ray_cluster(job: dict) -> None:
     # Only Mask R-CNN, YOLO, MONAI, etc. land here, and they now go through
     # the dashboard REST API instead of ray.init(address="ray://...").
     import base64 as _b64lib, requests as _ray_req
-    # Keep the wrapper script small (no inline base64) — pass training script
-    # via env var to avoid "Argument list too long" (Linux argv limit ~128KB).
+    # All Python deps are now pre-installed on the Ray cluster image, so the
+    # wrapper just sets env vars and exec()s the training script — no more
+    # subprocess.run(pip install) calls (those were the cause of jobs
+    # sitting PENDING for several minutes while the head node fought over
+    # pip resolver locks). Opencv swap is kept as an idempotent safety net
+    # in case a future pip install pulls opencv-python back in.
     _wrapper = (
         "import os, sys, subprocess, base64, time\n"
-        f"_pip = {pip_pkgs!r}\n"
         f"_env = {env_vars!r}\n"
-        "_b64 = os.environ.get('MEDIMAGE_TRAIN_SCRIPT_B64', '')\n"
-        "if not _b64:\n"
-        "    raise RuntimeError('_MEDIMAGE_TRAIN_SCRIPT_B64 env var not set')\n"
+        "# Training script can arrive in 2 ways:\n"
+        "#  (1) MEDIMAGE_SCRIPT_URL — wrapper downloads from API cache (used\n"
+        "#      for big scripts > 60KB b64 that wouldn't fit in env vars).\n"
+        "#  (2) MEDIMAGE_TRAIN_SCRIPT_B64_0, _1, ... chunks — back-compat\n"
+        "#      path for small scripts.\n"
+        "_chunks = []\n"
+        "_idx = 0\n"
+        "while True:\n"
+        "    _part = os.environ.get(f'MEDIMAGE_TRAIN_SCRIPT_B64_{_idx}')\n"
+        "    if _part is None:\n"
+        "        break\n"
+        "    _chunks.append(_part)\n"
+        "    _idx += 1\n"
+        "_b64 = ''.join(_chunks) if _chunks else os.environ.get('MEDIMAGE_TRAIN_SCRIPT_B64', '')\n"
         "print(f'[wrapper] python={sys.executable} pid={os.getpid()}', flush=True)\n"
-        "print(f'[wrapper] env keys={len(_env)} pip_pkgs={len(_pip)} script_b64_len={len(_b64)}', flush=True)\n"
-        "print(f'[wrapper] pip_pkgs={_pip}', flush=True)\n"
-        "print('[wrapper] pip install --force-reinstall numpy<2.0 ...', flush=True)\n"
-        "t0 = time.time()\n"
-        "_sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', 'numpy<2.0'], capture_output=True, text=True)\n"
-        "print(f'[wrapper] numpy install done in {time.time()-t0:.1f}s rc={_sp.returncode}', flush=True)\n"
-        "if _sp.returncode != 0:\n"
-        "    print(f'[wrapper] numpy install FAILED stderr={(_sp.stderr or \"\")[:500]}', flush=True)\n"
-        "if _pip:\n"
-        "    print(f'[wrapper] pip install {\" \".join(_pip)} ...', flush=True)\n"
-        "    t0 = time.time()\n"
-        "    _sp = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q'] + _pip, capture_output=True, text=True)\n"
-        "    print(f'[wrapper] pip install done in {time.time()-t0:.1f}s rc={_sp.returncode}', flush=True)\n"
-        "    if _sp.returncode != 0:\n"
-        "        print(f'[wrapper] pip install FAILED stderr={(_sp.stderr or \"\")[:500]}', flush=True)\n"
-        "# Opencv fix: ultralytics's dep chain pulls opencv-python (needs libGL.so.1,\n"
-        "# missing on the cluster). Uninstall opencv-python entirely and force-\n"
-        "# reinstall opencv-python-headless so the headless .so files win on import.\n"
-        "print('[opencv-fix] uninstall opencv-python...', flush=True)\n"
-        "t0 = time.time()\n"
-        "r = subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', '-q', 'opencv-python', 'opencv-contrib-python'], capture_output=True, text=True)\n"
-        "print(f'[opencv-fix] uninstall rc={r.returncode} in {time.time()-t0:.1f}s', flush=True)\n"
-        "print('[opencv-fix] force-reinstall opencv-python-headless...', flush=True)\n"
-        "t0 = time.time()\n"
-        "r = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', '--no-deps', 'opencv-python-headless'], capture_output=True, text=True)\n"
-        "print(f'[opencv-fix] install rc={r.returncode} in {time.time()-t0:.1f}s', flush=True)\n"
-        "r = subprocess.run([sys.executable, '-c', 'import cv2; print(\"cv2 ok:\", cv2.__version__)'], capture_output=True, text=True)\n"
-        "print(f'[opencv-fix] cv2 check: {r.stdout.strip()} {r.stderr.strip()}', flush=True)\n"
-        "print(f'[wrapper] setting {len(_env)} env vars (JOB_ID={os.environ.get(\"JOB_ID\", \"?\")})', flush=True)\n"
+        "print(f'[wrapper] env keys={len(_env)} script_chunks={len(_chunks)} script_b64_len={len(_b64)}', flush=True)\n"
+        "print(f'[wrapper] JOB_ID={os.environ.get(\"JOB_ID\", \"?\")}', flush=True)\n"
+        "# Idempotent opencv fix: if opencv-python got pulled back in (it needs\n"
+        "# libGL.so.1, missing on the cluster), swap it for opencv-python-headless.\n"
+        "# If headless is already there, this is a no-op (subprocess rc=0, fast).\n"
+        "try:\n"
+        "    import cv2  # noqa\n"
+        "    print('[opencv-fix] cv2 import ok, version:', cv2.__version__, flush=True)\n"
+        "except Exception as _e:\n"
+        "    print(f'[opencv-fix] cv2 import failed ({_e!r}) — swapping opencv-python -> opencv-python-headless', flush=True)\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', '-q', 'opencv-python', 'opencv-contrib-python'], capture_output=True, text=True)\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', '--no-deps', 'opencv-python-headless'], capture_output=True, text=True)\n"
+        "    import cv2  # noqa\n"
+        "    print(f'[opencv-fix] cv2 ok after swap: {cv2.__version__}', flush=True)\n"
         "for k, v in _env.items(): os.environ[k] = v\n"
+        "# Resolve the training script. Two delivery modes are supported:\n"
+        "#  (a) MinIO URL — API uploads the script to MinIO and passes the\n"
+        "#      URL. Used when the script is too big to fit in env vars\n"
+        "#      (Linux ARG_MAX is ~128KB, _VISION_TRAIN_SCRIPT is ~130KB\n"
+        "#      b64). MinIO is used because the API itself isn't reachable\n"
+        "#      from the Ray cluster's network but MinIO is — it already\n"
+        "#      has the dataset zip + weights keys.\n"
+        "#  (b) Inline env var(s) — used for short scripts. Kept for back-compat.\n"
+        "_job_id = os.environ.get('JOB_ID', 'unknown')\n"
+        "_script_url = os.environ.get('MEDIMAGE_SCRIPT_URL', '')\n"
+        "if _script_url:\n"
+        "    print(f'[wrapper] downloading training script from {_script_url}', flush=True)\n"
+        "    import urllib.request\n"
+        "    with urllib.request.urlopen(_script_url, timeout=60) as _r:\n"
+        "        _script_src = _r.read().decode('utf-8')\n"
+        "    print(f'[wrapper] downloaded {len(_script_src)} chars', flush=True)\n"
+        "else:\n"
+        "    _script_src = base64.b64decode(_b64).decode('utf-8')\n"
         "from io import StringIO\n"
         "_cap = StringIO()\n"
         "_so, _se = sys.stdout, sys.stderr\n"
         "sys.stdout = sys.stderr = _cap\n"
         "print('[wrapper] exec training script ...', flush=True)\n"
         "try:\n"
-        "    exec(base64.b64decode(_b64).decode(), {'__name__': '__main__'})\n"
+        "    exec(_script_src, {'__name__': '__main__'})\n"
         "except SystemExit as _e:\n"
         "    if _e.code not in (None, 0):\n"
         "        sys.stdout = _so; sys.stderr = _se\n"
@@ -3788,13 +4110,63 @@ def _run_on_ray_cluster(job: dict) -> None:
         "print(_cap.getvalue())\n"
     )
     _wrapper_b64 = _b64lib.b64encode(_wrapper.encode()).decode()
-    # Send the actual training script via env var (no argv limit on env vars)
+    # Upload the training script to MinIO and pass a presigned URL to the
+    # wrapper. The base64 of the ~97KB _VISION_TRAIN_SCRIPT is ~130KB which
+    # exceeds Linux's per-payload env var limit (~128KB = ARG_MAX/2). When
+    # that limit is hit, Ray silently PENDINGS the job forever with no logs.
+    # We can't GET the script from the API (the API isn't exposed to the
+    # Ray cluster's network) but MinIO is — we already use it for the
+    # dataset zip + weights. Bucket: "medimage-scripts" (auto-created).
+    # The presigned URL is generated against MINIO_PUBLIC_URL so the
+    # signature matches the hostname the Ray cluster uses to GET it.
+    import tempfile as _tf
+    _script_text = base64.b64decode(script_b64).decode("utf-8")
+    _tmp = _tf.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+    _tmp.write(_script_text)
+    _tmp.close()
+    _script_bucket = "medimage-scripts"
+    _script_key = f"{job_id}/train_script.py"
+    _script_presigned_url = ""
+    try:
+        # Upload via the docker-internal endpoint (always reachable from
+        # inside the API container).
+        upload_to_minio(
+            _tmp.name, _script_bucket, _script_key,
+            MINIO_URL, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+        )
+        # Sign the presigned URL using the public endpoint so the signature
+        # matches the host the Ray cluster will use to GET it.
+        import boto3 as _boto
+        from botocore.config import Config as _Cfg
+        _s3_pub = _boto.client(
+            "s3",
+            endpoint_url=MINIO_PUBLIC_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_Cfg(signature_version="s3v4"),
+        )
+        _script_presigned_url = _s3_pub.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _script_bucket, "Key": _script_key},
+            ExpiresIn=3600,
+        )
+    except Exception as _e:
+        _append_log(job_id, f"[cluster] WARN: could not upload training script to MinIO: {_e}")
+    finally:
+        try:
+            os.unlink(_tmp.name)
+        except Exception:
+            pass
     _env_for_job = dict(env_vars)
-    _env_for_job["MEDIMAGE_TRAIN_SCRIPT_B64"] = script_b64
+    # Don't pass the script in env vars — just point at the MinIO URL.
+    _env_for_job.pop("MEDIMAGE_TRAIN_SCRIPT_B64", None)
+    _env_for_job["MEDIMAGE_SCRIPT_URL"] = _script_presigned_url
+    _env_for_job["MEDIMAGE_SCRIPT_BUCKET"] = _script_bucket
+    _env_for_job["MEDIMAGE_SCRIPT_KEY"] = _script_key
     _num_gpus = int(job.get("num_gpus") or 1)
+    _env_for_job["MEDIMAGE_NUM_GPUS"] = str(_num_gpus)
     _deploy_payload = {
         "entrypoint": f"bash -c 'echo {_wrapper_b64} | base64 -d > /tmp/dl_train.py && python3 /tmp/dl_train.py'",
-        "entrypoint_num_gpus": _num_gpus,
         "runtime_env": {"env_vars": _env_for_job},
     }
     try:
@@ -3816,6 +4188,33 @@ def _run_on_ray_cluster(job: dict) -> None:
     while True:
         time.sleep(poll_sec)
         elapsed += poll_sec
+        # Check if the job was cancelled in the DB (DELETE endpoint sets
+        # status to 'error' with the cancellation message). The Ray job
+        # may still report PENDING/RUNNING because the autoscaler
+        # hasn't reaped it yet, but the user wants the training thread
+        # to stop polling and exit so the row doesn't keep "training in
+        # progress" forever.
+        try:
+            with get_db() as _c:
+                _db_row = _c.execute(
+                    "SELECT status FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()
+            if _db_row and _db_row["status"] not in ("running", "queued"):
+                # DB no longer says the job is live — assume cancellation
+                # or external error. Stop the Ray job, exit the loop, and
+                # let the surrounding handler surface the DB error.
+                _append_log(job_id, f"[cluster] DB status is '{_db_row['status']}' — abandoning Ray poll")
+                try:
+                    _req_stop = _ray_req.post(
+                        f"{http_url}/api/jobs/{_ray_job_id}/stop", timeout=5
+                    )
+                    _append_log(job_id, f"[cluster] best-effort stop: {_req_stop.status_code}")
+                except Exception:
+                    pass
+                _ray_status = "STOPPED"
+                break
+        except Exception:
+            pass
         try:
             _status_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}", timeout=10)
             _status_resp.raise_for_status()
@@ -3838,20 +4237,19 @@ def _run_on_ray_cluster(job: dict) -> None:
     for _log_attempt in range(15):
         try:
             _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
-            _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} len={len(_logs_resp.text)}")
-            if _logs_resp.ok and _logs_resp.text:
-                # Ray returns `{"logs": "line1\nline2\n..."}` — parse JSON
-                # first so we iterate over real log lines, not the JSON
-                # wrapper (which contains the substring "Runtime env is"
-                # and would otherwise be skipped as a single 12kB blob).
+            # Parse JSON wrapper first — Ray returns {"logs": "..."}
+            # so raw text length is misleading (e.g. {"logs":""} = 12 bytes but 0 lines).
+            _logs_str = ""
+            if _logs_resp.ok:
                 try:
                     _logs_str = _logs_resp.json().get("logs", "") or ""
                 except Exception:
-                    _logs_str = _logs_resp.text
+                    _logs_str = _logs_resp.text if _logs_resp.text else ""
+            _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} json_len={len(_logs_str)}")
+            if _logs_str.strip():
                 for _line in _logs_str.splitlines():
                     _line_s = _line.strip()
                     if not _line_s: continue
-                    # Skip Ray's own log lines (timestamps, runtime env setup)
                     if _line_s.startswith("Running entrypoint") or "Runtime env is" in _line_s or "Connecting to existing" in _line_s or "Connected to Ray" in _line_s or "Using address" in _line_s:
                         continue
                     _append_log(job_id, _line_s)
@@ -4015,6 +4413,23 @@ def _run_on_ray_cluster(job: dict) -> None:
         while True:
             time.sleep(poll_sec)
             elapsed += poll_sec
+            # Honour user cancellation even when using ray.wait (the
+            # future may stay PENDING forever if the cluster can't
+            # allocate a slot).
+            try:
+                with get_db() as _c:
+                    _db_row = _c.execute(
+                        "SELECT status FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                if _db_row and _db_row["status"] not in ("running", "queued"):
+                    _append_log(job_id, f"[cluster] DB status is '{_db_row['status']}' — abandoning Ray wait")
+                    try:
+                        ray.cancel(future)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                pass
             ready, _ = ray.wait([future], timeout=0)
             if ready:
                 break
@@ -4361,6 +4776,353 @@ def get_job(job_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
     return dict(row)
+
+
+# ─── WebSocket for real-time job updates ─────────────────────────────────────
+_ws_clients: list[WebSocket] = []
+_ws_broadcast_task: asyncio.Task | None = None
+
+
+async def _ws_broadcast_loop():
+    """Push job updates to all connected WebSocket clients every 2 seconds."""
+    while True:
+        await asyncio.sleep(2)
+        if not _ws_clients:
+            continue
+        try:
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT id, name, training_type, model_name, engine, status, "
+                    "progress, pipeline_step, created_at, started_at, finished_at, "
+                    "error, dataset, epochs, batch_size "
+                    "FROM jobs WHERE hidden_in_jobs = 0 ORDER BY created_at DESC"
+                ).fetchall()
+            payload = []
+            for r in rows:
+                d = dict(r)
+                d["model"] = d.pop("model_name", "")
+                payload.append(d)
+            msg = _json.dumps({"type": "jobs", "data": payload})
+            disconnected = []
+            for ws in _ws_clients:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    disconnected.append(ws)
+            for ws in disconnected:
+                _ws_clients.remove(ws)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/jobs")
+async def ws_jobs(websocket: WebSocket):
+    """WebSocket endpoint for real-time job status updates.
+
+    Accepts an optional ``token`` query parameter for JWT auth when Keycloak
+    is enabled. Clients should pass the same Bearer token as the REST API.
+    When Keycloak is disabled, the connection is accepted without auth.
+    """
+    global _ws_broadcast_task
+    if _KC_ENABLED and _jwks_client is not None:
+        token = websocket.query_params.get("token", "")
+        if not token:
+            await websocket.close(code=4001, reason="Missing token")
+            return
+        try:
+            await asyncio.to_thread(_sync_verify_token, token)
+        except Exception:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    await websocket.accept()
+    _ws_clients.append(websocket)
+    if _ws_broadcast_task is None or _ws_broadcast_task.done():
+        _ws_broadcast_task = asyncio.create_task(_ws_broadcast_loop())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if websocket in _ws_clients:
+            _ws_clients.remove(websocket)
+
+
+# ─── Bulk-run state: persisted in SQLite, broadcast over WebSocket ───────────
+# All Test-All "Run all compatible" state lives in the bulk_runs and
+# bulk_run_jobs tables (already in init_db). Frontend connects to
+# /ws/testall, sends/receives the latest snapshot every 2s. This replaces
+# the previous localStorage + 3s polling scheme.
+
+_bulk_ws_clients: list[WebSocket] = []
+_bulk_ws_task: asyncio.Task | None = None
+
+
+def _load_bulk_snapshot() -> dict:
+    """Build a single JSON snapshot of all bulk runs + their jobs.
+
+    Only the latest 5 runs are returned to keep the payload small.
+    The job status is enriched with the live status from the jobs
+    table (when a job_id is set) so the TestAll UI reflects the
+    actual backend state without polling.
+    """
+    with get_db() as conn:
+        runs = conn.execute(
+            "SELECT * FROM bulk_runs ORDER BY started_at DESC LIMIT 5"
+        ).fetchall()
+        if not runs:
+            return {"runs": [], "jobs_by_run": {}}
+        run_ids = [r["id"] for r in runs]
+        placeholders = ",".join("?" for _ in run_ids)
+        jobs = conn.execute(
+            f"SELECT * FROM bulk_run_jobs WHERE bulk_run_id IN ({placeholders})",
+            run_ids,
+        ).fetchall()
+        # Enrich with live job status so single-test submissions (which
+        # only update bulk_run_jobs at submit time) get the running /
+        # completed / error status as the backend updates it.
+        # sqlite3.Row supports [] but not .get(); convert upfront.
+        job_ids = [j["job_id"] for j in jobs if j["job_id"]]
+        live_status: dict[str, dict] = {}
+        if job_ids:
+            jplace = ",".join("?" for _ in job_ids)
+            for row in conn.execute(
+                f"SELECT id, status, error, started_at, finished_at, pipeline_step FROM jobs WHERE id IN ({jplace})",
+                job_ids,
+            ).fetchall():
+                live_status[row["id"]] = dict(row)
+        jobs_by_run: dict[str, list] = {rid: [] for rid in run_ids}
+        for j in jobs:
+            d = dict(j)
+            # Overlay the live job status onto the bulk row. The bulk
+            # row stores the status at submit time, which stays at
+            # "queued" forever unless the frontend (or a "Run all"
+            # loop) explicitly updates it. The jobs table is the
+            # source of truth for the actual training state.
+            if d.get("job_id") and d["job_id"] in live_status:
+                live = live_status[d["job_id"]]
+                d["status"] = live.get("status") or d.get("status") or "queued"
+                if live.get("error") and d["status"] == "error":
+                    d["error"] = live["error"]
+                if live.get("started_at"):
+                    d["started_at"] = live["started_at"]
+                if live.get("finished_at"):
+                    d["finished_at"] = live["finished_at"]
+            jobs_by_run[j["bulk_run_id"]].append(d)
+        return {
+            "runs": [dict(r) for r in runs],
+            "jobs_by_run": jobs_by_run,
+        }
+
+
+async def _bulk_ws_broadcast_loop():
+    """Push the latest bulk-run snapshot every 1s to subscribed clients.
+    The Jobs page polls /api/jobs directly so it doesn't need this,
+    but TestAllModels shows the bulk_run_jobs snapshot overlaid with the
+    live jobs-table status — 1s keeps the displayed row status in
+    sync with the actual job state without burning the database.
+    """
+    while True:
+        await asyncio.sleep(1)
+        if not _bulk_ws_clients:
+            continue
+        try:
+            snap = _load_bulk_snapshot()
+            msg = _json.dumps({"type": "bulk_snapshot", "data": snap})
+            disconnected = []
+            for ws in _bulk_ws_clients:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    disconnected.append(ws)
+            for ws in disconnected:
+                _bulk_ws_clients.remove(ws)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/testall")
+async def ws_testall(websocket: WebSocket):
+    """WebSocket endpoint for Test-All bulk run state.
+
+    Server pushes the current bulk_runs + bulk_run_jobs snapshot every
+    2s. Clients may also send a {"action":"create_run", "id":...} to
+    register a new bulk run row, and use REST endpoints to update jobs.
+    """
+    global _bulk_ws_task
+    if _KC_ENABLED and _jwks_client is not None:
+        token = websocket.query_params.get("token", "")
+        if not token:
+            await websocket.close(code=4001, reason="Missing token")
+            return
+        try:
+            await asyncio.to_thread(_sync_verify_token, token)
+        except Exception:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    await websocket.accept()
+    _bulk_ws_clients.append(websocket)
+    if _bulk_ws_task is None or _bulk_ws_task.done():
+        _bulk_ws_task = asyncio.create_task(_bulk_ws_broadcast_loop())
+    # Send an initial snapshot immediately so the client doesn't wait 2s
+    try:
+        snap = _load_bulk_snapshot()
+        await websocket.send_text(_json.dumps({"type": "bulk_snapshot", "data": snap}))
+    except Exception:
+        pass
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if websocket in _bulk_ws_clients:
+            _bulk_ws_clients.remove(websocket)
+
+
+@app.get("/api/bulk-runs/latest")
+def get_latest_bulk_run():
+    """Return the latest bulk run + its jobs (used for initial mount)."""
+    return _load_bulk_snapshot()
+
+
+@app.post("/api/bulk-runs")
+def create_bulk_run(payload: dict, request: Request):
+    """Create a new bulk_runs row. Returns the row's id.
+
+    Body: {id?: str, provider?: 'ray'|'modal', deploy_enabled?: bool, total?: int}
+    The frontend supplies a stable id (usually the same as a previous
+    run, so the row upserts instead of growing the table forever).
+    """
+    import uuid
+    rid = payload.get("id") or f"bulk_{uuid.uuid4().hex[:12]}"
+    user_id = _current_user_id(request)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO bulk_runs(id, started_at, provider, deploy_enabled, total, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, time.time(),
+             payload.get("provider", "ray"),
+             1 if payload.get("deploy_enabled") else 0,
+             int(payload.get("total", 0)),
+             user_id),
+        )
+        conn.commit()
+    return {"id": rid}
+
+
+@app.patch("/api/bulk-runs/{run_id}")
+def update_bulk_run(run_id: str, payload: dict):
+    """Update a bulk_runs row (finished_at, stopped, counts, etc)."""
+    fields, params = [], []
+    for k in ("finished_at", "stopped", "total", "ok", "failed", "deployed_count"):
+        if k in payload:
+            fields.append(f"{k}=?")
+            params.append(payload[k])
+    if not fields:
+        return {"updated": 0}
+    params.append(run_id)
+    with get_db() as conn:
+        cur = conn.execute(f"UPDATE bulk_runs SET {', '.join(fields)} WHERE id=?", params)
+        conn.commit()
+    return {"updated": cur.rowcount}
+
+
+@app.post("/api/bulk-runs/{run_id}/stop")
+def stop_bulk_run(run_id: str):
+    """Mark a bulk run as stopped on the server. The frontend's "Stop
+    Bulk" button calls this so a stop request survives a page refresh /
+    tab close / JS loop crash — the in-flight train job on the Ray
+    cluster is not cancelled (that would need a separate call to the
+    jobs endpoint) but the bulk_runs row is finalised so the next WS
+    push reflects a finished, stopped state and the UI gets unstuck.
+    Idempotent: safe to call when the run is already finished.
+    """
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE bulk_runs SET stopped = 1, "
+            "finished_at = COALESCE(finished_at, ?) "
+            "WHERE id = ? AND finished_at IS NULL",
+            (time.time(), run_id),
+        )
+        conn.commit()
+    return {"updated": cur.rowcount, "run_id": run_id}
+
+
+@app.delete("/api/bulk-runs")
+def delete_bulk_runs(request: Request):
+    """Wipe all bulk_runs (and their bulk_run_jobs) for the current
+    user. The frontend's "Reset" button calls this so a reset survives
+    a page refresh — without a server-side delete, the next WS push
+    would just refill the snapshot with the same rows and the UI would
+    flicker for 2s before looking identical to before the click.
+    Per-user: each user only wipes their own rows. The dismissed-flag
+    in user_prefs is intentionally NOT cleared — that preference is
+    per-run and outlives the run's lifetime.
+    """
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="authentication required")
+    with get_db() as conn:
+        # Delete child rows first (FK not enforced in SQLite by default
+        # but be explicit so the orphan check is obvious).
+        conn.execute(
+            "DELETE FROM bulk_run_jobs WHERE bulk_run_id IN "
+            "(SELECT id FROM bulk_runs WHERE user_id = ?)",
+            (uid,),
+        )
+        cur = conn.execute("DELETE FROM bulk_runs WHERE user_id = ?", (uid,))
+        conn.commit()
+    return {"deleted": cur.rowcount}
+
+
+@app.post("/api/bulk-runs/{run_id}/jobs")
+def upsert_bulk_run_job(run_id: str, payload: dict):
+    """Upsert a single bulk_run_jobs row (per-model state)."""
+    row_key = payload.get("row_key")
+    if not row_key:
+        raise HTTPException(status_code=400, detail="row_key required")
+    # Build column list and VALUES placeholders separately. The
+    # "column = excluded.column" form on the UPDATE branch is built
+    # by joining each column name with the SQLite "excluded" pseudo-
+    # table alias — NEVER embed "?" twice (the previous version of
+    # this query produced "status=?=excluded.status" which SQLite
+    # parses as 14 placeholders but the params list only has 8).
+    cols = ["status", "error", "elapsed_sec", "deployed", "deploy_url", "job_id"]
+    placeholders = ", ".join("?" for _ in cols)
+    update_set = ", ".join(f"{c}=excluded.{c}" for c in cols)
+    params = [
+        payload.get("status", "idle"),
+        payload.get("error"),
+        float(payload.get("elapsed_sec", 0) or 0),
+        1 if payload.get("deployed") else 0,
+        payload.get("deploy_url"),
+        payload.get("job_id"),
+        run_id,
+        row_key,
+    ]
+    with get_db() as conn:
+        conn.execute(
+            f"INSERT INTO bulk_run_jobs({', '.join(cols)}, bulk_run_id, row_key) "
+            f"VALUES ({placeholders}, ?, ?) "
+            f"ON CONFLICT(bulk_run_id, row_key) DO UPDATE SET {update_set}",
+            params,
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.get("/api/bulk-runs/{run_id}/jobs")
+def list_bulk_run_jobs(run_id: str):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bulk_run_jobs WHERE bulk_run_id = ?", (run_id,)
+        ).fetchall()
+    return {"jobs": [dict(r) for r in rows]}
 
 
 @app.get("/api/jobs/{job_id}/download-weights")
@@ -4873,6 +5635,55 @@ def save_setting(key: str, body: dict):
     value = str(body.get("value", ""))
     with get_db() as conn:
         conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+        conn.commit()
+    return {"ok": True}
+
+
+# ─── Per-user preferences (replaces localStorage) ────────────────────────────
+# All small per-user UI state (filter selections, dashboard URLs, MinIO
+# credentials, API keys, etc.) lives here. The frontend has a small
+# useUserPrefs() hook that mirrors this in memory so reads are sync.
+@app.get("/api/user-prefs")
+def list_user_prefs(request: Request):
+    """Return all of the current user's prefs as {key: value, ...}."""
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with get_db() as conn:
+        rows = conn.execute("SELECT key, value FROM user_prefs WHERE user_id=?", (uid,)).fetchall()
+    return {"prefs": {r["key"]: r["value"] for r in rows}}
+
+
+@app.get("/api/user-prefs/{key}")
+def get_user_pref(key: str, request: Request):
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM user_prefs WHERE user_id=? AND key=?", (uid, key)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"key": key, "value": row["value"]}
+
+
+@app.put("/api/user-prefs/{key}")
+def put_user_pref(key: str, body: dict, request: Request):
+    """Upsert a single preference. Use {"value": "..."} or {"value": null} to delete."""
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    value = body.get("value", "")
+    if value is None:
+        with get_db() as conn:
+            conn.execute("DELETE FROM user_prefs WHERE user_id=? AND key=?", (uid, key))
+            conn.commit()
+        return {"ok": True, "deleted": True}
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO user_prefs(user_id, key, value, updated_at) VALUES(?,?,?,strftime('%s','now')) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (uid, key, str(value)),
+        )
         conn.commit()
     return {"ok": True}
 
@@ -8315,6 +9126,12 @@ class HFImportRequest(BaseModel):
     hf_dataset_id: str
     bucket_name: str
     max_files: int = 20
+    # Optional explicit list of file paths inside the repo. When
+    # provided, these are used verbatim (subject to max_files cap and
+    # the 200 MB per-file size guard). When None, the legacy
+    # "first N by priority (parquet → jsonl/json/csv → images → other)"
+    # behaviour is used as a fallback.
+    selected_files: list[str] | None = None
 
 
 def _log_hf(job_id: str, line: str):
@@ -8363,7 +9180,12 @@ def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
             raise Exception(f"HuggingFace API returned HTTP {r.status_code} — dataset not found or is private")
 
         entries = r.json()
-        blobs = [e for e in entries if e.get("type") == "blob"]
+        # HF tree API returns type='file' or 'lfs' (LFS pointer), NOT
+        # 'blob'. The old filter (`type == "blob"`) silently matched
+        # nothing, so every HF import was uploading 0 files even though
+        # the user had selected a real repo. This is what the picker
+        # in the UI is fixing too (src/pages/Datasets.tsx).
+        blobs = [e for e in entries if e.get("type") in ("file", "lfs")]
 
         # If no blobs at root, try data/ subdirectory
         if not blobs:
@@ -8386,7 +9208,17 @@ def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
             if p.endswith(".txt"): return 3
             return 9
 
-        blobs.sort(key=_prio)
+        # If the user picked specific files in the UI, use those
+        # verbatim. Otherwise fall back to "first N by priority".
+        if req.selected_files:
+            wanted = set(req.selected_files)
+            blobs = [b for b in blobs if b["path"] in wanted]
+            blobs.sort(key=_prio)
+            not_found = wanted - {b["path"] for b in blobs}
+            if not_found:
+                _log_hf(job_id, f"⚠ {len(not_found)} selected file(s) not in repo: {', '.join(list(not_found)[:3])}{'…' if len(not_found) > 3 else ''}")
+        else:
+            blobs.sort(key=_prio)
         blobs = blobs[:req.max_files]
         _log_hf(job_id, f"Found {len(blobs)} file(s) to download")
         job["progress"] = 15
@@ -8435,6 +9267,274 @@ def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
         job["status"] = "error"
         job["error"] = str(e)
         _log_hf(job_id, f"ERROR: {e}")
+
+
+@app.get("/api/datasets/inspect-hf-file")
+def inspect_hf_file(repo_id: str, path: str, request: Request):
+    """Inspect a file in a HuggingFace dataset repo.
+
+    For .zip archives: list the central directory via two HTTP Range
+    requests (last 256 KB to find the EOCD record, then the central
+    directory itself). NO full download — works even for multi-GB
+    archives. The user sees the file's internal structure before
+    committing to download hundreds of MB.
+
+    For .tar / .tar.gz / .tgz archives: we need the full file because
+    tar has no central directory — the entry headers are interleaved
+    with the file data. Capped at 200 MB.
+
+    For other files: return a stub (download URL) so the frontend can
+    show a "preview not supported for this file type" message.
+    """
+    import requests as _req
+    import zipfile as _zlib
+    import tarfile as _tarlib
+    import struct as _struct
+    import io as _io
+
+    _user_id = _current_user_id(request)
+    _hf_token = _load_user_hf_token(_user_id) or os.getenv("HF_TOKEN", "") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+    _hf_headers = {"Authorization": f"Bearer {_hf_token}"} if _hf_token else {}
+    _hf_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{path}"
+
+    p_lower = path.lower()
+    is_zip  = p_lower.endswith(".zip")
+    is_tar  = p_lower.endswith(".tar") or p_lower.endswith(".tar.gz") or p_lower.endswith(".tgz")
+    # Text-previewable file types: markdown, plain text, json, csv,
+    # yaml/yml, log. For these, we fetch a HEAD to get the size and a
+    # capped Range download for the body so big files don't pin the
+    # API. The body is returned as a UTF-8 string in the response.
+    is_text = any(p_lower.endswith(ext) for ext in (
+        ".md", ".txt", ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".log", ".xml", ".html", ".py", ".js", ".ts",
+    ))
+
+    if not (is_zip or is_tar or is_text):
+        return {
+            "kind": "unsupported",
+            "repo_id": repo_id,
+            "path": path,
+            "message": "Preview is available for archives (.zip / .tar / .tar.gz) and text files (.md / .txt / .json / .csv / .yaml / …).",
+            "download_url": _hf_url,
+        }
+
+    try:
+        if is_zip:
+            # ── Two-Range-request zip central directory parser ──────────
+            # 1) Get file size via HEAD (HF CDN returns Content-Length).
+            # 2) Range-fetch the last 256 KB to find the EOCD record
+            #    (EOCD signature PK\x05\x06 is at the very end, with up
+            #    to 65535 bytes of comment + 22 bytes of record — the last
+            #    256 KB window catches every EOCD even with max-length
+            #    comments and disk-spanning data descriptors).
+            # 3) Parse EOCD to find central directory offset + size.
+            # 4) Range-fetch exactly the central directory bytes.
+            # 5) Walk central directory entries, decoding per-entry
+            #    fields. No full file download — works for 10 GB zips.
+
+            head = _req.head(_hf_url, headers=_hf_headers, timeout=15, allow_redirects=True)
+            file_size = int(head.headers.get("Content-Length") or 0)
+            if file_size <= 0:
+                # Some HF mirrors don't return Content-Length on HEAD
+                # (LFS). Fall back to a single range request sized to
+                # a safe window starting at file_size-256KB.
+                file_size = None
+                tail = b""
+                r = _req.get(_hf_url, headers={**_hf_headers, "Range": "bytes=-262144"}, timeout=30)
+                if r.status_code == 206:
+                    tail = r.content
+                elif r.status_code == 200:
+                    # Server ignored Range and returned full file —
+                    # bail to the legacy full-download path below.
+                    tail = r.content
+                    file_size = len(tail)
+                # else: server returned 416 or error — fall through.
+            else:
+                tail_size = min(262144, file_size)
+                r = _req.get(
+                    _hf_url,
+                    headers={**_hf_headers, "Range": f"bytes={file_size - tail_size}-{file_size - 1}"},
+                    timeout=30,
+                )
+                tail = r.content if r.status_code == 206 else b""
+
+            if not tail:
+                # HEAD didn't return a size, or range request failed.
+                # Fall back to legacy full download (capped at 200 MB).
+                r = _req.get(_hf_url, headers=_hf_headers, timeout=120, stream=True)
+                buf = b""
+                total = 0
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    buf += chunk
+                    total += len(chunk)
+                    if total > 200 * 1024 * 1024:
+                        return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": total, "message": "Archive >200 MB; partial listing not supported yet."}
+                zf = _zlib.ZipFile(_io.BytesIO(buf))
+                entries = [{"path": i.filename, "size": i.file_size, "compressed": i.compress_size, "is_dir": i.is_dir()} for i in zf.infolist()]
+                zf.close()
+                entries.sort(key=lambda e: (not e["is_dir"], e["path"]))
+                return {
+                    "kind": "zip", "repo_id": repo_id, "path": path,
+                    "size_bytes": total, "entry_count": len(entries),
+                    "entries": entries[:500], "truncated": len(entries) > 500,
+                    "method": "full_download_fallback",
+                }
+
+            # 2) Find EOCD. Search backwards for the 4-byte signature.
+            eocd_idx = tail.rfind(b"PK\x05\x06")
+            if eocd_idx < 0:
+                # EOCD not in last 256 KB — file is malformed, or has
+                # a comment longer than 256 KB (ZIP spec max is 65535,
+                # so this means the file is broken). Fall back to full.
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Could not locate EOCD record in last 256 KB; archive may be malformed."}
+            eocd = tail[eocd_idx:eocd_idx + 22]
+            if len(eocd) < 22:
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Truncated EOCD record."}
+            _sig, disk_num, cd_disk, n_entries_this, n_entries_total, cd_size, cd_offset, comment_len = _struct.unpack("<IHHHHIIH", eocd)
+            if disk_num != 0 or cd_disk != 0:
+                # Multi-disk zip — not supported in partial-read mode
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Multi-disk zip not supported; full download required."}
+            if file_size is None:
+                # No Content-Length from HEAD; can't safely compute
+                # absolute offsets for the next Range request.
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Server did not return file size; cannot range-fetch central directory."}
+            # 3+4) Range-fetch the central directory (cd_offset is
+            # relative to the start of the archive).
+            cd_start = cd_offset
+            cd_end   = cd_offset + cd_size - 1
+            if cd_start + cd_size > file_size:
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": file_size, "message": "Central directory offset exceeds file size; archive may be truncated."}
+            r = _req.get(
+                _hf_url,
+                headers={**_hf_headers, "Range": f"bytes={cd_start}-{cd_end}"},
+                timeout=60,
+            )
+            if r.status_code != 206:
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": file_size, "message": f"Central directory range request returned HTTP {r.status_code}."}
+            cd_bytes = r.content
+
+            # 5) Walk central directory entries. Each CD entry:
+            #   signature "PK\x01\x02" (4 bytes) + 42 bytes of fixed
+            #   fields + variable filename + extra + comment.
+            # Fixed fields (after sig): 11 H's + 5 I's = 16 placeholders,
+            # 42 bytes. Field order: ver ver_need flags method mod_time
+            #   mod_date crc(I) comp_size(I) uncomp_size(I) fname_len
+            #   extra_len comment_len disk_no int_attr ext_attr(I)
+            #   local_header_offset(I)
+            entries = []
+            i = 0
+            while i < len(cd_bytes) - 46:
+                if cd_bytes[i:i+4] != b"PK\x01\x02":
+                    break
+                (
+                    _v, _vm, _flags, _method, _mod_time, _mod_date,
+                    _crc, comp_size, uncomp_size,
+                    fname_len, extra_len, comment_len, _disk_no,
+                    _int_attr, _ext_attr, _local_off
+                ) = _struct.unpack(
+                    "<HHHHHHIIIHHHHHII", cd_bytes[i + 4:i + 46]
+                )
+                # Data-descriptor variant: if the GP flag is set, the
+                # 12-byte CRC/sizes are in a trailing data descriptor
+                # after the file data, not here. uncomp_size will be 0
+                # in that case. We don't need the real size for preview,
+                # so 0 is fine.
+                name = cd_bytes[i+46:i+46+fname_len].decode("utf-8", errors="replace")
+                # local_header_offset (start of the local file entry)
+                # is the most reliable pointer to the file's actual
+                # bytes — but we don't fetch the local headers for the
+                # preview, only the central directory.
+                is_dir = name.endswith("/")
+                entries.append({
+                    "path": name,
+                    "size": uncomp_size,
+                    "compressed": comp_size,
+                    "is_dir": is_dir,
+                })
+                i += 46 + fname_len + extra_len + comment_len
+            entries.sort(key=lambda e: (not e["is_dir"], e["path"]))
+            return {
+                "kind": "zip",
+                "repo_id": repo_id,
+                "path": path,
+                "size_bytes": file_size,
+                "entry_count": len(entries),
+                "entries": entries[:500],
+                "truncated": len(entries) > 500,
+                "method": "central_directory_range",  # the fast path
+            }
+        elif is_tar:
+            # tar — index is at the end too, but tar has no central
+            # directory. We need the whole file. Cap at 200 MB.
+            r = _req.get(_hf_url, headers=_hf_headers, timeout=300, stream=True)
+            total = 0
+            buf = b""
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                buf += chunk
+                total += len(chunk)
+                if total > 200 * 1024 * 1024:
+                    return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": total, "message": "Archive >200 MB; partial listing not supported yet."}
+            tf = _tarlib.open(fileobj=_io.BytesIO(buf), mode="r:*")
+            entries = []
+            for info in tf:
+                entries.append({
+                    "path": info.name,
+                    "size": info.size,
+                    "is_dir": info.isdir(),
+                })
+            tf.close()
+            entries.sort(key=lambda e: (not e["is_dir"], e["path"]))
+            return {
+                "kind": "tar",
+                "repo_id": repo_id,
+                "path": path,
+                "size_bytes": total,
+                "entry_count": len(entries),
+                "entries": entries[:500],
+                "truncated": len(entries) > 500,
+            }
+        elif is_text:
+            # ── Text-file preview (.md / .txt / .json / .csv / …) ──
+            # Cap at 256 KB — enough for a README, JSON schema, or the
+            # first chunk of a CSV. Bigger files get truncated + a flag.
+            TEXT_PREVIEW_CAP = 256 * 1024
+            head = _req.head(_hf_url, headers=_hf_headers, timeout=15, allow_redirects=True)
+            file_size = int(head.headers.get("Content-Length") or 0) or None
+            r = _req.get(
+                _hf_url,
+                headers={**_hf_headers, "Range": f"bytes=0-{TEXT_PREVIEW_CAP - 1}"},
+                timeout=60,
+            )
+            if r.status_code == 206:
+                body_bytes = r.content
+            elif r.status_code == 200:
+                # Server ignored Range — cap the response ourselves.
+                body_bytes = r.content[:TEXT_PREVIEW_CAP]
+            else:
+                raise _req.HTTPError(r.status_code, f"HTTP {r.status_code}")
+            # Decode UTF-8 with replacement for binary files that
+            # happen to share an extension. The frontend renders
+            # whatever comes out as text.
+            try:
+                body_text = body_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                body_text = body_bytes.decode("utf-8", errors="replace")
+            truncated = (file_size is None and len(body_bytes) == TEXT_PREVIEW_CAP) or \
+                        (file_size is not None and file_size > len(body_bytes))
+            return {
+                "kind": "text",
+                "repo_id": repo_id,
+                "path": path,
+                "size_bytes": file_size,
+                "preview_bytes": len(body_bytes),
+                "truncated": truncated,
+                "content": body_text,
+            }
+    except _req.HTTPError as e:
+        raise HTTPException(e.response.status_code, f"HF download failed: {e.response.reason}")
+    except _zlib.BadZipFile:
+        raise HTTPException(400, "File is not a valid zip archive")
+    except Exception as e:
+        raise HTTPException(500, f"Inspect failed: {e}")
 
 
 @app.post("/api/datasets/import-hf")

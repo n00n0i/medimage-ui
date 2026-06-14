@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { getPrefOr, refreshPrefs, subscribePrefs } from '../lib/userPrefs'
 import {
   Zap, Key, Copy, Trash2, Plus, RefreshCw, CheckCircle2, Code2,
   Globe, Lock, Eye, EyeOff, ExternalLink, BookOpen, Wifi, WifiOff,
@@ -124,12 +125,24 @@ function genKey(): string {
   return 'mia_' + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+const KEYS_PREF = 'mia_api_keys'
+
 function loadKeys(): ApiKey[] {
-  try { return JSON.parse(localStorage.getItem('mia_api_keys') || '[]') } catch { return [] }
+  const raw = getPrefOr(KEYS_PREF, '[]')
+  try { return JSON.parse(raw) } catch { return [] }
 }
 
-function saveKeys(keys: ApiKey[]) {
-  localStorage.setItem('mia_api_keys', JSON.stringify(keys))
+async function saveKeys(keys: ApiKey[]) {
+  const value = JSON.stringify(keys)
+  try {
+    await fetch(`/api/user-prefs/${encodeURIComponent(KEYS_PREF)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    })
+    // Refresh the in-memory mirror so other tabs / future reads see it
+    void refreshPrefs()
+  } catch { /* best-effort */ }
 }
 
 function fmtDate(ts: number) {
@@ -221,6 +234,15 @@ export default function ApiService() {
   const [selectedModel, setSelectedModel] = useState<DeployedModel | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const statusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Re-sync the keys list whenever the prefs mirror changes — covers
+  // (a) the initial /api/user-prefs load finishing, and (b) another tab
+  // / window creating/revoking a key.
+  useEffect(() => {
+    const sync = () => setApiKeys(loadKeys())
+    sync()
+    return subscribePrefs(sync)
+  }, [])
 
   const showToast = (msg: string) => {
     setToast(msg)

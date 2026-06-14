@@ -48,6 +48,12 @@ export default defineConfig(({ mode }) => {
         target: BACKEND_URL,
         changeOrigin: true,
       },
+      // WebSocket for real-time job updates
+      '/ws': {
+        target: BACKEND_URL,
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
   }

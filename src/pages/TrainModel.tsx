@@ -80,11 +80,9 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'yolov9-c',   label: 'YOLOv9-C',                   engine: 'Ultralytics', model: 'yolov9c.pt',                    hardware: 'GPU 12GB+',    description: 'Programmable gradient — better small defect detection vs YOLOv8',            compatible: true },
     { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: true },
     { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet-50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
-    { value: 'rdd-yolov8s',label: 'RDD-YOLOv8 (Road Damage)',    engine: 'Ultralytics', model: 'road-damage-yolov8s.pt',        hardware: 'GPU 6GB+',     description: 'YOLOv8s fine-tuned on RDD2022 (Crowdsensing-based Road Damage Detection Challenge 2022) — 4 classes: Longitudinal Crack, Transverse Crack, Alligator Crack, Potholes, ดีสำหรับ road/infrastructure inspection (weights จาก oracl4/RoadDamageDetection)', compatible: true  },
-    // ── From Intel Geti catalog (open-edge-platform/geti) ─────────────────────────
-    { value: 'yolox-s',    label: 'YOLOX-S',                    engine: 'Ultralytics', model: 'yolox-s.pt',                    hardware: 'GPU 6GB+',     description: 'Anchor-free YOLO (2021) — decoupled head, strong AP on COCO, popular for edge deployment, Geti-catalog alternative to YOLOv8', compatible: true  },
-    { value: 'rtmdet-t',   label: 'RTMDet-Tiny',                engine: 'Ultralytics', model: 'rtmdet-t.pt',                   hardware: 'GPU 4GB+',     description: 'Real-time DETR (2022) — large-kernel depthwise conv + transformer, COCO mAP 41+, faster than YOLOv5 on CPU, edge-friendly', compatible: true  },
-    { value: 'd-fine-m',   label: 'D-FINE Medium (2024)',         engine: 'D-FINE',       model: 'd-fine-m.pt',                  hardware: 'GPU 10GB+',    description: 'D-FINE 2024 detection SOTA (replaces DINO/YOLOv9) — refine box via D-FINE head, COCO mAP 55+, Geti catalog default', compatible: true  },
+    { value: 'rdd-yolov8s',label: 'RDD-YOLOv8 (Road Damage)',    engine: 'Ultralytics', model: 'road-damage-yolov8s.pt',        hardware: 'GPU 6GB+',     description: 'YOLOv8s fine-tuned on RDD2022 (Crowdsensing-based Road Damage Detection Challenge 2022) — 5 classes: Longitudinal Crack, Transverse Crack, Alligator Crack, Other Corruption, Pothole (weights จาก ozair23/yolov8-road-damage-detector)', compatible: true  },
+    // RTMDet-Tiny via HuggingFace — uses trust_remote_code (OpenMMLab MMDetection port, custom modeling code)
+    { value: 'rtmdet-t',   label: 'RTMDet-Tiny (HF)',           engine: 'HuggingFace', model: 'akore/rtmdet-tiny',             hardware: 'GPU 4GB+',     description: 'RTMDet-tiny (OpenMMLab MMDetection port) — CSPNeXt backbone, COCO 80 classes, real-time detection (uses trust_remote_code)', compatible: true  },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
@@ -94,7 +92,7 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'deeplabv3',  label: 'DeepLabV3+ (ResNet101)',     engine: 'TorchVision', model: 'resnet101-deeplabv3',            hardware: 'GPU 10GB+',    description: 'Atrous conv — semantic segmentation บน aerial, industrial floor plan',       compatible: true  },
     { value: 'maskrcnn',   label: 'Mask R-CNN',                 engine: 'TorchVision', model: 'maskrcnn_resnet50_fpn',          hardware: 'GPU 12GB+',    description: 'Instance segmentation — individual part isolation, robotic grasping',         compatible: false },
     { value: 'yoloseg',    label: 'YOLOv8-Seg',                engine: 'Ultralytics', model: 'yolov8m-seg.pt',                hardware: 'GPU 10GB+',    description: 'Fast instance seg — real-time defect segmentation on production line',        compatible: true  },
-    { value: 'monai-unet', label: 'MONAI UNet (Medical)',        engine: 'MONAI',       model: 'monai-unet',                    hardware: 'GPU 8GB+',     description: 'MONAI UNet — organ/tumor segmentation, CT/MRI, handles DICOM & NIfTI automatically', compatible: true  },
+    { value: 'monai-unet', label: 'MONAI UNet (Medical)',        engine: 'MONAI',       model: 'monai-unet',                    hardware: 'GPU 8GB+',     description: 'MONAI UNet — organ/tumor segmentation, CT/MRI, handles DICOM & NIfTI automatically. ⚠ Dataset must use pixel-level Brush/Mask labels in Label Studio (NOT polygon/rectangle/keypoint) with label values 0..N-1 matching the number of classes — otherwise CUDA index out of bounds during training.', compatible: true  },
     { value: 'medsam',     label: 'MedSAM (Fine-tune)',          engine: 'MedSAM',      model: 'medsam_vit_b',                  hardware: 'GPU 12GB+',    description: 'SAM fine-tuned บน medical images — segment อวัยวะ/tumor ด้วย bounding box prompt', compatible: true },
     { value: 'nnunet-2d',  label: 'nnU-Net 2D Auto',            engine: 'nnU-Net',     model: 'nnunet-2d',                     hardware: 'GPU 16GB+',    description: 'Auto-configure segmentation pipeline — MICCAI standard, organ/tumor, CT/MRI', compatible: true },
     // ── nnU-Net 3D variants (MIC-DKFZ/nnUNet) ────────────────────────────────────
@@ -444,9 +442,7 @@ export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   // Detection
   'yolov8-s':          _C,
   'rdd-yolov8s':       _C,
-  'yolox-s':           _C,
   'rtmdet-t':          _C,
-  'd-fine-m':          _C,
   'yolov8-m':          _C,
   'yolov8-l':          _C,
   'yolonano':          ['rgb', 'general'],

@@ -3,6 +3,7 @@ import {
   FlaskConical, Upload, Play, X, Loader2, ImageIcon,
   Zap, CheckCircle2, AlertCircle, ChevronDown, MessageSquare, Eye,
   Send, History, Trash2, Clock, Copy, Check,
+  Database, RefreshCw, Shuffle,
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -264,6 +265,15 @@ export default function Playground() {
   const [imageFile, setImageFile] = useState<File | null>(null)
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  // ── Image source: direct upload OR pick from a Label Studio project ──
+  const [imageSource, setImageSource] = useState<'upload' | 'dataset'>('upload')
+  const [lsProjects, setLsProjects] = useState<any[]>([])
+  const [lsProjectsLoading, setLsProjectsLoading] = useState(false)
+  const [selectedLsProject, setSelectedLsProject] = useState<number | null>(null)
+  const [lsTasks, setLsTasks] = useState<any[]>([])
+  const [lsTasksLoading, setLsTasksLoading] = useState(false)
+  const [pickedTask, setPickedTask] = useState<any | null>(null)
+  const [datasetImageLoading, setDatasetImageLoading] = useState(false)
 
   const [threshold, setThreshold] = useState(0.3)
 
@@ -623,6 +633,96 @@ export default function Playground() {
     setImageUrl(null)
     setResult(null)
     setError(null)
+    setPickedTask(null)
+  }
+
+  // ── Dataset source: load LS projects, list tasks, pick one → fetch image ──
+  const loadLsProjects = useCallback(async () => {
+    setLsProjectsLoading(true)
+    try {
+      const r = await fetch('/api/ls/projects/?page_size=100', {
+        headers: { Authorization: 'Token medimage-ls-token-2026' },
+      })
+      if (r.ok) {
+        const data = await r.json()
+        const list = Array.isArray(data) ? data : (data?.results ?? data?.projects ?? [])
+        setLsProjects(list)
+      }
+    } catch { /* ignore */ }
+    setLsProjectsLoading(false)
+  }, [])
+
+  useEffect(() => {
+    if (imageSource === 'dataset' && lsProjects.length === 0 && !lsProjectsLoading) {
+      loadLsProjects()
+    }
+  }, [imageSource, lsProjects.length, lsProjectsLoading, loadLsProjects])
+
+  const loadLsTasks = useCallback(async (projectId: number) => {
+    setLsTasksLoading(true)
+    setLsTasks([])
+    try {
+      const r = await fetch(`/api/ls/tasks?project=${projectId}&page_size=50`, {
+        headers: { Authorization: 'Token medimage-ls-token-2026' },
+      })
+      if (r.ok) {
+        const data = await r.json()
+        const list = Array.isArray(data) ? data : (data?.tasks ?? data?.results ?? [])
+        // Only show tasks that have an image
+        setLsTasks(list.filter((t: any) => t?.data?.image))
+      }
+    } catch { /* ignore */ }
+    setLsTasksLoading(false)
+  }, [])
+
+  useEffect(() => {
+    if (selectedLsProject != null) loadLsTasks(selectedLsProject)
+  }, [selectedLsProject, loadLsTasks])
+
+  // Pick a task: fetch its image (data URI or HTTP URL) and turn it
+  // into a File object so the existing inference flow works unchanged.
+  const pickTaskImage = useCallback(async (task: any) => {
+    setPickedTask(task)
+    setDatasetImageLoading(true)
+    setResult(null)
+    setError(null)
+    try {
+      const imgField: string = task?.data?.image || ''
+      let blob: Blob
+      if (imgField.startsWith('data:')) {
+        // data:image/jpeg;base64,... — decode inline
+        const m = imgField.match(/^data:([^;]+);base64,(.*)$/)
+        if (!m) throw new Error('Unsupported data URI format')
+        const mime = m[1]
+        const bin = atob(m[2])
+        const arr = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+        blob = new Blob([arr], { type: mime })
+      } else {
+        // HTTP(S) URL — fetch with the same auth LS uses
+        const r = await fetch(imgField, {
+          headers: { Authorization: 'Token medimage-ls-token-2026' },
+        })
+        if (!r.ok) throw new Error(`Image fetch HTTP ${r.status}`)
+        blob = await r.blob()
+      }
+      const ext = (blob.type.split('/')[1] || 'jpg').split(';')[0] || 'jpg'
+      const file = new File([blob], `ls-task-${task.id}.${ext}`, { type: blob.type })
+      // Mirror the existing upload path
+      if (imageUrl) URL.revokeObjectURL(imageUrl)
+      const url = URL.createObjectURL(blob)
+      setImageFile(file)
+      setImageUrl(url)
+    } catch (e: any) {
+      setError(`Could not load dataset image: ${e?.message || e}`)
+    }
+    setDatasetImageLoading(false)
+  }, [imageUrl])
+
+  const pickRandomTask = () => {
+    if (lsTasks.length === 0) return
+    const t = lsTasks[Math.floor(Math.random() * lsTasks.length)]
+    pickTaskImage(t)
   }
 
   const canRun = !!selectedModel && !!imageFile && !running
@@ -1015,21 +1115,148 @@ export default function Playground() {
             />
 
             {!imageFile ? (
-              <div style={{ textAlign: 'center', padding: 40 }}>
+              <div style={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
+                {/* ── Source toggle (Upload vs Dataset) ── */}
                 <div style={{
-                  width: 60, height: 60, borderRadius: 14,
-                  background: 'var(--bg-elevated)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  margin: '0 auto 16px',
+                  display: 'flex', gap: 4, padding: '8px 10px 0',
+                  borderBottom: '1px solid var(--border-subtle)',
                 }}>
-                  <Upload size={26} color="var(--text-muted)" />
+                  <button
+                    onClick={() => setImageSource('upload')}
+                    style={{
+                      flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                      padding: '7px 10px', borderRadius: '6px 6px 0 0', fontSize: 12, fontWeight: 600,
+                      background: imageSource === 'upload' ? 'var(--bg-elevated)' : 'transparent',
+                      color: imageSource === 'upload' ? 'var(--text-primary)' : 'var(--text-muted)',
+                      border: 'none', borderBottom: imageSource === 'upload' ? '2px solid var(--primary)' : '2px solid transparent',
+                      cursor: 'pointer', marginBottom: '-1px',
+                    }}
+                  >
+                    <Upload size={13} /> Upload
+                  </button>
+                  <button
+                    onClick={() => setImageSource('dataset')}
+                    style={{
+                      flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                      padding: '7px 10px', borderRadius: '6px 6px 0 0', fontSize: 12, fontWeight: 600,
+                      background: imageSource === 'dataset' ? 'var(--bg-elevated)' : 'transparent',
+                      color: imageSource === 'dataset' ? 'var(--text-primary)' : 'var(--text-muted)',
+                      border: 'none', borderBottom: imageSource === 'dataset' ? '2px solid var(--primary)' : '2px solid transparent',
+                      cursor: 'pointer', marginBottom: '-1px',
+                    }}
+                  >
+                    <Database size={13} /> From Dataset
+                  </button>
                 </div>
-                <p style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 6px' }}>
-                  Drop image here or click to upload
-                </p>
-                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
-                  PNG, JPG, TIFF, DICOM preview — max 50 MB
-                </p>
+
+                {imageSource === 'upload' ? (
+                  <div style={{ textAlign: 'center', padding: 40 }}>
+                    <div style={{
+                      width: 60, height: 60, borderRadius: 14,
+                      background: 'var(--bg-elevated)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      margin: '0 auto 16px',
+                    }}>
+                      <Upload size={26} color="var(--text-muted)" />
+                    </div>
+                    <p style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 6px' }}>
+                      Drop image here or click to upload
+                    </p>
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+                      PNG, JPG, TIFF, DICOM preview — max 50 MB
+                    </p>
+                  </div>
+                ) : (
+                  /* ── Dataset picker (LS project → task → image) ── */
+                  <div
+                    onClick={e => e.stopPropagation()}
+                    onMouseDown={e => e.stopPropagation()}
+                    onDragEnter={e => e.preventDefault()}
+                    onDragOver={e => e.preventDefault()}
+                    onDrop={e => { e.preventDefault(); e.stopPropagation() }}
+                    style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 10, minHeight: 220 }}
+                  >
+                    {/* Project selector */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <select
+                        value={selectedLsProject ?? ''}
+                        onChange={e => { setSelectedLsProject(e.target.value ? Number(e.target.value) : null); setPickedTask(null) }}
+                        style={{ flex: 1, padding: '7px 8px', borderRadius: 6, fontSize: 12, border: '1px solid var(--border-default)', background: 'var(--bg-input)', color: 'var(--text-primary)' }}
+                      >
+                        <option value="">{lsProjectsLoading ? 'Loading Label Studio projects…' : '— Select project —'}</option>
+                        {lsProjects.map(p => (
+                          <option key={p.id} value={p.id}>
+                            {p.title || p.id} {p.finished_task_number != null ? `(${p.finished_task_number} labeled)` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={loadLsProjects}
+                        title="Reload projects"
+                        style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', borderRadius: 6, padding: '6px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                      >
+                        <RefreshCw size={12} className={lsProjectsLoading ? 'animate-spin' : ''} />
+                      </button>
+                    </div>
+
+                    {/* Task list */}
+                    {selectedLsProject != null && (
+                      <>
+                        {lsTasksLoading ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 12, padding: '8px 0' }}>
+                            <Loader2 size={12} className="animate-spin" /> Loading tasks…
+                          </div>
+                        ) : lsTasks.length === 0 ? (
+                          <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
+                            No tasks with images in this project.
+                          </div>
+                        ) : (
+                          <>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                {lsTasks.length} tasks with images
+                              </span>
+                              <button
+                                onClick={pickRandomTask}
+                                style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', fontSize: 11, fontWeight: 600, background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 5, cursor: 'pointer' }}
+                              >
+                                <Shuffle size={11} /> Pick random
+                              </button>
+                            </div>
+                            <div style={{ maxHeight: 200, overflowY: 'auto', border: '1px solid var(--border-subtle)', borderRadius: 6, background: 'var(--bg-base)' }}>
+                              {lsTasks.slice(0, 30).map(t => {
+                                const isPicked = pickedTask?.id === t.id
+                                return (
+                                  <button
+                                    key={t.id}
+                                    onClick={() => pickTaskImage(t)}
+                                    style={{
+                                      display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                                      padding: '6px 10px', border: 'none', cursor: 'pointer',
+                                      borderBottom: '1px solid var(--border-subtle)',
+                                      background: isPicked ? 'rgba(99,102,241,0.10)' : (pickedTask ? 'transparent' : 'var(--bg-surface)'),
+                                      textAlign: 'left', fontSize: 11, fontFamily: 'var(--font-mono)',
+                                    }}
+                                  >
+                                    <ImageIcon size={11} color={isPicked ? 'var(--primary)' : 'var(--text-muted)'} />
+                                    <span style={{ color: 'var(--text-primary)', flex: 1 }}>Task #{t.id}</span>
+                                    {isPicked && <CheckCircle2 size={11} color="var(--primary)" />}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </>
+                    )}
+
+                    {datasetImageLoading && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 12 }}>
+                        <Loader2 size={12} className="animate-spin" /> Loading image…
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             ) : (
               <>

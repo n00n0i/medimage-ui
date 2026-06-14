@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { BrainCircuit, Terminal, Pencil, Trash2, CheckCircle2, RefreshCw, Loader, X, ChevronDown, ChevronUp, RotateCcw, CheckSquare, Square, Download, ExternalLink, Search, Cloud, Wifi, WifiOff, Save, Eye, EyeOff, Globe, StopCircle, Copy, Check } from 'lucide-react'
+import { useUserPref } from '../lib/userPrefs'
 
 function CopyLogButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
@@ -811,8 +812,8 @@ function RayServeTab({ rayUrl, setRayUrl, onAutoSave, modelId }: {
   const [modelDeployLogs, setModelDeployLogs] = useState<string[]>([])
   const [showModelLogs, setShowModelLogs] = useState(false)
 
-  // Auto-fill dashboard URL from localStorage ray_head_url
-  const [dashUrl, setDashUrl] = useState(() => localStorage.getItem('ray_head_url') || 'http://100.68.53.118:8265')
+  // Auto-fill dashboard URL from user_prefs ray_head_url
+  const [dashUrl, setDashUrl] = useUserPref('ray_head_url', 'http://100.68.53.118:8265')
 
   // Derive serve URL (8265→8000) whenever dashUrl changes
   useEffect(() => {
