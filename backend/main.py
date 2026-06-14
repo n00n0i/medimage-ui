@@ -3733,7 +3733,7 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
             # use the standard bbox format (cx cy w h); for segmentation
             # we use polygon points — both honour rectangle→polygon or
             # polygon→polygon natively.
-            _yolo_task = "segment" if training_type == "segmentation" else "detect"
+            _yolo_task = "segment" if training_type_for_export == "segmentation" else "detect"
             try:
                 export_data = _convert_ls_json_to_yolo_zip(
                     json_data, ls_url, ls_token,
