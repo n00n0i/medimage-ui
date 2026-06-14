@@ -2575,9 +2575,17 @@ def _move_batch_to_device(batch, device):
     leaves nested tensors on CPU, which then crashes the matcher with
     ``Expected all tensors to be on the same device, but found at least
     two devices, cuda:0 and cpu!``.
+
+    Uses duck-typing on ``.to`` so this helper works even when called
+    from a context where ``torch`` itself isn't imported yet (avoids the
+    NameError that crashed when the helper was hoisted to module top
+    level for clarity).
     """
-    if isinstance(batch, torch.Tensor):
-        return batch.to(device)
+    if hasattr(batch, "to") and callable(batch.to):
+        try:
+            return batch.to(device)
+        except Exception:
+            return batch
     if isinstance(batch, dict):
         return {k: _move_batch_to_device(v, device) for k, v in batch.items()}
     if isinstance(batch, (list, tuple)):
