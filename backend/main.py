@@ -3651,6 +3651,16 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
                     f"names: {classes_seen!r}\n"
                 )
                 zf.writestr("dataset.yaml", _yaml)
+                # Also bundle the raw Label Studio JSON as
+                # annotations.json so engines that need it for
+                # re-parsing (SMP, TorchVision segmentation, MedSAM,
+                # Anomalib, MONAI) can find it via
+                # `_find_ls_json()` in the worker. Detection /
+                # classification YOLO scripts ignore it. The file
+                # duplicates the data already encoded in labels/,
+                # but it lets every engine share the same zip
+                # format without re-exporting from LS.
+                zf.writestr("annotations.json", json.dumps(json_data, ensure_ascii=False))
             export_data = buf.getvalue()
             _append_log(job_id, f"[export] JSON→YOLO conversion: {n_imgs} images, {n_lbls} labels, {len(classes_seen)} classes")
             _append_log(job_id, f"[export] Wrapped converted YOLO into zip ({len(export_data)//1024} KB)")
