@@ -81,8 +81,8 @@ export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: true },
     { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet-50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
     { value: 'rdd-yolov8s',label: 'RDD-YOLOv8 (Road Damage)',    engine: 'Ultralytics', model: 'road-damage-yolov8s.pt',        hardware: 'GPU 6GB+',     description: 'YOLOv8s fine-tuned on RDD2022 (Crowdsensing-based Road Damage Detection Challenge 2022) — 5 classes: Longitudinal Crack, Transverse Crack, Alligator Crack, Other Corruption, Pothole (weights จาก ozair23/yolov8-road-damage-detector)', compatible: true  },
-    // RTMDet-Tiny via HuggingFace — uses trust_remote_code (OpenMMLab MMDetection port, custom modeling code)
-    { value: 'rtmdet-t',   label: 'RTMDet-Tiny (HF)',           engine: 'HuggingFace', model: 'akore/rtmdet-tiny',             hardware: 'GPU 4GB+',     description: 'RTMDet-tiny (OpenMMLab MMDetection port) — CSPNeXt backbone, COCO 80 classes, real-time detection (uses trust_remote_code)', compatible: true  },
+    // YOLOS-Tiny via HuggingFace — Vision Transformer detection, fine-tunable via AutoModelForObjectDetection
+    { value: 'yolos-t',    label: 'YOLOS-Tiny (HF)',             engine: 'HuggingFace', model: 'hustvl/yolos-tiny',             hardware: 'GPU 6GB+',     description: 'YOLOS-Tiny (You Only Look at One Sequence) — ViT detection head, COCO 80 classes, fine-tunable via HuggingFace pipeline', compatible: true  },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
