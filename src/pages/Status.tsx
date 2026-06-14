@@ -282,9 +282,9 @@ export default function Status() {
           marginBottom: 24,
           padding: '14px 18px',
           background: anyError
-            ? 'color-mix(in oklch, var(--danger) 8%, var(--bg-surface))'
-            : 'color-mix(in oklch, var(--success) 8%, var(--bg-surface))',
-          border: `1px solid ${anyError ? 'color-mix(in oklch, var(--danger) 40%, var(--border-default))' : 'color-mix(in oklch, var(--success) 40%, var(--border-default))'}`,
+            ? 'rgba(255,180,201,0.08)'
+            : 'rgba(214,222,209,0.08)',
+          border: `1px solid ${anyError ? 'rgba(255,180,201,0.10)' : 'rgba(214,222,209,0.10)'}`,
           display: 'flex',
           alignItems: 'center',
           gap: 10,
@@ -315,7 +315,7 @@ export default function Status() {
               className="card"
               style={{
                 padding: '18px 20px',
-                borderColor: isErr ? 'color-mix(in oklch, var(--danger) 30%, var(--border-default))' : undefined,
+                borderColor: isErr ? 'rgba(255,180,201,0.30)' : undefined,
               }}
             >
               {/* Card header */}
@@ -324,9 +324,9 @@ export default function Status() {
                   <div style={{
                     width: 36, height: 36, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
                     background: isOk
-                      ? 'color-mix(in oklch, var(--primary) 12%, var(--bg-surface))'
+                      ? 'rgba(188,208,189,0.12)'
                       : isErr
-                        ? 'color-mix(in oklch, var(--danger) 10%, var(--bg-surface))'
+                        ? 'rgba(255,180,201,0.10)'
                         : 'var(--bg-elevated)',
                     color: isOk ? 'var(--primary)' : isErr ? 'var(--danger)' : 'var(--text-muted)',
                   }}>
@@ -380,7 +380,7 @@ export default function Status() {
                     <span>Response:</span>
                     <span style={{
                       fontFamily: 'var(--font-mono)', fontWeight: 500,
-                      color: state.ms > 800 ? 'var(--danger)' : state.ms > 300 ? 'oklch(0.75 0.15 60)' : 'var(--success)',
+                      color: state.ms > 800 ? 'var(--danger)' : state.ms > 300 ? 'rgb(255,207,217)' : 'var(--success)',
                     }}>
                       {state.ms} ms
                     </span>

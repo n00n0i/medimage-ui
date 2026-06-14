@@ -524,7 +524,7 @@ export default function Projects() {
           <div className="modal" style={{ maxWidth: 420 }}>
             <div style={{ padding: '24px 24px 20px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-                <div style={{ width: 40, height: 40, borderRadius: 10, background: 'color-mix(in oklch, var(--danger) 15%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <div style={{ width: 40, height: 40, borderRadius: 10, background: 'rgba(255,180,201,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <Trash2 size={18} style={{ color: 'var(--danger)' }} />
                 </div>
                 <div>
@@ -539,7 +539,7 @@ export default function Projects() {
               {confirmDelete.storages.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
                   {confirmDelete.uniqueStorages.map(s => (
-                    <span key={s.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--danger)', background: 'color-mix(in oklch, var(--danger) 10%, transparent)', border: '1px solid color-mix(in oklch, var(--danger) 25%, transparent)', borderRadius: 4, padding: '2px 7px' }}>
+                    <span key={s.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--danger)', background: 'rgba(255,180,201,0.10)', border: '1px solid rgba(255,180,201,0.25)', borderRadius: 4, padding: '2px 7px' }}>
                       <HardDrive size={9} />{s.derivedBucket}
                     </span>
                   ))}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "entroly": {
+      "type": "local",
+      "command": ["/usr/bin/python3.11", "-m", "entroly", "serve"],
+      "enabled": true
+    },
+    "codebase-memory-mcp": {
+      "type": "local",
+      "command": ["/home/opc/.local/bin/codebase-memory-mcp-wrapper"],
+      "enabled": true
+    }
+  }
+}

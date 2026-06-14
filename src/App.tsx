@@ -1,7 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useState } from 'react'
 import Dashboard from './pages/Dashboard'
-import TrainModel from './pages/TrainModel'
+import TrainDeepLearning from './pages/TrainDeepLearning'
+import TrainLLM from './pages/TrainLLM'
 import Datasets from './pages/Datasets'
 import Projects from './pages/Projects'
 import Jobs from './pages/Jobs'
@@ -13,6 +14,8 @@ import Storage from './pages/Storage'
 import Status from './pages/Status'
 import Playground from './pages/Playground'
 import ApiService from './pages/ApiService'
+import TestAllModels from './pages/TestAllModels'
+import DeployModels from './pages/DeployModels'
 import Users from './pages/Users'
 import Profile from './pages/Profile'
 import Sidebar from './components/Sidebar'
@@ -55,9 +58,12 @@ function AppInner() {
             <Route path="/" element={<Navigate to="/projects" replace />} />
             <Route path="/projects"  element={<Projects />} />
             <Route path="/datasets"  element={<Datasets />} />
-            <Route path="/train"     element={<TrainModel />} />
+            <Route path="/train"     element={<Navigate to="/train/deep-learning" replace />} />
+            <Route path="/train/deep-learning" element={<TrainDeepLearning />} />
+            <Route path="/train/llm"  element={<TrainLLM />} />
             <Route path="/jobs"      element={<Jobs />} />
             <Route path="/models"    element={<Models />} />
+            <Route path="/models/zero-shot" element={<DeployModels />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/ray-cluster" element={<RayCluster />} />
             <Route path="/modal-cluster" element={<ModalCluster />} />
@@ -65,6 +71,7 @@ function AppInner() {
             <Route path="/notebook" element={<Notebook />} />
             <Route path="/status" element={<Status />} />
             <Route path="/playground" element={<Playground />} />
+            <Route path="/test-all" element={<TestAllModels />} />
             <Route path="/api-service" element={<ApiService />} />
             <Route path="/users" element={<Users />} />
             <Route path="/profile" element={<Profile />} />

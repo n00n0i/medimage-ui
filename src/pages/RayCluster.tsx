@@ -1,36 +1,49 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Activity, Cpu, HardDrive, RefreshCw, ExternalLink, Server, Zap, Settings, X, Check, Plus, Copy, Terminal, Loader } from 'lucide-react'
+import { getPrefOr, useUserPref } from '../lib/userPrefs'
 
 const DEFAULT_RAY_URL = 'http://100.68.53.118:8265'
-const STORAGE_KEY     = 'ray_head_url'
+const PREF_KEY        = 'ray_head_url'
 const MAX_HISTORY     = 40  // 40 × 10 s ≈ 6.7 min
 const SETTINGS_API    = '/api/settings'
 
-// ──────────────── Persistent settings (backend SQLite → localStorage cache) ────
+// ──────────────── Persistent settings (SQLite user_prefs) ────────────────
+// Migrated from localStorage. The URL lives in the user_prefs table
+// (scoped per Keycloak user). The in-memory mirror in userPrefs.ts is
+// populated on mount so reads are sync.
 
 async function loadRayUrl(): Promise<string> {
+  // Backwards-compat: migrate from old global /api/settings to per-user
+  // /api/user-prefs if the legacy row exists.
   try {
     const res = await fetch(`${SETTINGS_API}/ray_head_url`)
     if (res.ok) {
       const d = await res.json()
       if (d?.value) {
-        localStorage.setItem(STORAGE_KEY, d.value)
+        // Save into per-user prefs and remove the global row
+        try {
+          await fetch(`/api/user-prefs/${PREF_KEY}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: d.value }),
+          })
+        } catch { /* best-effort */ }
         return d.value
       }
     }
-  } catch { /* backend down — fall through to cache */ }
-  return localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL
+  } catch { /* ignore */ }
+  return getPrefOr(PREF_KEY, DEFAULT_RAY_URL)
 }
 
 async function saveRayUrl(url: string): Promise<void> {
-  localStorage.setItem(STORAGE_KEY, url)   // instant cache
+  // Persist to per-user prefs via the shared hook
   try {
-    await fetch(`${SETTINGS_API}/ray_head_url`, {
-      method: 'POST',
+    await fetch(`/api/user-prefs/${PREF_KEY}`, {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value: url }),
     })
-  } catch { /* offline — localStorage is the fallback */ }
+  } catch { /* best-effort */ }
 }
 
 // ──────────────── Ray Dashboard REST API types ────────────────
@@ -49,6 +62,7 @@ interface RayGpu {
   memoryTotal?: number       // MB
   temperatureC?: number
   powerMw?: number
+  isRealUtil?: boolean       // true if utilizationGpu comes from nvidia-smi (not allocation)
 }
 
 interface RayNodeSummary {
@@ -293,10 +307,11 @@ const inputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box',
   padding: '7px 10px', borderRadius: 7,
   border: '1px solid var(--border)',
-  background: 'var(--bg-elevated)',
+  background: 'var(--bg-surface, #fff)',
   color: 'var(--text-primary)',
   fontSize: 13, fontFamily: 'var(--font-mono)',
   outline: 'none',
+  transition: 'border-color 0.15s',
 }
 
 function AddWorkerTab({ headUrl }: { headUrl: string }) {
@@ -305,7 +320,7 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
   })()
 
   const [cpus, setCpus]       = useState('8')
-  const [gpus, setGpus]       = useState('0')
+  const [gpus, setGpus]       = useState('1')
   const [gpuUtil, setGpuUtil] = useState('100')   // % advertised GPU utilisation cap
   const [block, setBlock]     = useState(true)
   const [copied, setCopied]   = useState(false)
@@ -330,8 +345,8 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
       {/* Prerequisites note */}
       <div style={{
         padding: '8px 12px', borderRadius: 7, marginBottom: 16,
-        background: 'color-mix(in oklch, var(--primary) 8%, transparent)',
-        border: '1px solid color-mix(in oklch, var(--primary) 20%, transparent)',
+        background: 'rgba(188,208,189,0.08)',
+        border: '1px solid rgba(188,208,189,0.20)',
         fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6,
       }}>
         Worker must have <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--primary)' }}>ray</code> installed
@@ -364,8 +379,9 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
           <input
             type="number" min={1} max={100} value={gpuUtil}
             onChange={e => setGpuUtil(e.target.value)}
-            disabled={parseFloat(gpus) === 0}
-            style={{ ...inputStyle, opacity: parseFloat(gpus) === 0 ? 0.4 : 1 }}
+            style={{ ...inputStyle, cursor: 'text' }}
+            onFocus={e => e.target.style.borderColor = 'var(--primary)'}
+            onBlur={e => e.target.style.borderColor = 'var(--border)'}
           />
         </div>
       </div>
@@ -373,8 +389,8 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
         <div style={{
           fontSize: 11, color: 'var(--text-muted)', marginBottom: 12,
           padding: '6px 10px', borderRadius: 6,
-          background: 'color-mix(in oklch, var(--accent) 8%, transparent)',
-          border: '1px solid color-mix(in oklch, var(--accent) 20%, transparent)',
+          background: 'rgba(188,208,189,0.08)',
+          border: '1px solid rgba(188,208,189,0.20)',
         }}>
           <span style={{ color: 'var(--accent)', fontWeight: 500 }}>--num-gpus={gpuEffective}</span>
           {' '}→ Ray จะโฆษณา {gpuEffective} GPU ต่อ node
@@ -412,9 +428,9 @@ function AddWorkerTab({ headUrl }: { headUrl: string }) {
           style={{
             position: 'absolute', top: 8, right: 8,
             background: copied
-              ? 'color-mix(in oklch, var(--success) 15%, transparent)'
-              : 'color-mix(in oklch, var(--primary) 10%, transparent)',
-            border: `1px solid ${copied ? 'color-mix(in oklch, var(--success) 30%, transparent)' : 'var(--border)'}`,
+              ? 'rgba(214,222,209,0.15)'
+              : 'rgba(188,208,189,0.10)',
+            border: `1px solid ${copied ? 'rgba(214,222,209,0.30)' : 'var(--border)'}`,
             borderRadius: 5, padding: '3px 8px',
             cursor: 'pointer', fontSize: 11,
             color: copied ? 'var(--success)' : 'var(--text-secondary)',
@@ -551,12 +567,13 @@ function SettingsModal({
 // ──────────────────────────────────────────────────────────────
 
 export default function RayCluster() {
-  // Init synchronously from localStorage cache; async override from backend on mount
-  const [rayUrl, setRayUrl] = useState<string>(
-    () => localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL
-  )
+  // Init from the in-memory prefs mirror; mirror is populated on mount
+  // by GET /api/user-prefs. The hook re-renders us when it loads.
+  const [storedUrl, setStoredUrl] = useUserPref(PREF_KEY, DEFAULT_RAY_URL)
+  const [rayUrl, setRayUrl] = useState<string>(storedUrl)
   const [result, setResult] = useState<RayClusterData | null>(null)
   const [nodes, setNodes] = useState<RayNodeSummary[]>([])
+  const [gpuStatsData, setGpuStatsData] = useState<any>(null)
   const [version, setVersion] = useState<RayVersion | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -567,12 +584,14 @@ export default function RayCluster() {
   const historyRef = useRef<MetricPoint[]>([])
   const [history, setHistory] = useState<MetricPoint[]>([])
 
-  // Load authoritative URL from backend on mount
+  // Sync rayUrl with the prefs mirror once the user-prefs load finishes,
+  // and migrate any legacy global /api/settings value to per-user.
   useEffect(() => {
-    loadRayUrl().then(url => {
-      if (url !== (localStorage.getItem(STORAGE_KEY) ?? DEFAULT_RAY_URL)) setRayUrl(url)
+    if (storedUrl) setRayUrl(storedUrl)
+    void loadRayUrl().then(url => {
+      if (url && url !== rayUrl) setRayUrl(url)
     })
-  }, [])
+  }, [storedUrl])
 
   const fetchData = useCallback(async (manual = false) => {
     if (manual) setRefreshing(true)
@@ -586,19 +605,78 @@ export default function RayCluster() {
       if (!nRes.ok) throw new Error(`nodes ${nRes.status}`)
       const sData = await sRes.json()
       const nData = await nRes.json()
-      if (sData.data) setResult(sData.data)
-      if (nData.data?.summary) setNodes(nData.data.summary)
+
+      // The Ray Dashboard /api/cluster_status may wrap the payload in a
+      // "data" key or return it flat. Normalise so we always have the
+      // clusterStatus object directly.
+      const clusterPayload = sData.data ?? sData
+      if (clusterPayload) setResult(clusterPayload)
+
+      // Fetch GPU stats once (used for both node merging and chart metric)
+      let gpuStats: any = null
+      try {
+        const gRes = await fetch('/api/ray/gpu-stats')
+        if (gRes.ok) { gpuStats = await gRes.json(); setGpuStatsData(gpuStats) }
+      } catch { /* ignore */ }
+
+      if (nData.data?.summary) {
+        // Merge GPU stats into nodes
+        const gpuNodes: any[] = gpuStats?.nodes ?? []
+        for (const node of nData.data.summary) {
+          // If Ray already reports per-node GPU data, keep it
+          if (node.gpus && node.gpus.length > 0) continue
+
+          const gn = gpuNodes.find((n: any) => n.hostname === node.hostname || n.ip === node.ip)
+          const gpusFromResources = Math.round(node.raylet?.resourcesTotal?.['GPU'] ?? 0)
+          const gpusAllocated = gn ? gn.gpus_allocated : 0
+          const gpuCount = Math.max(gpusAllocated, gpusFromResources, 0)
+          const gpusDetail: any[] = gn?.gpus_detail ?? []
+
+          if (gpuCount > 0) {
+            // If sidecar provided per-GPU detail, use it — but only take the GPUs
+            // that belong to this node (NVLink clusters show ALL GPUs on every node).
+            // Limit to the number Ray reports for this node (gpusAllocated).
+            if (gpusDetail.length > 0) {
+              const nodeGpus = gpusDetail.slice(0, gpuCount).map((g: any, i: number) => ({
+                index: g.index ?? i,
+                name: g.name ?? 'H200',
+                utilizationGpu: g.util_pct ?? 0,
+                memoryUsed: g.mem_used_mb ?? 0,
+                memoryTotal: g.mem_total_mb ?? 80000,
+                isRealUtil: true,
+              }))
+              node.gpus = nodeGpus
+            } else {
+              node.gpus = Array.from({ length: gpuCount }, (_, i) => ({
+                index: i,
+                name: 'H200',
+                utilizationGpu: 0,
+                memoryUsed: 0,
+                memoryTotal: 80000,
+                isRealUtil: false,
+              }))
+            }
+          }
+        }
+        setNodes(nData.data.summary)
+      }
       if (vRes.ok) setVersion(await vRes.json())
-      // Record metric point for realtime graph
-      const freshUsage: Record<string, [number, number]> = sData.data?.clusterStatus?.loadMetricsReport?.usage ?? {}
-      const cpuPct  = freshUsage['CPU']?.[1]    ? (freshUsage['CPU'][0]    / freshUsage['CPU'][1])    * 100 : 0
-      const gpuAlloc = freshUsage['GPU']?.[1]   ? (freshUsage['GPU'][0]    / freshUsage['GPU'][1])    * 100 : 0
-      const memPct   = freshUsage['memory']?.[1] ? (freshUsage['memory'][0] / freshUsage['memory'][1]) * 100 : 0
-      const summary: RayNodeSummary[] = nData.data?.summary ?? []
-      const allGpuUtils: number[] = summary.flatMap(n => n.gpus?.map(g => g.utilizationGpu ?? 0) ?? [])
-      const gpuUtil = allGpuUtils.length > 0
-        ? allGpuUtils.reduce((a, b) => a + b, 0) / allGpuUtils.length
-        : gpuAlloc
+
+      // ── Compute metric point for the realtime graph ──
+      // Walk through all possible nesting of the cluster status payload.
+      const cs = clusterPayload?.clusterStatus ?? clusterPayload
+      const usage: Record<string, [number, number]> = (cs as any)?.loadMetricsReport?.usage ?? {}
+      const cpuPct  = (usage['CPU']?.[1] ?? 0) > 0    ? (usage['CPU'][0]    / usage['CPU'][1])    * 100 : 0
+      const memPct   = (usage['memory']?.[1] ?? 0) > 0 ? (usage['memory'][0] / usage['memory'][1]) * 100 : 0
+      let gpuUtil = 0
+      if ((gpuStats?.cluster?.gpu_active_count ?? 0) > 0) {
+        gpuUtil = gpuStats.cluster.gpu_util_pct ?? 0
+        // Clear stale history that used allocation % (100%) instead of util %
+        if (historyRef.current.some(p => p.gpu > 50 && Math.abs(p.gpu - gpuUtil) > 50)) {
+          historyRef.current = []
+          setHistory([])
+        }
+      }
       const point: MetricPoint = { t: Date.now(), cpu: cpuPct, gpu: gpuUtil, mem: memPct }
       const next = [...historyRef.current, point].slice(-MAX_HISTORY)
       historyRef.current = next
@@ -634,14 +712,17 @@ export default function RayCluster() {
 
   const handleSaveUrl = (url: string) => {
     setRayUrl(url)
+    setStoredUrl(url)   // sync to user_prefs so other tabs/devices see it
     setShowSettings(false)
   }
 
-  const usage    = result?.clusterStatus?.loadMetricsReport?.usage ?? {}
+  const cs: any = result?.clusterStatus ?? result
+  const usage    = cs?.loadMetricsReport?.usage ?? {}
   const cpuUsed  = Math.round(usage['CPU']?.[0] ?? 0)
   const cpuTotal = Math.round(usage['CPU']?.[1] ?? 0)
-  const gpuUsed  = usage['GPU']?.[0] ?? 0
   const gpuTotal = usage['GPU']?.[1] ?? 0
+  const hasGpuUtil = (gpuStatsData?.cluster?.gpu_active_count ?? 0) > 0
+  const gpuUtilPct = hasGpuUtil ? (gpuStatsData.cluster.gpu_util_pct || 0) : 0
   const memTotal = usage['memory']?.[1] ?? 0
   const memUsed  = usage['memory']?.[0] ?? 0
   const aliveNodes = nodes.filter(n => n.raylet?.state === 'ALIVE' && (n.ip || n.hostname)).length
@@ -746,11 +827,11 @@ export default function RayCluster() {
         display: 'flex', alignItems: 'center', gap: 10,
         padding: '8px 14px', borderRadius: 8, marginBottom: 20,
         background: isConnected
-          ? 'color-mix(in oklch, var(--success) 12%, transparent)'
-          : 'color-mix(in oklch, var(--danger) 12%, transparent)',
+          ? 'rgba(214,222,209,0.12)'
+          : 'rgba(255,180,201,0.12)',
         border: `1px solid ${isConnected
-          ? 'color-mix(in oklch, var(--success) 25%, transparent)'
-          : 'color-mix(in oklch, var(--danger) 25%, transparent)'}`,
+          ? 'rgba(214,222,209,0.25)'
+          : 'rgba(255,180,201,0.25)'}`,
       }}>
         <div style={{
           width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
@@ -786,7 +867,7 @@ export default function RayCluster() {
           {/* Stat cards */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
             <StatCard icon={<Cpu size={14} />}       label="CPUs"   value={`${cpuUsed} / ${cpuTotal}`}  sub="used / total" />
-            <StatCard icon={<Zap size={14} />}        label="GPUs"   value={`${gpuUsed} / ${gpuTotal}`}  sub="used / total" accent />
+            <StatCard icon={<Zap size={14} />}        label="GPUs"   value={hasGpuUtil ? `${Math.round(gpuUtilPct)}%` : `${gpuTotal}`}  sub={hasGpuUtil ? "utilized" : "allocated to Ray"} accent />
             <StatCard icon={<HardDrive size={14} />}  label="Memory" value={`${gb(memUsed)} GB`}          sub={`of ${gb(memTotal)} GB`} />
             <StatCard icon={<Server size={14} />}     label="Nodes"  value={`${aliveNodes} / ${nodes.length}`} sub="alive / total" />
           </div>
@@ -800,9 +881,9 @@ export default function RayCluster() {
               </h3>
               <div style={{ display: 'flex', gap: 14 }}>
                 {[
-                  { label: 'CPU alloc',   color: 'var(--primary)' },
-                  { label: 'GPU compute', color: 'var(--accent)'  },
-                  { label: 'Memory',      color: 'oklch(65% 0.14 160)' },
+                  { label: 'CPU alloc',     color: '#60a5fa' },
+                  { label: hasGpuUtil ? 'GPU util' : 'GPU alloc', color: '#f97316' },
+                  { label: 'Memory %',       color: '#a78bfa' },
                 ].map(({ label, color }) => (
                   <span key={label} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>
                     <span style={{ width: 14, height: 2, borderRadius: 1, background: color, display: 'inline-block', flexShrink: 0 }} />
@@ -818,9 +899,9 @@ export default function RayCluster() {
             ) : (
               <RealtimeChart
                 series={[
-                  { label: 'CPU', color: 'var(--primary)',         data: history.map(p => p.cpu) },
-                  { label: 'GPU', color: 'var(--accent)',          data: history.map(p => p.gpu) },
-                  { label: 'MEM', color: 'oklch(65% 0.14 160)',    data: history.map(p => p.mem) },
+                  { label: 'CPU', color: '#60a5fa',         data: history.map(p => p.cpu) },
+                  { label: 'GPU', color: '#f97316',          data: history.map(p => p.gpu) },
+                  { label: 'MEM', color: '#a78bfa',    data: history.map(p => p.mem) },
                 ]}
                 timeLabels={[
                   new Date(history[0].t).toLocaleTimeString(),
@@ -834,7 +915,19 @@ export default function RayCluster() {
           <div className="card" style={{ marginBottom: 16 }}>
             <h3 style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 16 }}>Cluster Utilisation</h3>
             <UtilBar label="CPU" used={cpuUsed} total={cpuTotal} />
-            {gpuTotal > 0 && <UtilBar label="GPU" used={gpuUsed} total={gpuTotal} />}
+            {gpuTotal > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
+                  <span style={{ color: 'var(--text-secondary)' }}>GPU</span>
+                  <span style={{ fontWeight: 500, color: 'var(--accent)' }}>
+                    {hasGpuUtil ? `${Math.round(gpuUtilPct)}% utilized` : `${gpuTotal} allocated`}
+                  </span>
+                </div>
+                <div className="progress-bar">
+                  <div className="progress-bar-fill" style={{ width: `${hasGpuUtil ? Math.min(gpuUtilPct, 100) : 0}%`, background: 'var(--primary)' }} />
+                </div>
+              </div>
+            )}
             <UtilBar label="Memory" used={parseFloat(gb(memUsed))} total={parseFloat(gb(memTotal))} unit=" GB" />
           </div>
 
@@ -862,8 +955,8 @@ export default function RayCluster() {
                     <span style={{
                       fontSize: 11,
                       padding: '2px 10px', borderRadius: 20,
-                      background: 'color-mix(in oklch, var(--warning) 10%, transparent)',
-                      border: '1px solid color-mix(in oklch, var(--warning) 25%, transparent)',
+                      background: 'rgba(255,206,216,0.10)',
+                      border: '1px solid rgba(255,206,216,0.25)',
                       color: 'var(--warning)',
                     }}>
                       Head only · no workers connected
@@ -886,7 +979,7 @@ export default function RayCluster() {
                     <div key={node.raylet?.nodeId ?? node.ip} style={{
                       padding: '12px 14px', borderRadius: 8,
                       background: 'var(--bg-elevated)',
-                      border: `1px solid ${head ? 'color-mix(in oklch, var(--primary) 30%, var(--border))' : 'var(--border)'}`,
+                      border: `1px solid ${head ? 'rgba(188,208,189,0.10)' : 'var(--border)'}`,
                     }}>
                       {/* Node header row */}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: gpuCount > 0 ? 10 : 8 }}>
@@ -899,12 +992,12 @@ export default function RayCluster() {
                           fontSize: 10, fontWeight: 600, padding: '1px 7px', borderRadius: 4,
                           letterSpacing: '0.04em',
                           background: head
-                            ? 'color-mix(in oklch, var(--primary) 15%, transparent)'
-                            : 'color-mix(in oklch, var(--accent) 10%, transparent)',
+                            ? 'rgba(188,208,189,0.15)'
+                            : 'rgba(188,208,189,0.10)',
                           color: head ? 'var(--primary)' : 'var(--accent)',
                           border: `1px solid ${head
-                            ? 'color-mix(in oklch, var(--primary) 30%, transparent)'
-                            : 'color-mix(in oklch, var(--accent) 20%, transparent)'}`,
+                            ? 'rgba(188,208,189,0.30)'
+                            : 'rgba(188,208,189,0.20)'}`,
                           flexShrink: 0,
                         }}>
                           {head ? 'HEAD' : 'WORKER'}
@@ -945,19 +1038,24 @@ export default function RayCluster() {
                             <span key={gpu.index} style={{
                               fontSize: 11, color: 'var(--accent)', padding: '2px 8px',
                               borderRadius: 4,
-                              background: 'color-mix(in oklch, var(--accent) 10%, transparent)',
-                              border: '1px solid color-mix(in oklch, var(--accent) 20%, transparent)',
+                              background: 'rgba(188,208,189,0.10)',
+                              border: '1px solid rgba(188,208,189,0.20)',
                               fontFamily: 'var(--font-mono)',
                             }}>
-                              {gpu.name} · {gpu.memoryUsed ?? 0}/{gpu.memoryTotal ?? 0} MB
-                              {gpu.utilizationGpu != null && (
-                                <span style={{
-                                  marginLeft: 6,
-                                  color: gpu.utilizationGpu > 80 ? 'var(--danger)' : gpu.utilizationGpu > 40 ? 'var(--warning)' : 'var(--success)',
-                                  fontWeight: 600,
-                                }}>
-                                  {gpu.utilizationGpu}%
+                              {gpu.name}
+                              {gpu.isRealUtil ? (
+                                <span style={{ marginLeft: 4 }}>
+                                  · {(gpu.memoryUsed ?? 0) > 1024 ? `${((gpu.memoryUsed ?? 0) / 1024).toFixed(0)}/${((gpu.memoryTotal ?? 80000) / 1024).toFixed(0)} GB` : `${gpu.memoryUsed ?? 0}/${gpu.memoryTotal ?? 80000} MB`}
+                                  <span style={{
+                                    marginLeft: 6,
+                                    color: (gpu.utilizationGpu ?? 0) > 80 ? 'var(--danger)' : (gpu.utilizationGpu ?? 0) > 40 ? 'var(--warning)' : (gpu.utilizationGpu ?? 0) > 0 ? 'var(--success)' : 'var(--text-muted)',
+                                    fontWeight: 600,
+                                  }}>
+                                    {(gpu.utilizationGpu ?? 0) > 0 ? `${Math.round(gpu.utilizationGpu ?? 0)}% util` : 'idle'}
+                                  </span>
                                 </span>
+                              ) : (
+                                <span style={{ marginLeft: 4, color: 'var(--text-muted)' }}>· reserved</span>
                               )}
                               {gpu.temperatureC != null && ` · ${gpu.temperatureC}°C`}
                             </span>

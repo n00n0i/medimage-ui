@@ -5,6 +5,7 @@ services:
     build: .
     ports:
       - "8083:8083"
+      - "8888:80"
     environment:
       # ถ้า backend run บน host machine ให้ใช้ host.docker.internal
       # ถ้า backend อยู่ใน docker-compose เดียวกัน ให้ใช้ชื่อ service เช่น medimage-api
@@ -93,6 +94,20 @@ services:
       - KEYCLOAK_JWKS_URL=http://medimage-keycloak-1:8080/kc/realms/h-forge/protocol/openid-connect/certs
     volumes:
       - api-data:/data
+    restart: unless-stopped
+
+  # Pushes real GPU utilization (nvidia-smi) to medimage-api every 10s.
+  # Deploy one instance on each GPU node with:  deploy: placement: constraints: [node.labels.gpu == true]
+  gpu-monitor:
+    build: ./gpu-monitor
+    environment:
+      - GPU_UTIL_API_URL=http://medimage-api:8000/api/gpu-util
+      - GPU_UTIL_INTERVAL=10
+    deploy:
+      mode: daemon          # one per node
+      placement:
+        constraints:
+          - node.labels.gpu == true
     restart: unless-stopped
 
   jupyter:

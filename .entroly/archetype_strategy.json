@@ -28,5 +28,35 @@
       "entropy_mean": 0.4916029399458534,
       "entropy_var": 0.023414065335002628
     }
+  },
+  "python_backend": {
+    "weights": {
+      "w_recency": 0.35,
+      "w_frequency": 0.25,
+      "w_semantic": 0.2,
+      "w_entropy": 0.2,
+      "w_resonance": 0.1,
+      "decay_half_life": 15.0,
+      "min_relevance": 0.05,
+      "exploration_rate": 0.1
+    },
+    "sample_count": 0,
+    "confidence": 0.5,
+    "created_at": 1780752757.9809134,
+    "fingerprint": {
+      "lang_python": 0.6931930286090102,
+      "lang_rust": 0.0,
+      "lang_js_ts": 0.008549819138441302,
+      "lang_other": 0.2982571522525485,
+      "avg_file_size": 0.6992011935432279,
+      "func_density": 0.5524780913916069,
+      "class_ratio": 0.26705202312138726,
+      "import_density": 0.5017050738893991,
+      "test_ratio": 0.40447221308780007,
+      "module_count": 0.4557067470936043,
+      "ffi_ratio": 0.0700427490956922,
+      "entropy_mean": 0.45018069474819505,
+      "entropy_var": 0.025605153237786296
+    }
   }
 }

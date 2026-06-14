@@ -1,13 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle, X, Loader2, StopCircle } from 'lucide-react'
+import { Brain, Cpu, Sparkles, ArrowRight, Play, ChevronDown, RotateCcw, MessageSquare, Server, Cloud, CheckCircle, X, Loader2, StopCircle, AlertTriangle } from 'lucide-react'
 
 // ─── Training Types ───────────────────────────────────────────────────────────
-type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text'
-type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
-type TargetType  = 'prelabel' | 'finetune' | 'export'
+export type TrainingType = 'classification' | 'detection' | 'segmentation' | 'vlm-finetune' | 'self-supervised' | 'llm-text' | 'anomaly-detection'
+export type DataType    = 'rgb' | 'thermal' | 'xray' | 'microscopy' | 'lidar' | 'general'
+export type TargetType  = 'finetune' | 'export'
 
-interface TrainOption {
+export interface TrainOption {
   value: string
   label: string
   engine: string
@@ -16,6 +16,10 @@ interface TrainOption {
   description: string
   compatible: boolean
   zeroShot?: boolean
+  // Optional metadata for the Deploy-Only catalog (see DEPLOY_CATALOG)
+  dataTypes?: DataType[]
+  source?: string
+  paper?: string
 }
 
 interface TrainingConfig {
@@ -42,35 +46,43 @@ interface TrainingConfig {
 }
 
 // ─── Training Matrix ───────────────────────────────────────────────────────────
-const TRAINING_MATRIX: Record<string, TrainOption[]> = {
+export const TRAINING_MATRIX: Record<string, TrainOption[]> = {
   // ── Classification ──────────────────────────────────────────────────────────
   classification: [
     { value: 'eff-b2',     label: 'EfficientNet-B2',              engine: 'PyTorch',     model: 'efficientnet-b2',               hardware: 'GPU 8GB+',     description: 'Balanced accuracy & speed — defect grading, product quality classification',   compatible: true  },
-    { value: 'eff-b4',     label: 'EfficientNet-B4',              engine: 'PyTorch',     model: 'efficientnet-b4',               hardware: 'GPU 12GB+',    description: 'Higher accuracy — fine-grained surface defect or part classification',        compatible: false },
+    { value: 'eff-b4',     label: 'EfficientNet-B4',              engine: 'PyTorch',     model: 'efficientnet-b4',               hardware: 'GPU 12GB+',    description: 'Higher accuracy — fine-grained surface defect or part classification',        compatible: true  },
     { value: 'mobilenet',  label: 'MobileNetV3-Small',            engine: 'PyTorch+TIMM', model: 'mobilenetv3_small_100',        hardware: 'CPU / Edge',   description: 'Lightweight — deploy บน Raspberry Pi, Jetson Nano, industrial edge device',   compatible: true  },
     { value: 'res50',      label: 'ResNet-50',                    engine: 'TorchVision', model: 'resnet50',                      hardware: 'GPU 6GB+',     description: 'Classic baseline — เสถียร, ปรับง่าย, รองรับ transfer learning ทุก domain',   compatible: true  },
     { value: 'convnext',   label: 'ConvNeXt-Tiny',               engine: 'PyTorch',     model: 'convnext_tiny',                 hardware: 'GPU 8GB+',     description: 'Modern CNN — strong baseline สำหรับ visual inspection, PCB, textile',        compatible: true  },
     { value: 'regnet',     label: 'RegNet-Y400M',                 engine: 'TorchVision', model: 'regnet_y_400mf',                hardware: 'GPU 6GB+',     description: 'Efficient for large-scale classification — automotive parts, warehouse SKU',  compatible: true  },
     { value: 'swin-t',     label: 'Swin-Tiny',                   engine: 'TIMM',        model: 'swin_tiny_patch4_window7_224',  hardware: 'GPU 8GB+',     description: 'Transformer-based — ดีสำหรับ texture-rich images เช่น fabric, metal surface', compatible: true  },
-    { value: 'vit-b',      label: 'ViT-Base (Vision Transformer)', engine: 'TIMM',      model: 'vit_base_patch16_224',          hardware: 'GPU 12GB+',    description: 'Pure transformer — เหมาะกับ dataset ขนาดใหญ่, multi-class defect',          compatible: false },
+    { value: 'vit-b',      label: 'ViT-Base (Vision Transformer)', engine: 'TIMM',      model: 'vit_base_patch16_224',          hardware: 'GPU 12GB+',    description: 'Pure transformer — เหมาะกับ dataset ขนาดใหญ่, multi-class defect',          compatible: true  },
     { value: 'dino-s',     label: 'DINOv2-Small',                engine: 'TIMM',        model: 'vit_small_patch14_dinov2',      hardware: 'GPU 8GB+',     description: 'Self-supervised feature backbone — few-shot classification, anomaly detection', compatible: true },
     { value: 'efficientvit', label: 'EfficientViT-M5',           engine: 'TIMM',        model: 'efficientvit_m5',               hardware: 'GPU 6GB+',     description: 'Ultra-fast edge transformer — real-time line inspection, <1ms latency',       compatible: true  },
     // ── Medical pre-trained ─────────────────────────────────────────────────────
-    { value: 'rad-dino',   label: 'RAD-DINO (Radiology)',        engine: 'HuggingFace', model: 'microsoft/rad-dino',            hardware: 'GPU 8GB+',     description: 'Pre-trained บน 1M+ chest X-ray (CheXpert, MIMIC) — fine-tune ได้สำหรับ X-ray classification', compatible: true  },
+    { value: 'rad-dino',   label: 'RAD-DINO (Radiology)',        engine: 'HuggingFace', model: 'microsoft/rad-dino',            hardware: 'GPU 8GB+',     description: 'Pre-trained บน 1M+ chest X-ray (CheXpert, MIMIC) — fine-tune ได้สำหรับ X-ray classification', compatible: false },
     { value: 'txrv-densenet', label: 'CheXNet DenseNet121',      engine: 'PyTorch',     model: 'densenet121-res224-all',        hardware: 'GPU 6GB+',     description: 'Pre-trained บน 800k+ chest X-ray (TorchXRayVision) — pneumonia, effusion, nodule', compatible: true  },
     { value: 'uni-pathology', label: 'UNI (Pathology ViT-L)',    engine: 'HuggingFace', model: 'MahmoodLab/UNI',               hardware: 'GPU 16GB+',    description: 'Pre-trained บน 100k+ pathology slides (TCGA) — tissue classification, cancer grading', compatible: false },
     { value: 'monai-densenet', label: 'MONAI DenseNet121',        engine: 'MONAI',       model: 'monai-densenet121',             hardware: 'GPU 8GB+',     description: 'MONAI medical classification — CT/MRI/X-ray, auto-handle DICOM & NIfTI format',  compatible: true  },
+    // ── COVID-Net (lindawangg) — research-only, TF 1.x EOL ────────────────────────
+    { value: 'covidnet-cxr-3', label: 'COVID-Net CXR-3 (Research)', engine: 'TensorFlow 1.15', model: 'covidnet-cxr-3',          hardware: 'GPU 6GB+',     description: 'DarwinAI COVID-Net CXR-3 (chest X-ray COVID-19 detection) — research-only, NOT production clinical, requires TensorFlow 1.13-1.15 (EOL), trained on COVIDx V8B (16,352 CXR / 51 countries), sens 99.0%/97.5% (neg/pos)', compatible: false },
+    // ── From Intel Geti catalog ────────────────────────────────────────────────────
+    { value: 'eff-v2-s',   label: 'EfficientNet-V2-S',          engine: 'TIMM',        model: 'tf_efficientnetv2_s',         hardware: 'GPU 8GB+',     description: 'EfficientNet-V2 (2021) — fused MBConv + progressive LR, faster training + better accuracy than V1, Geti default classifier', compatible: true  },
+    { value: 'deit-tiny',  label: 'DeiT-Tiny',                  engine: 'TIMM',        model: 'deit_tiny_patch16_224',      hardware: 'GPU 4GB+',     description: 'Data-efficient Image Transformer (tiny) — distillation-based ViT, smaller data requirement, Geti catalog default', compatible: true  },
   ],
 
   // ── Object Detection ─────────────────────────────────────────────────────────
   detection: [
     { value: 'yolov8-s',   label: 'YOLOv8-Small',               engine: 'Ultralytics', model: 'yolov8s.pt',                    hardware: 'GPU 6GB+',     description: 'Real-time detection — assembly line inspection, package detection',           compatible: true  },
     { value: 'yolov8-m',   label: 'YOLOv8-Medium',              engine: 'Ultralytics', model: 'yolov8m.pt',                    hardware: 'GPU 10GB+',    description: 'Balanced — surface scratch, weld defect, component presence detection',       compatible: true  },
-    { value: 'yolov8-l',   label: 'YOLOv8-Large',               engine: 'Ultralytics', model: 'yolov8l.pt',                    hardware: 'GPU 16GB+',    description: 'High recall — critical defect detection ที่ต้องการ miss rate ต่ำมาก',       compatible: false },
+    { value: 'yolov8-l',   label: 'YOLOv8-Large',               engine: 'Ultralytics', model: 'yolov8l.pt',                    hardware: 'GPU 16GB+',    description: 'High recall — critical defect detection ที่ต้องการ miss rate ต่ำมาก',       compatible: true },
     { value: 'yolonano',   label: 'YOLOv8-Nano',                engine: 'Ultralytics', model: 'yolov8n.pt',                    hardware: 'CPU / Edge',   description: 'Edge-optimized — Jetson Orin, Hailo, industrial smart camera',               compatible: true  },
-    { value: 'yolov9-c',   label: 'YOLOv9-C',                   engine: 'Ultralytics', model: 'yolov9c.pt',                    hardware: 'GPU 12GB+',    description: 'Programmable gradient — better small defect detection vs YOLOv8',            compatible: false },
-    { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: false },
+    { value: 'yolov9-c',   label: 'YOLOv9-C',                   engine: 'Ultralytics', model: 'yolov9c.pt',                    hardware: 'GPU 12GB+',    description: 'Programmable gradient — better small defect detection vs YOLOv8',            compatible: true },
+    { value: 'rt-detr',    label: 'RT-DETR-L',                  engine: 'Ultralytics', model: 'rtdetr-l.pt',                   hardware: 'GPU 12GB+',    description: 'Transformer detection — anchor-free, ดีสำหรับ dense object counting',        compatible: true },
     { value: 'detr',       label: 'DETR-ResNet50',              engine: 'HuggingFace', model: 'facebook/detr-resnet-50',         hardware: 'GPU 10GB+',    description: 'End-to-end transformer detection — robotic picking, warehouse automation',    compatible: false },
+    { value: 'rdd-yolov8s',label: 'RDD-YOLOv8 (Road Damage)',    engine: 'Ultralytics', model: 'road-damage-yolov8s.pt',        hardware: 'GPU 6GB+',     description: 'YOLOv8s fine-tuned on RDD2022 (Crowdsensing-based Road Damage Detection Challenge 2022) — 5 classes: Longitudinal Crack, Transverse Crack, Alligator Crack, Other Corruption, Pothole (weights จาก ozair23/yolov8-road-damage-detector)', compatible: true  },
+    // YOLOS-Tiny via HuggingFace — Vision Transformer detection, fine-tunable via AutoModelForObjectDetection
+    { value: 'yolos-t',    label: 'YOLOS-Tiny (HF)',             engine: 'HuggingFace', model: 'hustvl/yolos-tiny',             hardware: 'GPU 6GB+',     description: 'YOLOS-Tiny (You Only Look at One Sequence) — ViT detection head, COCO 80 classes, fine-tunable via HuggingFace pipeline', compatible: true  },
   ],
 
   // ── Segmentation ─────────────────────────────────────────────────────────────
@@ -80,49 +92,308 @@ const TRAINING_MATRIX: Record<string, TrainOption[]> = {
     { value: 'deeplabv3',  label: 'DeepLabV3+ (ResNet101)',     engine: 'TorchVision', model: 'resnet101-deeplabv3',            hardware: 'GPU 10GB+',    description: 'Atrous conv — semantic segmentation บน aerial, industrial floor plan',       compatible: true  },
     { value: 'maskrcnn',   label: 'Mask R-CNN',                 engine: 'TorchVision', model: 'maskrcnn_resnet50_fpn',          hardware: 'GPU 12GB+',    description: 'Instance segmentation — individual part isolation, robotic grasping',         compatible: false },
     { value: 'yoloseg',    label: 'YOLOv8-Seg',                engine: 'Ultralytics', model: 'yolov8m-seg.pt',                hardware: 'GPU 10GB+',    description: 'Fast instance seg — real-time defect segmentation on production line',        compatible: true  },
-    { value: 'monai-unet', label: 'MONAI UNet (Medical)',        engine: 'MONAI',       model: 'monai-unet',                    hardware: 'GPU 8GB+',     description: 'MONAI UNet — organ/tumor segmentation, CT/MRI, handles DICOM & NIfTI automatically', compatible: true  },
-    { value: 'medsam',     label: 'MedSAM (Fine-tune)',          engine: 'MedSAM',      model: 'medsam_vit_b',                  hardware: 'GPU 12GB+',    description: 'SAM fine-tuned บน medical images — segment อวัยวะ/tumor ด้วย bounding box prompt', compatible: false },
-    { value: 'nnunet-2d',  label: 'nnU-Net 2D Auto',            engine: 'nnU-Net',     model: 'nnunet-2d',                     hardware: 'GPU 16GB+',    description: 'Auto-configure segmentation pipeline — MICCAI standard, organ/tumor, CT/MRI', compatible: false },
+    { value: 'monai-unet', label: 'MONAI UNet (Medical)',        engine: 'MONAI',       model: 'monai-unet',                    hardware: 'GPU 8GB+',     description: 'MONAI UNet — organ/tumor segmentation, CT/MRI, handles DICOM & NIfTI automatically. ⚠ Dataset must use pixel-level Brush/Mask labels in Label Studio (NOT polygon/rectangle/keypoint) with label values 0..N-1 matching the number of classes — otherwise CUDA index out of bounds during training.', compatible: true  },
+    { value: 'medsam',     label: 'MedSAM (Fine-tune)',          engine: 'MedSAM',      model: 'medsam_vit_b',                  hardware: 'GPU 12GB+',    description: 'SAM fine-tuned บน medical images — segment อวัยวะ/tumor ด้วย bounding box prompt', compatible: true },
+    { value: 'nnunet-2d',  label: 'nnU-Net 2D Auto',            engine: 'nnU-Net',     model: 'nnunet-2d',                     hardware: 'GPU 16GB+',    description: 'Auto-configure segmentation pipeline — MICCAI standard, organ/tumor, CT/MRI', compatible: true },
+    // ── nnU-Net 3D variants (MIC-DKFZ/nnUNet) ────────────────────────────────────
+    { value: 'nnunet-3d-lowres',  label: 'nnU-Net 3D Low-Res',   engine: 'nnU-Net',     model: 'nnunet-3d-lowres',              hardware: 'GPU 8GB+',     description: 'MICCAI standard 3D segmentation, low-resolution config (downsample then segment) — large organ/whole-body CT, MRI', compatible: true },
+    { value: 'nnunet-3d-fullres', label: 'nnU-Net 3D Full-Res',  engine: 'nnU-Net',     model: 'nnunet-3d-fullres',             hardware: 'GPU 16GB+',    description: 'MICCAI standard 3D segmentation, full-resolution — best Dice for tumor/organ CT/MRI; auto-preprocess + auto-configure', compatible: true },
+    { value: 'nnunet-3d-cascade', label: 'nnU-Net 3D Cascade',   engine: 'nnU-Net',     model: 'nnunet-3d-cascade',             hardware: 'GPU 24GB+',    description: '3D cascade — low-res first, then full-res on detected regions, SOTA on large anisotropic volumes (CT whole-body, MRI)',  compatible: true },
+    // ── MedicalNet 3D-ResNet (Tencent) — 3D backbone pretrains for transfer ──
+    { value: 'medicalnet-3d-r10', label: 'MedicalNet 3D-ResNet10',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet10',        hardware: 'GPU 8GB+',     description: 'Tencent MedicalNet 3D-ResNet10 (14M params) — pretrained on 23 medical datasets, transfer-learning backbone for CT/MRI volumetric classification/segmentation, MIT license', compatible: false },
+    { value: 'medicalnet-3d-r18', label: 'MedicalNet 3D-ResNet18',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet18',        hardware: 'GPU 12GB+',    description: 'Tencent MedicalNet 3D-ResNet18 (33M params) — 23-dataset pretrain, popular transfer backbone for 3D organ/lesion classification', compatible: false },
+    { value: 'medicalnet-3d-r50', label: 'MedicalNet 3D-ResNet50',  engine: 'PyTorch',  model: 'medicalnet-3d-resnet50',        hardware: 'GPU 16GB+',    description: 'Tencent MedicalNet 3D-ResNet50 (46M params) — best Dice on lung seg (93.3%) + nodule cls (89.9%) in their paper, 23-dataset pretrain', compatible: false },
+    // ── From Intel Geti catalog ────────────────────────────────────────────────────
+    { value: 'lite-hrnet', label: 'Lite-HRNet (Seg)',           engine: 'MMSegmentation', model: 'lite-hrnet-x',             hardware: 'GPU 6GB+',     description: 'Lite-HRNet (2021) — high-resolution backbone with shuffled blocks, efficient semantic segmentation, Geti catalog default', compatible: true  },
+    { value: 'segnext-s', label: 'SegNext Small',              engine: 'MMSegmentation', model: 'segnext-small',           hardware: 'GPU 8GB+',     description: 'SegNext (2022) — stacked convolutional attention decoder, mIoU 47+ on ADE20K, SOTA for industrial/defect segmentation, Geti default', compatible: true  },
   ],
 
   // ── LLM Text Fine-tuning ─────────────────────────────────────────────────────
   'llm-text': [
-    { value: 'llama31-8b',  label: 'LLaMA-3.1-8B',             engine: 'Unsloth', model: 'unsloth/llama-3.1-8b-bnb-4bit',            hardware: 'GPU 16GB+',  description: 'Meta LLaMA 3.1 8B — strong general LLM, ดีสำหรับ technical doc Q&A, SOP',     compatible: false },
+    { value: 'llama31-8b',  label: 'LLaMA-3.1-8B',             engine: 'Unsloth', model: 'unsloth/llama-3.1-8b-bnb-4bit',            hardware: 'GPU 16GB+',  description: 'Meta LLaMA 3.1 8B — strong general LLM, ดีสำหรับ technical doc Q&A, SOP',     compatible: true },
     { value: 'llama32-3b',  label: 'LLaMA-3.2-3B-Instruct',   engine: 'Unsloth', model: 'unsloth/Llama-3.2-3B-Instruct-bnb-4bit',   hardware: 'GPU 8GB+',   description: 'Compact LLaMA 3.2 — เร็ว, เหมาะกับ domain chatbot, maintenance assistant',     compatible: true  },
-    { value: 'mistral-7b',  label: 'Mistral-7B-Instruct',     engine: 'Unsloth', model: 'unsloth/mistral-7b-instruct-v0.3-bnb-4bit', hardware: 'GPU 14GB+',  description: 'Strong instruction following — structured output, report generation, API agent', compatible: false },
-    { value: 'qwen25-7b',   label: 'Qwen2.5-7B-Instruct',    engine: 'Unsloth', model: 'unsloth/Qwen2.5-7B-Instruct-bnb-4bit',     hardware: 'GPU 14GB+',  description: 'Excellent multilingual (EN/TH/ZH) — ดีสำหรับ Thai industrial documentation',   compatible: false },
+    { value: 'mistral-7b',  label: 'Mistral-7B-Instruct',     engine: 'Unsloth', model: 'unsloth/mistral-7b-instruct-v0.3-bnb-4bit', hardware: 'GPU 14GB+',  description: 'Strong instruction following — structured output, report generation, API agent', compatible: true },
+    { value: 'qwen25-7b',   label: 'Qwen2.5-7B-Instruct',    engine: 'Unsloth', model: 'unsloth/Qwen2.5-7B-Instruct-bnb-4bit',     hardware: 'GPU 14GB+',  description: 'Excellent multilingual (EN/TH/ZH) — ดีสำหรับ Thai industrial documentation',   compatible: true },
     { value: 'phi35-mini',  label: 'Phi-3.5-Mini-Instruct',   engine: 'Unsloth', model: 'unsloth/Phi-3.5-mini-instruct-bnb-4bit',   hardware: 'GPU 6GB+',   description: 'Microsoft Phi-3.5 3.8B — lightweight แต่แรง, เหมาะ edge inference, IoT gateway', compatible: true  },
     { value: 'gemma2-2b',   label: 'Gemma-2-2B-Instruct',    engine: 'Unsloth', model: 'unsloth/gemma-2-2b-it-bnb-4bit',           hardware: 'GPU 6GB+',   description: 'Google Gemma 2 2B — ขนาดเล็กมาก, ดีสำหรับ classification text, FAQ bot',       compatible: true  },
-    { value: 'deepseek-r1', label: 'DeepSeek-R1-8B',          engine: 'Unsloth', model: 'unsloth/DeepSeek-R1-0528-Qwen3-8B-bnb-4bit', hardware: 'GPU 20GB+', description: 'Reasoning model — RCA (root cause analysis), troubleshooting chain-of-thought',  compatible: false },
-    { value: 'qwen3-14b',   label: 'Qwen3-14B',               engine: 'Unsloth', model: 'unsloth/Qwen3-14B-bnb-4bit',               hardware: 'GPU 24GB+',  description: 'Top-tier reasoning — complex process optimization, multi-step planning',         compatible: false },
-    { value: 'medgemma-27b', label: 'MedGemma-27B-IT',        engine: 'Unsloth', model: 'google/medgemma-27b-it',                   hardware: 'GPU 48GB+',  description: 'Google medical LLM — pre-trained บน medical text, ดีสำหรับ clinical NLP, radiology report',  compatible: false },
-    { value: 'meditron-7b',  label: 'Meditron-7B',            engine: 'Unsloth', model: 'epfl-llm/meditron-7b',                    hardware: 'GPU 14GB+',  description: 'EPFL+Yale — fine-tuned จาก Llama 2 บน medical corpus, ดีสำหรับ clinical reasoning, medical QA', compatible: false },
-    { value: 'biomistral-7b', label: 'BioMistral-7B',         engine: 'Unsloth', model: 'BioMistral/BioMistral-7B',                hardware: 'GPU 14GB+',  description: 'Fine-tune จาก Mistral บน PubMed — medical Q&A, summarization, literature review',              compatible: false },
+    { value: 'deepseek-r1', label: 'DeepSeek-R1-8B',          engine: 'Unsloth', model: 'unsloth/DeepSeek-R1-0528-Qwen3-8B-bnb-4bit', hardware: 'GPU 20GB+', description: 'Reasoning model — RCA (root cause analysis), troubleshooting chain-of-thought',  compatible: true },
+    { value: 'qwen3-14b',   label: 'Qwen3-14B',               engine: 'Unsloth', model: 'unsloth/Qwen3-14B-bnb-4bit',               hardware: 'GPU 24GB+',  description: 'Top-tier reasoning — complex process optimization, multi-step planning',         compatible: true },
+    { value: 'medgemma-27b', label: 'MedGemma-27B-IT',        engine: 'Unsloth', model: 'google/medgemma-27b-it',                   hardware: 'GPU 48GB+',  description: 'Google medical LLM — pre-trained บน medical text, ดีสำหรับ clinical NLP, radiology report',  compatible: true },
+    { value: 'meditron-7b',  label: 'Meditron-7B',            engine: 'Unsloth', model: 'epfl-llm/meditron-7b',                    hardware: 'GPU 14GB+',  description: 'EPFL+Yale — fine-tuned จาก Llama 2 บน medical corpus, ดีสำหรับ clinical reasoning, medical QA', compatible: true },
+    { value: 'biomistral-7b', label: 'BioMistral-7B',         engine: 'Unsloth', model: 'BioMistral/BioMistral-7B',                hardware: 'GPU 14GB+',  description: 'Fine-tune จาก Mistral บน PubMed — medical Q&A, summarization, literature review',              compatible: true },
     { value: 'openbiollm-8b', label: 'OpenBioLLM-8B',         engine: 'Unsloth', model: 'aaditya/Llama3-OpenBioLLM-8B',           hardware: 'GPU 16GB+',  description: 'Saama — Llama 3 fine-tuned บน biomedical corpus, ดีสำหรับ drug research, biomedical NLP',       compatible: true  },
   ],
 
   // ── VLM Fine-tuning ───────────────────────────────────────────────────────────
+  // All VLM models go through the Unsloth path on the backend. Unsloth pins
+  // compatible transformers/peft/bitsandbytes versions, so we avoid the
+  // bare-HF version-conflict class of bugs and the numpy/pandas ABI mismatch
+  // on the Ray cluster. Unsloth supports Qwen2-VL, LLaVA, Pixtral, and
+  // Llama-3.2-Vision; for models unsloth doesn't have a pre-built
+  // bnb-4bit version of, we still pass the original model id and unsloth
+  // tries to load it (will raise a clear error if unsupported).
+  //
+  // Medical VLMs (Med-R1, Hulu-Med) are flagged zeroShot=true because they
+  // are SOTA off-the-shelf for diagnosis / VQA / report generation across
+  // 8-14 imaging modalities, so users can deploy them as-is before any
+  // LoRA fine-tune.
   'vlm-finetune': [
-    { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'LLaVA',      model: 'llava-v1.6-mistral-7b',          hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: false },
-    { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',   engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit', hardware: 'GPU 16GB+', description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: false },
-    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'HuggingFace', model: 'OpenGVLab/InternVL2-8B',        hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: false },
-    { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'HuggingFace', model: 'google/paligemma2-3b-pt-448',   hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: false },
-    { value: 'medgemma-4b', label: 'MedGemma-4B-IT',          engine: 'HuggingFace', model: 'google/medgemma-4b-it',         hardware: 'GPU 12GB+',  description: 'Google medical VLM — pre-trained บน medical images & text, ดีสำหรับ radiology, pathology, dermatology', compatible: true  },
-    { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'HuggingFace', model: 'HuggingFaceTB/SmolVLM-500M-Instruct', hardware: 'GPU 6GB+', description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
+    { value: 'llava16-7b',  label: 'LLaVA-1.6-7B',            engine: 'Unsloth',    model: 'unsloth/llava-v1.6-mistral-7b-bnb-4bit',  hardware: 'GPU 16GB+',  description: 'General VLM — visual inspection report, defect description generation',       compatible: true  },
+    { value: 'qwen2vl-7b',  label: 'Qwen2-VL-7B-Instruct',    engine: 'Unsloth',    model: 'unsloth/Qwen2-VL-7B-Instruct-bnb-4bit',   hardware: 'GPU 16GB+',  description: 'Strong multimodal — Thai/EN, ดีสำหรับ industrial doc + image Q&A',         compatible: true  },
+    { value: 'internvl2',   label: 'InternVL2-8B',            engine: 'Unsloth',    model: 'unsloth/InternVL2-8B-bnb-4bit',           hardware: 'GPU 16GB+',  description: 'Top-ranked open VLM — OCR, diagram understanding, part recognition',         compatible: true  },
+    { value: 'paligemma',   label: 'PaliGemma-2-3B',          engine: 'Unsloth',    model: 'unsloth/paligemma2-3b-pt-448-bnb-4bit',  hardware: 'GPU 8GB+',   description: 'Google compact VLM — ดีสำหรับ captioning, VQA, grounding on industrial images', compatible: true  },
+    { value: 'medgemma-4b', label: 'MedGemma-4B-IT',          engine: 'Unsloth',    model: 'unsloth/medgemma-4b-it-bnb-4bit',         hardware: 'GPU 12GB+',  description: 'Google medical VLM — pre-trained บน medical images & text, ดีสำหรับ radiology, pathology, dermatology', compatible: true  },
+    { value: 'smolvlm',     label: 'SmolVLM-500M',            engine: 'Unsloth',    model: 'HuggingFaceTB/SmolVLM-500M-Instruct',     hardware: 'GPU 6GB+',   description: 'Ultra-lightweight VLM — edge deployment, Jetson Orin, smart camera',         compatible: true  },
+    { value: 'medr1-3b',    label: 'Med-R1-3B (GRPO Medical VLM)', engine: 'Unsloth', model: 'yuxianglai117/Med-R1',                hardware: 'GPU 14GB+',  description: 'Qwen2-VL fine-tuned ด้วย GRPO reinforcement learning — 8 imaging modalities (CT/MRI/X-Ray/Fundus/Dermoscopy/Microscopy/OCT/US), 5 tasks (anatomy ID, disease diagnosis, lesion grading, modality recognition, bio-attribute) — chain-of-thought reasoning แข็งแกร่ง, เหมาะ zero-shot diagnostic VQA', compatible: true, zeroShot: true },
+    { value: 'hulumed-7b',  label: 'Hulu-Med-7B (Medical Generalist VLM)', engine: 'Unsloth', model: 'ZJU-AI4H/Hulu-Med-7B',          hardware: 'GPU 16GB+',  description: 'ZJU-AI4H transparent generalist VLM — 14 imaging modalities (CT/MRI/X-Ray/US/PET/OCT/Endoscopy/Histopathology/Fundus/Dermoscopy/Angiography/...), รองรับ 2D/3D NIfTI/video, SOTA บน 30 medical benchmarks — generalist diagnostic + report generation', compatible: true, zeroShot: true },
+    { value: 'huatuogpt-v-7b', label: 'HuatuoGPT-Vision-7B (PubMedVision)', engine: 'Unsloth', model: 'FreedomIntelligence/HuatuoGPT-Vision-7B', hardware: 'GPU 16GB+', description: 'FreedomIntelligence medical MLLM (Qwen2-7B + LLaVA-style vision adapter) — train บน PubMedVision 1.3M medical VQA, SOTA บน VQA-RAD 63.7 / SLAKE 76.2 / PathVQA 57.9 / PMC-VQA 54.3 / OmniMedVQA 74.0 — แข่งกับ LLaVA-v1.6-34B ที่ขนาดเล็กกว่า', compatible: true, zeroShot: true },
+    { value: 'bimedix2-8b', label: 'BiMediX2-8B (Bilingual EN/AR Medical LMM)', engine: 'Unsloth', model: 'MBZUAI/BiMediX2',                   hardware: 'GPU 16GB+', description: 'MBZUAI bilingual medical LMM (Llama 3.1 + LLaVA-pp) — 1.6M Arabic-English multimodal instruction (BiMed-V), SOTA บน BiMed-MBench (+9% EN, +20% AR), USMLE +8% over GPT-4, medical VQA + report generation + summarization — bilingual medical assistant', compatible: true, zeroShot: true },
   ],
 
   // ── Self-supervised / SSL ────────────────────────────────────────────────────
   'self-supervised': [
     { value: 'mae',        label: 'MAE (Masked AutoEncoder)',   engine: 'PyTorch', model: 'mae_vit_base',                   hardware: 'GPU 12GB+',   description: 'Self-supervised pretraining — ดีเมื่อ label น้อย แต่ unlabeled data เยอะ', compatible: false },
-    { value: 'dino',       label: 'DINOv2 (ViT-B/14)',         engine: 'TIMM',    model: 'vit_base_patch14_dinov2',        hardware: 'GPU 10GB+',   description: 'Self-distillation — universal feature extractor สำหรับ downstream tasks',   compatible: false },
+    { value: 'dino',       label: 'DINOv2 (ViT-B/14)',         engine: 'TIMM',    model: 'vit_base_patch14_dinov2',        hardware: 'GPU 10GB+',    description: 'Self-distillation — universal feature extractor สำหรับ downstream tasks (linear-probe via DINOv2-style encoder+classifier pipeline)',   compatible: true  },
     { value: 'simCLR',     label: 'SimCLR (ResNet50)',         engine: 'PyTorch', model: 'resnet50-simclr',                hardware: 'GPU 8GB+',    description: 'Contrastive learning — pretrain ก่อน fine-tune เมื่อ label data ขาดแคลน',  compatible: true  },
     { value: 'byol',       label: 'BYOL (ResNet50)',           engine: 'PyTorch', model: 'resnet50-byol',                  hardware: 'GPU 8GB+',    description: 'Bootstrap your own latent — no negative samples, stable training',           compatible: true  },
     { value: 'padim',      label: 'PaDiM (Anomaly Detection)', engine: 'Anomalib', model: 'padim_resnet18',               hardware: 'GPU 6GB+',    description: 'Unsupervised anomaly detection — zero defect sample needed for training',    compatible: true  },
     { value: 'patchcore',  label: 'PatchCore',                engine: 'Anomalib', model: 'patchcore_wide_resnet50',       hardware: 'GPU 8GB+',    description: 'Memory bank anomaly detection — MVTec-style industrial inspection',          compatible: true  },
+    // ── From Intel Geti catalog ────────────────────────────────────────────────────
+    { value: 'stfpm',      label: 'STFPM (Anomaly)',           engine: 'Anomalib', model: 'stfpm_resnet18',                hardware: 'GPU 6GB+',    description: 'Student-Teacher Feature Pyramid Matching (2021) — ResNet-18 teacher/student + multi-layer feature distillation, AUROC 92+ on MVTec, Geti default', compatible: true  },
+    { value: 'uflow',      label: 'U-Flow (Anomaly)',          engine: 'Anomalib', model: 'uflow_resnet18',                hardware: 'GPU 8GB+',    description: 'Unsupervised Flow (2022) — normalizing flow + multi-scale feature, AUROC 96+ on MVTec AD, Geti default anomaly',                compatible: true  },
+  ],
+
+  // ── Industrial Anomaly Detection ──────────────────────────────────────────────
+  //
+  // Models from M-3LAB/awesome-industrial-anomaly-detection.
+  // Categorized by method type: Teacher-Student, Memory Bank, Reconstruction,
+  // Normalizing Flow, Multi-Class Unified, Zero/Few-Shot, VLM-based.
+  //
+  // Use cases: factory QC, PCB inspection, textile defect, food/agri sorting,
+  // oil & gas corrosion, road damage, construction crack, electronic soldering.
+  //
+  'anomaly-detection': [
+    // ── Teacher-Student ──────────────────────────────────────────────────────────
+    { value: 'rd4ad',         label: 'RD4AD (Reverse Distillation)', engine: 'Anomalib',  model: 'rd4ad_wide_resnet50',          hardware: 'GPU 8GB+',  description: 'CVPR 2022 — Teacher→Student reverse knowledge distillation, AUROC 95+ MVTec, ดีสำหรับ surface scratch, texture defect, metal/plastic inspection', compatible: true },
+    { value: 'rd4ad-r18',     label: 'RD4AD (ResNet18 Light)',      engine: 'Anomalib',  model: 'rd4ad_resnet18',               hardware: 'GPU 4GB+',  description: 'RD4AD variant with ResNet-18 — เร็วกว่า 2x, เหมาะ edge GPU, Jetson, smart camera', compatible: true },
+    { value: 'stfpm-r18',     label: 'STFPM (ResNet18)',            engine: 'Anomalib',  model: 'stfpm_resnet18',               hardware: 'GPU 6GB+',  description: 'Student-Teacher Feature Pyramid Matching (2021) — multi-layer feature distillation, AUROC 92+ MVTec', compatible: true },
+    { value: 'efficientad',   label: 'EfficientAD',                engine: 'Anomalib',  model: 'efficientad_wide_resnet50',    hardware: 'GPU 4GB+',  description: 'WACV 2024 — ultra-fast teacher-student, >100 FPS, designed for real-time production line', compatible: true },
+    // ── Memory Bank ──────────────────────────────────────────────────────────────
+    { value: 'patchcore-wr50',label: 'PatchCore (WRN-50)',         engine: 'Anomalib',  model: 'patchcore_wide_resnet50',      hardware: 'GPU 8GB+',  description: 'CVPR 2022 Amazon — SOTA memory-bank, AUROC 99+ MVTec, ดีสำหรับทุก industrial inspection ที่ต้องการ precision สูง', compatible: true },
+    { value: 'patchcore-r18', label: 'PatchCore (ResNet18)',       engine: 'Anomalib',  model: 'patchcore_resnet18',           hardware: 'GPU 4GB+',  description: 'PatchCore เบา — เหมาะ edge deployment, ตรวจของเสียสายพานแบบ real-time', compatible: true },
+    // ── One-Class Classification ─────────────────────────────────────────────────
+    { value: 'simplenet',     label: 'SimpleNet',                  engine: 'Anomalib',  model: 'simplenet_wide_resnet50',      hardware: 'GPU 6GB+',  description: 'CVPR 2023 — simplest architecture, single feature adaptor + discriminative classifier, เร็วมาก, ดีสำหรับ quick POC', compatible: true },
+    // ── Normalizing Flow ─────────────────────────────────────────────────────────
+    { value: 'cflow-ad',      label: 'CFlow-AD',                   engine: 'Anomalib',  model: 'cflow_ad_wide_resnet50',       hardware: 'GPU 8GB+',  description: 'WACV 2022 — conditional normalizing flows, real-time anomaly detection + localization, AUROC 93+ MVTec', compatible: true },
+    { value: 'pyramidflow',   label: 'PyramidFlow',                engine: 'PyTorch',   model: 'pyramidflow',                  hardware: 'GPU 10GB+', description: 'CVPR 2023 — pyramid normalizing flow + contrastive localization, high-res defect map, ดีสำหรับ fine-grained defect', compatible: false },
+    { value: 'cs-flow',       label: 'CS-Flow',                    engine: 'Anomalib',  model: 'csflow_wide_resnet50',         hardware: 'GPU 8GB+',  description: 'Cross-scale normalizing flow — multi-scale feature coupling, AUROC 93+ MVTec', compatible: true },
+    // ── Reconstruction-Based ─────────────────────────────────────────────────────
+    { value: 'draem',         label: 'DRAEM',                      engine: 'Anomalib',  model: 'draem',                        hardware: 'GPU 8GB+',  description: 'ICCV 2021 — discriminatively trained reconstruction, ดีมากสำหรับ surface anomaly (scratch, dent, stain, discoloration)', compatible: true },
+    { value: 'dsr',           label: 'DSR (Dual Subspace)',        engine: 'PyTorch',   model: 'dsr',                          hardware: 'GPU 8GB+',  description: 'ECCV 2022 — dual subspace re-projection, reconstruct + detect anomaly in parallel, ดีสำหรับ texture + logical defect', compatible: false },
+    { value: 'realnet',       label: 'RealNet',                    engine: 'PyTorch',   model: 'realnet',                      hardware: 'GPU 10GB+', description: 'CVPR 2024 — realistic synthetic anomaly generation + feature selection, แก้ปัญหา "ไม่มีรูป defect เลย" ด้วย anomaly synthesis', compatible: false },
+    // ── Multi-Class Unified (1 model, many product types) ────────────────────────
+    { value: 'dinomaly',      label: 'Dinomaly (CVPR 2025)',      engine: 'PyTorch',   model: 'dinomaly',                     hardware: 'GPU 12GB+', description: 'CVPR 2025 SOTA — "less is more" DINOv2-based, 1 model รองรับหลาย product type, AUROC 98+ multi-class, ดีสำหรับ multi-product factory', compatible: false },
+    { value: 'dinomaly2',     label: 'Dinomaly2 (Full-Spectrum)',  engine: 'PyTorch',   model: 'dinomaly2',                    hardware: 'GPU 16GB+', description: '2025 — multi-class + multi-view + multi-modal + few-shot, full-spectrum AD, handles RGB + RGBD + point cloud', compatible: false },
+    { value: 'uniad',         label: 'UniAD',                      engine: 'PyTorch',   model: 'uniad',                        hardware: 'GPU 12GB+', description: 'NeurIPS 2022 — unified multi-class AD via transformer reconstruction, 1 model N classes', compatible: false },
+    { value: 'hvq-trans',     label: 'HVQ-Trans',                  engine: 'PyTorch',   model: 'hvq_trans',                    hardware: 'GPU 12GB+', description: 'NeurIPS 2023 — hierarchical vector quantized transformer, multi-class AD', compatible: false },
+    { value: 'uniformaly',    label: 'UniFormaly',                 engine: 'PyTorch',   model: 'uniformaly',                   hardware: 'GPU 10GB+', description: 'Task-agnostic unified framework — รองรับหลาย anomaly task ใน model เดียว', compatible: false },
+    // ── Few-Shot AD ──────────────────────────────────────────────────────────────
+    { value: 'regad',         label: 'RegAD (Few-Shot)',           engine: 'PyTorch',   model: 'regad',                        hardware: 'GPU 8GB+',  description: 'ECCV 2022 — registration-based few-shot AD, เหมาะเมื่อมีรูปปกติน้อยมาก (1-4 shots)', compatible: false },
+    { value: 'anomalygpt',    label: 'AnomalyGPT',                 engine: 'PyTorch',   model: 'anomalygpt',                   hardware: 'GPU 24GB+', description: 'AAAI 2024 — LVLM-based anomaly detection, อธิบาย defect เป็นภาษาคน, รองรับ few-shot in-context learning', compatible: false },
+    // ── Supervised AD (มีตัวอย่าง defect) ────────────────────────────────────────
+    { value: 'dra',           label: 'DRA (Open-Set)',             engine: 'PyTorch',   model: 'dra',                          hardware: 'GPU 8GB+',  description: 'CVPR 2022 — open-set supervised AD, catch known + unknown defect types, เหมาะเมื่อมี defect sample บางประเภท', compatible: false },
+    { value: 'bgad',          label: 'BGAD (Boundary Guided)',     engine: 'PyTorch',   model: 'bgad',                         hardware: 'GPU 8GB+',  description: 'CVPR 2023 — explicit boundary guided semi-push-pull contrastive, precise anomaly boundary', compatible: false },
+    // ── Zero-Shot AD (ไม่ต้อง train เลย) ──────────────────────────────────────────
+    { value: 'anovl',         label: 'AnoVL (Zero-Shot)',          engine: 'PyTorch',   model: 'anovl',                        hardware: 'GPU 8GB+',  description: '2023 — vision-language zero-shot anomaly localization via CLIP, ไม่ต้อง train, พิมพ์ชื่อ defect → หาให้', compatible: false },
+    { value: 'grounded-sam-ad',label: 'Grounded SAM Zero-Shot',   engine: 'PyTorch',   model: 'grounded_sam_ad',              hardware: 'GPU 12GB+', description: 'GroundingDINO + SAM — zero-shot: พิมพ์ "scratch, dent, crack" → หา + segment ทันที, ดีสำหรับ ad-hoc inspection', compatible: false },
+    { value: 'winclip',       label: 'WinCLIP (Zero-Shot)',        engine: 'PyTorch',   model: 'winclip',                      hardware: 'GPU 8GB+',  description: 'CVPR 2023 — window-based CLIP, zero-shot AD + localization, competitive with unsupervised methods without training', compatible: false },
+    { value: 'april-gan',     label: 'April-GAN',                  engine: 'Anomalib',  model: 'winclip',                      hardware: 'GPU 8GB+',  description: 'Anomalib zero-shot — CLIP-based anomaly detection, text-promptable, ไม่ต้องมี training data เลย', compatible: true },
+    // ── Noisy AD (มี contaminated training data) ─────────────────────────────────
+    { value: 'softpatch',     label: 'SoftPatch (Noisy)',          engine: 'PyTorch',   model: 'softpatch',                    hardware: 'GPU 8GB+',  description: 'NeurIPS 2022 Tencent — PatchCore + noise-robust scoring, ดีเมื่อ training data มี defect ปนอยู่ (noisy normal set)', compatible: false },
+    { value: 'igd',           label: 'IGD (Noisy)',                engine: 'PyTorch',   model: 'igd',                          hardware: 'GPU 6GB+',  description: 'AAAI 2022 — interpolated Gaussian descriptor, robust to contaminated training set', compatible: false },
+    // ── RGBD / 3D ────────────────────────────────────────────────────────────────
+    { value: 'm3dm',          label: 'M3DM (RGBD)',                engine: 'PyTorch',   model: 'm3dm',                         hardware: 'GPU 12GB+', description: 'CVPR 2023 — multimodal (RGB + depth) industrial AD via hybrid fusion, ดีสำหรับ 3D inspection (machined parts, electronics)', compatible: false },
+    { value: 'real3d-ad',     label: 'Real3D-AD (Point Cloud)',    engine: 'PyTorch',   model: 'real3d_ad',                    hardware: 'GPU 16GB+', description: 'NeurIPS 2023 — point cloud anomaly detection, 3D shape inspection, CAD model comparison', compatible: false },
+    // ── Continual AD ─────────────────────────────────────────────────────────────
+    { value: 'ucad',          label: 'UCAD (Continual)',           engine: 'PyTorch',   model: 'ucad',                         hardware: 'GPU 10GB+', description: 'AAAI 2024 — unsupervised continual AD with contrastively-learned prompt, เรียนรู้ product ใหม่เรื่อยๆ โดยไม่ลืมของเก่า', compatible: false },
+    // ── Logical AD ───────────────────────────────────────────────────────────────
+    { value: 'psad',          label: 'PSAD (Logical)',             engine: 'PyTorch',   model: 'psad',                         hardware: 'GPU 8GB+',  description: 'AAAI 2024 — part segmentation reveals compositional logic, ตรวจ logical anomaly (วางผิดที่, ขาดชิ้น, เกินชิ้น)', compatible: false },
+    { value: 'salad',         label: 'SALAD (Semantic Logic)',     engine: 'PyTorch',   model: 'salad',                        hardware: 'GPU 10GB+', description: 'ICCV 2025 — semantics-aware logical AD, ตรวจความผิดปกติเชิงตรรกะ (เช่น ฝาปิดผิด, ฉลากผิด)', compatible: false },
+    // ── MLLM-based AD (LLM ตรวจของเสีย) ────────────────────────────────────────
+    { value: 'ad-copilot',    label: 'AD-Copilot (MLLM)',          engine: 'PyTorch',   model: 'ad_copilot',                   hardware: 'GPU 24GB+', description: '2025 — end-to-end trained MLLM สำหรับ industrial AD, เหนือกว่าคนบน real inspection tasks, อธิบาย + localize defect', compatible: false },
+    { value: 'mmad',          label: 'MMAD (Benchmark VLM)',       engine: 'PyTorch',   model: 'mmad',                         hardware: 'GPU 16GB+', description: 'ICLR 2025 — benchmark LLMs เป็น quality inspector, evaluate GPT-4V/Gemini/Claude บน industrial AD', compatible: false },
+    // ── Anomalib built-in (already wired, listed here for visibility) ────────────
+    { value: 'padim',         label: 'PaDiM',                      engine: 'Anomalib',  model: 'padim_resnet18',               hardware: 'GPU 6GB+',  description: 'ICPR 2021 — Gaussian embedding per patch, fast unsupervised AD baseline, ดีสำหรับ prototype / quick POC', compatible: true },
+    { value: 'patchcore-ad',  label: 'PatchCore',                  engine: 'Anomalib',  model: 'patchcore_wide_resnet50',      hardware: 'GPU 8GB+',  description: 'CVPR 2022 Amazon — SOTA memory-bank, AUROC 99+ MVTec, ดีสำหรับทุก industrial inspection ที่ต้องการ precision สูง', compatible: true },
   ],
 
   // ── Export ────────────────────────────────────────────────────────────────────
 }
+
+// ─── Deploy-Only Catalog ───────────────────────────────────────────────────
+//
+// SOTA pre-trained models that should be **deployed as-is** (not fine-tuned
+// via the Unsloth path in this UI). Each one needs a custom training
+// pipeline because its vision encoder / architecture is not in the set
+// that Unsloth knows how to LoRA-wrap:
+//
+//   - RaDialog_v2: LLaVA + BioViL (chest X-ray) + CheXbert + flash-attn
+//   - Med3DVLM:    DCFormer (3D decomposed conv) + Qwen-2.5-7B
+//
+// The Deploy page reads from this list and offers Ray Serve / Modal
+// endpoints. Adding a model here keeps the Train menu uncluttered and
+// avoids the false expectation that "select → train" will work — these
+// are inference-only out of the box.
+//
+// The Deploy page ALSO surfaces any model in TRAINING_MATRIX with
+// `zeroShot: true` set (see DeployModels.tsx for the union) — those
+// are SOTA off-the-shelf models that can be deployed without fine-tune
+// even though they are also fine-tunable via Unsloth.
+export const DEPLOY_CATALOG: TrainOption[] = [
+  {
+    value:        'radialog-v2',
+    label:        'RaDialog-v2 (LLaVA Radiology)',
+    engine:       'LLaVA + BioViL',
+    model:        'ChantalPellegrini/RaDialog-interactive-radiology-report-generation',
+    hardware:     'GPU 16GB+',
+    dataTypes:    ['xray'],
+    description:  'MIDL 2025 — LLaVA-based radiology VLM with BioViL image encoder, CheXbert classifier, fine-tuned on MIMIC-CXR + RaDialog-Instruct — supports chest X-ray report generation, view classification, impression generation, and interactive dialog correction',
+    compatible:   true,
+    source:       'https://github.com/ChantalMP/RaDialog_v2',
+    paper:        'https://openreview.net/pdf?id=trUvr1gSNI',
+  },
+  {
+    value:        'med3dvlm',
+    label:        'Med3DVLM (3D Medical VLM)',
+    engine:       'DCFormer + Qwen-2.5-7B',
+    model:        'MagicXin/Med3DVLM-Qwen-2.5-7B',
+    hardware:     'GPU 24GB+',
+    dataTypes:    ['xray'],   // 3D CT/MRI volumes — surfaced as 'xray' data type
+    description:  'IEEE JBHI 2025 — 3D medical VLM with DCFormer (decomposed 3D conv encoder) + SigLIP contrastive pretraining + Qwen-2.5-7B LLM, trained on M3D-Cap (120K 3D image-text) and M3D-VQA (96K 3D VQA) — supports volumetric CT/MRI report generation, image-text retrieval (R@1 61%), open-ended VQA (METEOR 36.76), closed-ended VQA (acc 79.95%)',
+    compatible:   true,
+    source:       'https://github.com/mirthai/med3dvlm',
+    paper:        'https://ieeexplore.ieee.org/document/11145341/',
+  },
+  // ── From yangzhou12/awesome-medical-vision-language-models (zero-shot / pretrain) ──
+  {
+    value:        'chexzero',
+    label:        'CheXzero (Zero-shot CXR)',
+    engine:       'CLIP (contrastive)',
+    model:        'StanfordSAI/chexzero',
+    hardware:     'GPU 8GB+',
+    dataTypes:    ['xray'],
+    description:  'Nature Biomedical Engineering 2022 — self-supervised contrastive learning from unannotated chest X-rays + reports, zero-shot pathology detection (no labels needed at inference), expert-level on 5 common pathologies, Stanford Rajpurkar Lab',
+    compatible:   true,
+    source:       'https://github.com/rajpurkarlab/CheXzero',
+    paper:        'https://www.nature.com/articles/s41551-022-00936-9',
+  },
+  {
+    value:        'medclip',
+    label:        'MedCLIP (Zero-shot Medical)',
+    engine:       'CLIP (decoupled contrastive)',
+    model:        'flaviagiammarino/medclip-vit-base-patch16',
+    hardware:     'GPU 8GB+',
+    dataTypes:    ['xray', 'microscopy', 'rgb', 'general'],
+    description:  'EMNLP 2022 — contrastive learning from unpaired medical images and text (decoupled to handle unpaired data), zero-shot medical image classification across multiple modalities, ViT-B/16 backbone',
+    compatible:   true,
+    source:       'https://github.com/RyanWangZf/MedCLIP',
+    paper:        'https://arxiv.org/abs/2210.10163',
+  },
+  {
+    value:        'mgca',
+    label:        'MGCA (Medical VLP Pretrain)',
+    engine:       'ResNet50 + BioBERT',
+    model:        'fuying-wang/MGCA',
+    hardware:     'GPU 12GB+',
+    dataTypes:    ['xray', 'rgb', 'general'],
+    description:  'NeurIPS 2022 — Multi-Granularity Cross-modal Alignment for medical visual representation learning (instance-, region-, disease-level), pretrain backbone for chest X-ray classification/segmentation, can be deployed zero-shot or fine-tuned',
+    compatible:   true,
+    source:       'https://github.com/fuying-wang/MGCA',
+    paper:        'https://arxiv.org/abs/2210.06044',
+  },
+  {
+    value:        'm3ae',
+    label:        'M3AE (Medical MAE Pretrain)',
+    engine:       'ViT-B + BioBERT (Masked Autoencoder)',
+    model:        'zhjohnchan/M3AE',
+    hardware:     'GPU 12GB+',
+    dataTypes:    ['xray', 'rgb', 'general'],
+    description:  'MICAI 2022 — Multi-Modal Masked Autoencoders for medical vision-and-language pretraining, masked image+text reconstruction, ViT-B/16 backbone, pretrain backbone for downstream classification/segmentation/VQA',
+    compatible:   true,
+    source:       'https://github.com/zhjohnchan/M3AE',
+    paper:        'https://arxiv.org/abs/2209.07098',
+  },
+  // ── Framework-dependent models (deploy-only — fine-tune needs custom path) ─────
+  {
+    value:        'medsam-deploy',
+    label:        'MedSAM (Segment Anything Medical)',
+    engine:       'SAM fine-tuned on medical',
+    model:        'MedSAM/MedSAM-ViT-B',
+    hardware:     'GPU 12GB+',
+    dataTypes:    ['xray', 'microscopy', 'rgb'],
+    description:  'SAM fine-tuned on medical images (1.5M image-mask pairs, 11 modalities) — segment organs/tumors with bounding-box or point prompt, ViT-B backbone, deployable zero-shot for inference, custom training path needed for fine-tune',
+    compatible:   true,
+    source:       'https://github.com/bowang-lab/MedSAM',
+    paper:        'https://arxiv.org/abs/2304.02606',
+  },
+  {
+    value:        'nnunet-3d-lowres-deploy',
+    label:        'nnU-Net 3D Low-Res (Deploy)',
+    engine:       'nnU-Net',
+    model:        'nnunet-3d-lowres',
+    hardware:     'GPU 8GB+',
+    dataTypes:    ['xray'],
+    description:  'MICCAI standard 3D segmentation (low-resolution config) — auto-preprocess + auto-configure, deploy pretrained checkpoint via nnU-Net v2 framework, large organ/whole-body CT and MRI',
+    compatible:   true,
+    source:       'https://github.com/MIC-DKFZ/nnUNet',
+  },
+  {
+    value:        'nnunet-3d-fullres-deploy',
+    label:        'nnU-Net 3D Full-Res (Deploy)',
+    engine:       'nnU-Net',
+    model:        'nnunet-3d-fullres',
+    hardware:     'GPU 16GB+',
+    dataTypes:    ['xray'],
+    description:  'MICCAI standard 3D segmentation (full-resolution) — best Dice on tumor/organ CT/MRI, deploy pretrained checkpoint via nnU-Net v2 framework',
+    compatible:   true,
+    source:       'https://github.com/MIC-DKFZ/nnUNet',
+  },
+  {
+    value:        'nnunet-3d-cascade-deploy',
+    label:        'nnU-Net 3D Cascade (Deploy)',
+    engine:       'nnU-Net',
+    model:        'nnunet-3d-cascade',
+    hardware:     'GPU 24GB+',
+    dataTypes:    ['xray'],
+    description:  'MICCAI standard 3D segmentation (cascade — low-res first, then full-res on detected regions), SOTA on large anisotropic volumes (whole-body CT, MRI), deploy via nnU-Net v2 framework',
+    compatible:   true,
+    source:       'https://github.com/MIC-DKFZ/nnUNet',
+  },
+  {
+    value:        'medicalnet-3d-r50-deploy',
+    label:        'MedicalNet 3D-ResNet50 (Deploy)',
+    engine:       'PyTorch (3D-ResNet)',
+    model:        'Tencent/MedicalNet-Resnet50',
+    hardware:     'GPU 16GB+',
+    dataTypes:    ['xray'],
+    description:  'Tencent MedicalNet 3D-ResNet50 (46M params) — pretrained on 23 medical datasets, transfer-learning backbone for CT/MRI volumetric classification/segmentation, best Dice on lung seg (93.3%) + nodule cls (89.9%), MIT license, weights from Tencent/MedicalNet',
+    compatible:   true,
+    source:       'https://github.com/Tencent/MedicalNet',
+    paper:        'https://arxiv.org/abs/1904.00625',
+  },
+  {
+    value:        'covidnet-cxr-3-deploy',
+    label:        'COVID-Net CXR-3 (Deploy)',
+    engine:       'TensorFlow 1.15',
+    model:        'covidnet-cxr-3',
+    hardware:     'GPU 6GB+',
+    dataTypes:    ['xray'],
+    description:  'DarwinAI COVID-Net CXR-3 (chest X-ray COVID-19 detection) — research-only, NOT for clinical use, requires TensorFlow 1.13-1.15 (EOL), trained on COVIDx V8B (16,352 CXR / 51 countries), sensitivity 99.0%/97.5% (neg/pos), weights from lindawangg/COVID-Net',
+    compatible:   true,
+    source:       'https://github.com/lindawangg/COVID-Net',
+    paper:        'https://www.nature.com/articles/s41598-020-76550-z',
+  },
+]
 
 // ─── Data-type compatibility per model ───────────────────────────────────────────────
 const _A: DataType[] = ['rgb', 'thermal', 'xray', 'microscopy', 'lidar', 'general'] // all
@@ -131,7 +402,7 @@ const _C: DataType[] = ['rgb', 'thermal', 'general']                            
 const _X: DataType[] = ['xray', 'microscopy', 'rgb', 'general']                      // precision detail
 const _I: DataType[] = ['rgb', 'thermal', 'xray', 'general']                         // inspection/anomaly
 
-const MODEL_DATA_TYPES: Record<string, DataType[]> = {
+export const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   // Classification
   'eff-b2':            _A,
   'eff-b4':            _V,
@@ -157,8 +428,21 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'monai-unet':        ['xray', 'microscopy', 'rgb'],
   'medsam':            ['xray', 'microscopy', 'rgb'],
   'nnunet-2d':         ['xray', 'microscopy', 'rgb'],
+  'nnunet-3d-lowres':  ['xray'],
+  'nnunet-3d-fullres': ['xray'],
+  'nnunet-3d-cascade': ['xray'],
+  'medicalnet-3d-r10': ['xray'],
+  'medicalnet-3d-r18': ['xray'],
+  'medicalnet-3d-r50': ['xray'],
+  'lite-hrnet':       ['rgb', 'xray', 'microscopy', 'general'],
+  'segnext-s':        ['rgb', 'xray', 'microscopy', 'general'],
+  'covidnet-cxr-3':    ['xray'],
+  'eff-v2-s':          _V,
+  'deit-tiny':         _V,
   // Detection
   'yolov8-s':          _C,
+  'rdd-yolov8s':       _C,
+  'rtmdet-t':          _C,
   'yolov8-m':          _C,
   'yolov8-l':          _C,
   'yolonano':          ['rgb', 'general'],
@@ -186,6 +470,10 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'internvl2':         _V,
   'paligemma':         ['rgb', 'general'],
   'smolvlm':           ['rgb', 'general'],
+  'medr1-3b':          ['xray', 'microscopy', 'rgb', 'general'],
+  'hulumed-7b':        ['xray', 'microscopy', 'rgb', 'general'],
+  'huatuogpt-v-7b':    ['xray', 'microscopy', 'rgb', 'general'],
+  'bimedix2-8b':       ['xray', 'microscopy', 'rgb', 'general'],
   // Self-supervised / anomaly
   'mae':               ['rgb', 'general'],
   'dino':              ['rgb', 'microscopy', 'general'],
@@ -193,6 +481,8 @@ const MODEL_DATA_TYPES: Record<string, DataType[]> = {
   'byol':              _V,
   'padim':             _I,
   'patchcore':         _I,
+  'stfpm':             _I,
+  'uflow':             _I,
   // Export formats (data-type agnostic)
   'tflite':            _A,
   'onnx':              _A,
@@ -220,7 +510,13 @@ function parseRequiredGb(hardware: string): number {
   return m ? parseInt(m[1]) : 0
 }
 
-export default function TrainModel() {
+export default function TrainModel({ types }: { types?: TrainingType[] } = {}) {
+  // If a `types` prop is passed, only those training-type cards show
+  // in step 0. Used by the Deep-Learning / LLM wrapper pages so the
+  // sidebar submenus can scope their content without duplicating the
+  // 1480-line form. Default = all six training types (legacy /train).
+  const _allowed: TrainingType[] | null = types && types.length ? types : null
+  const showType = (t: TrainingType) => _allowed === null || _allowed.includes(t)
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const [retrainSource, setRetrainSource] = useState<{ id: string; name: string } | null>(null)
@@ -251,6 +547,13 @@ export default function TrainModel() {
   const [launching, setLaunching] = useState(false)
   const [jobId, setJobId] = useState('')
   const [showAllModels, setShowAllModels] = useState(false)
+  // Existing trained models — used when target='export' to let the
+  // user pick a previously-trained model to continue/export from.
+  const [existingModels, setExistingModels] = useState<Array<{
+    id: string; name: string; model_name?: string; engine?: string;
+    training_type?: string; epochs?: number; finished_at?: string;
+  }>>([])
+  const [existingModelsLoading, setExistingModelsLoading] = useState(false)
   const [clusterStatus, setClusterStatus] = useState<{
     ray:   { available: boolean; url: string; info: string }
     modal: { available: boolean; status: string; ray_url: string | null; creds_saved?: boolean; gpu_type?: string; num_workers?: number }
@@ -266,6 +569,34 @@ export default function TrainModel() {
       .then(setClusterStatus)
       .catch(() => {})
   }, [step])
+
+  // Fetch existing trained models when the user picks target='export' —
+  // step 2 then renders a list of these for the user to choose one
+  // to continue/export from. Triggered by target change, not step
+  // change, so the list is ready when the user advances to step 2.
+  useEffect(() => {
+    if (config.target !== 'export') {
+      setExistingModels([])
+      return
+    }
+    setExistingModelsLoading(true)
+    fetch('/api/jobs?view=models', { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => {
+        const jobs = Array.isArray(d) ? d : (d?.jobs ?? [])
+        setExistingModels(jobs.map((j: any) => ({
+          id: j.id,
+          name: j.name || j.id?.slice(0, 8) || 'unnamed',
+          model_name: j.model_name,
+          engine: j.engine,
+          training_type: j.training_type,
+          epochs: j.epochs,
+          finished_at: j.finished_at || j.updated_at,
+        })))
+      })
+      .catch(() => setExistingModels([]))
+      .finally(() => setExistingModelsLoading(false))
+  }, [config.target])
 
   // ── Modal Start-Cluster popup (shown when the user picks Modal but the
   //    cluster isn't running yet).  Lets them start inline rather than
@@ -386,7 +717,16 @@ export default function TrainModel() {
       .catch(() => {})
   }, [config.trainingType])
 
-  // Query Ray cluster for actual GPU memory
+  // Query Ray cluster for available GPU memory. Ray's `nodes?view=summary`
+  // returns per-node `mem: [total, available, usedPct, used]` in bytes
+  // but `gpus: []` is empty (Ray 2.x does not expose per-GPU mem in the
+  // summary view). We use `mem[1]` (available system RAM, in bytes) as
+  // a proxy — for an H200 node, system RAM (~150 GB) is in the same
+  // ballpark as a single H200 GPU (141 GB), and the largest models in
+  // the catalog can run on one GPU. We always take the MAX across all
+  // nodes (so a busy head node doesn't drag down the estimate). If the
+  // API fails entirely, we fall back to a généreus 64 GB default so the
+  // dynamic check never silently disables models.
   useEffect(() => {
     fetch('/api/ray/nodes?view=summary')
       .then(r => r.json())
@@ -394,14 +734,24 @@ export default function TrainModel() {
         const nodes: any[] = data?.data?.summary ?? []
         let maxFreeGb = 0
         for (const node of nodes) {
-          for (const gpu of (node.gpus ?? [])) {
-            const freeGb = (gpu.memoryTotal - gpu.memoryUsed) / 1024
-            if (freeGb > maxFreeGb) maxFreeGb = freeGb
+          // Always check system mem — Ray 2.x summary view has gpus: []
+          if (Array.isArray(node.mem) && node.mem.length >= 2) {
+            const availBytes = Number(node.mem[1] ?? 0)
+            if (availBytes > 0) {
+              const availGb = availBytes / (1024 ** 3)
+              if (availGb > maxFreeGb) maxFreeGb = availGb
+            }
           }
         }
-        if (maxFreeGb > 0) setGpuFreeGb(Math.floor(maxFreeGb))
+        if (maxFreeGb > 0) {
+          setGpuFreeGb(Math.floor(maxFreeGb))
+        } else {
+          // API failed or returned no data — généreus default so we don't
+          // silently fall back to the static `compatible: false` for LLMs.
+          setGpuFreeGb(64)
+        }
       })
-      .catch(() => {})
+      .catch(() => setGpuFreeGb(64))
   }, [])
 
   useEffect(() => {
@@ -454,17 +804,31 @@ export default function TrainModel() {
     setStep(3)
   }
 
+  // When target='export', the model selection step shows previously-
+  // trained models from the existingModels list. Picking one
+  // continues with that model's engine / model_name (or a
+  // generic 'export-<id>' marker if the original model_name
+  // isn't available) and jumps to step 3 to configure the export.
+  const handleExistingModelSelect = (m: {
+    id: string; name: string; model_name?: string; engine?: string; training_type?: string;
+  }) => {
+    set('model', m.model_name || m.id)        // HF model id or our job id
+    set('engine', m.engine || 'Export')
+    if (m.training_type) set('trainingType', m.training_type as TrainingType)
+    setStep(3)
+  }
+
   const handleLaunch = async () => {
     if (!config.engine || !config.model) {
       showToast('กรุณาเลือก model ก่อน', 'error')
       return
     }
-    const llm = isLlmType(config.trainingType)
-    if (!llm && !config.datasetId) {
+    const needsText = needsTextDataset(config.trainingType)
+    if (!needsText && !config.datasetId) {
       showToast('กรุณาเลือก dataset', 'error')
       return
     }
-    if (llm && !config.textDatasetId) {
+    if (needsText && !config.textDatasetId) {
       showToast('กรุณาเลือก text dataset', 'error')
       return
     }
@@ -482,7 +846,7 @@ export default function TrainModel() {
     setLaunching(true)
     showToast('🚀 Launching training job...', 'success')
 
-    const projectId = llm ? 0 : config.datasetId
+    const projectId = needsText ? 0 : config.datasetId
 
     try {
       const res = await fetch(`/api/train/${projectId}`, {
@@ -729,8 +1093,7 @@ export default function TrainModel() {
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>เลือกประเภทงานที่ต้องการ — ระบบจะแนะนำ engine และ model ที่เหมาะสม</p>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-            {/* Classification */}
-            <button
+            {showType('classification') && (<button
               onClick={() => { set('trainingType', 'classification'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'classification' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
@@ -751,10 +1114,9 @@ export default function TrainModel() {
                 <span>{countForType('classification')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* Object Detection */}
-            <button
+            {showType('detection') && (<button
               onClick={() => { set('trainingType', 'detection'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'detection' ? { borderColor: 'var(--warning)', background: 'var(--warning-dim)' } : {}}
@@ -775,10 +1137,9 @@ export default function TrainModel() {
                 <span>{countForType('detection')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* Segmentation */}
-            <button
+            {showType('segmentation') && (<button
               onClick={() => { set('trainingType', 'segmentation'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'segmentation' ? { borderColor: 'var(--success)', background: 'var(--success-dim)' } : {}}
@@ -799,10 +1160,9 @@ export default function TrainModel() {
                 <span>{countForType('segmentation')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* VLM Fine-tune */}
-            <button
+            {showType('vlm-finetune') && (<button
               onClick={() => { set('trainingType', 'vlm-finetune'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'vlm-finetune' ? { borderColor: 'var(--info)', background: 'var(--info-dim)' } : {}}
@@ -823,10 +1183,9 @@ export default function TrainModel() {
                 <span>GPU 16GB+ required</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* Self-Supervised */}
-            <button
+            {showType('self-supervised') && (<button
               onClick={() => { set('trainingType', 'self-supervised'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'self-supervised' ? { borderColor: 'var(--primary)', background: 'var(--primary-dim)' } : {}}
@@ -847,10 +1206,32 @@ export default function TrainModel() {
                 <span>{countForType('self-supervised')} models</span>
                 <ChevronDown size={12} />
               </div>
-            </button>
+            </button>)}
 
-            {/* LLM Text Fine-tuning */}
-            <button
+            {showType('anomaly-detection') && (<button
+              onClick={() => { set('trainingType', 'anomaly-detection'); nextStep() }}
+              className="card text-left"
+              style={config.trainingType === 'anomaly-detection' ? { borderColor: '#f97316', background: 'rgba(249,115,22,0.08)' } : {}}
+            >
+              <div className="flex items-center gap-3 mb-3">
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(249,115,22,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <AlertTriangle size={18} style={{ color: '#f97316' }} />
+                </div>
+                <div>
+                  <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Anomaly Detection</h3>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Industrial Defect · Unsupervised</p>
+                </div>
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                ตรวจของเสีย / ของผิดปกติ โดยไม่ต้องมีรูป defect — โรงงาน, PCB, textile, food, oil & gas, road inspection
+              </p>
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <span style={{ background: 'rgba(249,115,22,0.15)', color: '#f97316', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>No defect sample needed</span>
+                <span style={{ background: 'rgba(249,115,22,0.15)', color: '#f97316', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>{countForType('anomaly-detection')} models</span>
+              </div>
+            </button>)}
+
+            {showType('llm-text') && (<button
               onClick={() => { set('trainingType', 'llm-text'); nextStep() }}
               className="card text-left"
               style={config.trainingType === 'llm-text' ? { borderColor: '#8b5cf6', background: 'rgba(139,92,246,0.08)' } : {}}
@@ -871,7 +1252,7 @@ export default function TrainModel() {
                 <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>QLoRA 4-bit</span>
                 <span style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', borderRadius: 4, padding: '2px 6px', fontWeight: 600 }}>Unsloth 2x faster</span>
               </div>
-            </button>
+            </button>)}
           </div>
         </div>
       )}
@@ -908,14 +1289,12 @@ export default function TrainModel() {
                 onChange={e => set('target', e.target.value as TargetType)}
                 className="mt-1"
               >
-                <option value="prelabel">Pre-label (เตรียมข้อมูลก่อน label)</option>
                 <option value="finetune">Fine-tune (ปรับแต่งจาก pretrained)</option>
                 <option value="export">Export (export model ที่มีอยู่แล้ว)</option>
               </select>
               <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
-                {config.target === 'prelabel' && 'ใช้ AI ช่วย pre-label ก่อน เพื่อลดเวลาการ label ของ expert'}
                 {config.target === 'finetune' && 'Fine-tune จาก pretrained model เช่น ImageNet, MedCLIP'}
-                {config.target === 'export' && 'Export checkpoint ที่มีอยู่ไปเป็น format ที่ต้องการ'}
+                {config.target === 'export' && 'Export checkpoint ที่มีอยู่ไปเป็น format ที่ต้องการ — step ถัดไปจะให้เลือก existing model ที่จะ export'}
               </p>
             </div>
 
@@ -970,7 +1349,62 @@ export default function TrainModel() {
       {/* ── STEP 2: Model Selection ── */}
       {step === 2 && (
         <div>
-          <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
+          {config.target === 'export' ? (
+            <div>
+              <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Existing Model</h2>
+              <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>
+                เลือก model ที่ train เสร็จแล้ว — จะถูก export เป็น format ที่เลือกในขั้นถัดไป ({existingModels.length} model ที่ train เสร็จ)
+              </p>
+              {existingModelsLoading ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '20px', color: 'var(--text-muted)' }}>
+                  <Loader2 size={16} className="animate-spin" />
+                  กำลังโหลด existing models ...
+                </div>
+              ) : existingModels.length === 0 ? (
+                <div style={{ padding: '20px', borderRadius: 8, background: 'var(--bg-elevated)', textAlign: 'center' }}>
+                  <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 8 }}>
+                    ยังไม่มี model ที่ train เสร็จ — ไปที่ <a href="/models" style={{ color: 'var(--primary)' }}>Models</a> ดูผลงานที่ train เสร็จแล้ว
+                  </p>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    หรือกลับไปเลือก target = "Fine-tune" เพื่อ train model ใหม่จาก pretrained
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {existingModels.map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => handleExistingModelSelect(m)}
+                      className="card text-left"
+                    >
+                      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8 }}>
+                        <h3 style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>{m.name}</h3>
+                        {m.training_type && (
+                          <span className="badge badge-primary" style={{ fontSize: 10 }}>{m.training_type}</span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: 6 }}>
+                        <span style={{ color: 'var(--primary-hover)' }}>{m.engine || '—'}</span>
+                        <span>·</span>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.model_name || m.id}</span>
+                      </div>
+                      {m.epochs !== undefined && (
+                        <p style={{ fontSize: 11, color: 'var(--text-muted)' }}>epochs: {m.epochs}{m.finished_at ? ` · finished ${new Date(m.finished_at).toLocaleDateString()}` : ''}</p>
+                      )}
+                      <div style={{ marginTop: 8, fontSize: 12, color: 'var(--primary-hover)', fontWeight: 500 }}>
+                        เลือก model นี้ →
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="flex justify-between mt-6">
+                <button className="btn btn-secondary" onClick={prevStep}>← Back</button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>เลือก Model</h2>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 8 }}>
             <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
               {showAllModels
@@ -1103,6 +1537,8 @@ export default function TrainModel() {
           <div className="flex justify-between mt-6">
             <button className="btn btn-secondary" onClick={prevStep}>← Back</button>
           </div>
+            </div>
+          )}
         </div>
       )}
 

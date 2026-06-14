@@ -7,8 +7,10 @@ MedImage Training Backend
 """
 
 import os
+import sys
 import uuid
 import time
+import shutil
 import threading
 import sqlite3
 import json
@@ -23,11 +25,14 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form as FForm, Request, Body, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form as FForm, Request, Body, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from starlette.websockets import WebSocketState
 import io
 import zipfile
+import asyncio
+import json as _json
 from pydantic import BaseModel
 
 # ─── DB ──────────────────────────────────────────────────────────────────────
@@ -91,15 +96,58 @@ def init_db():
             ("pipeline_step",    "TEXT DEFAULT ''"),
             ("updated_at",       "TEXT DEFAULT ''"),
             ("user_id",          "TEXT DEFAULT ''"),
+            ("num_gpus",         "INTEGER DEFAULT 1"),
+            ("ray_submission_id","TEXT DEFAULT ''"),
+            ("bulk_run_id",      "TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {defval}")
             except Exception:
                 pass
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS bulk_runs (
+                id              TEXT PRIMARY KEY,
+                started_at      REAL NOT NULL,
+                finished_at     REAL,
+                stopped         INTEGER DEFAULT 0,
+                provider        TEXT DEFAULT 'ray',
+                deploy_enabled  INTEGER DEFAULT 0,
+                total           INTEGER DEFAULT 0,
+                ok              INTEGER DEFAULT 0,
+                failed          INTEGER DEFAULT 0,
+                deployed_count  INTEGER DEFAULT 0,
+                user_id         TEXT DEFAULT ''
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bulk_runs_started ON bulk_runs(started_at DESC)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bulk_run_jobs (
+                bulk_run_id  TEXT NOT NULL,
+                row_key      TEXT NOT NULL,
+                job_id       TEXT,
+                status       TEXT,
+                error        TEXT,
+                elapsed_sec  REAL DEFAULT 0,
+                deployed     INTEGER DEFAULT 0,
+                deploy_url   TEXT,
+                PRIMARY KEY (bulk_run_id, row_key)
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL DEFAULT '',
+                updated_at REAL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (user_id, key)
             )
         """)
         conn.execute("""
@@ -113,6 +161,33 @@ def init_db():
                 created_at REAL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inference_history (
+                id              TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL DEFAULT 'default',
+                created_at      REAL NOT NULL,
+                mode            TEXT NOT NULL,
+                model_id        TEXT,
+                model_name      TEXT,
+                model_type      TEXT,
+                image_name      TEXT,
+                thumbnail_key   TEXT,
+                image_key       TEXT,
+                user_prompt     TEXT,
+                system_prompt   TEXT,
+                result_json     TEXT NOT NULL,
+                inference_time_ms INTEGER
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inference_history_user_time "
+            "ON inference_history (user_id, created_at DESC)"
+        )
+        # Migration: add image_key column if missing (existing DBs from before)
+        try:
+            conn.execute("ALTER TABLE inference_history ADD COLUMN image_key TEXT")
+        except Exception:
+            pass  # column already exists
         conn.execute("""
             CREATE TABLE IF NOT EXISTS totp_credentials (
                 id          TEXT PRIMARY KEY,
@@ -155,6 +230,229 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ─── Ray job reconciliation watchdog ──────────────────────────────────────────
+#
+# Without this, stuck PENDING jobs accumulate on the Ray cluster and hold GPU
+# resources forever — every subsequent job then queues behind them and the
+# whole pipeline grinds to a halt (the "TRAIN: UNKNOWN error" symptom).
+#
+# Every 60s the watchdog:
+#   1. Lists all Ray jobs from the dashboard
+#   2. Stops any PENDING job older than 5 min (orphans OR jobs that the
+#      autoscaler can't place)
+#   3. Marks the matching medimage DB job as 'error' if the Ray job is
+#      FAILED/STOPPED but the DB still says 'running' (catches the race
+#      where run_training() crashes before it can _set_status the error)
+#
+# Runs as a daemon thread so the API can restart without leaking the loop.
+
+_RAY_RECONCILE_INTERVAL_S = 60
+_RAY_STUCK_PENDING_AGE_S  = 300   # 5 min
+_ray_stopped_pending: set[str] = set()   # submission IDs we already stopped — avoid re-stopping
+
+
+def _stop_ray_submission(submission_id: str) -> bool:
+    """Ask the Ray dashboard to stop a job. Returns True on success.
+    For PENDING jobs that won't stop, also tries DELETE."""
+    if not submission_id or not submission_id.startswith("raysubmit_"):
+        return False
+    try:
+        import requests as _req
+        r = _req.post(f"{RAY_URL}/api/jobs/{submission_id}/stop", timeout=5)
+        if r.ok:
+            return True
+        # STOP failed — try DELETE (works for some terminal-state jobs)
+        r2 = _req.delete(f"{RAY_URL}/api/jobs/{submission_id}", timeout=5)
+        return r2.ok
+    except Exception:
+        return False
+
+
+def _reconcile_ray_jobs() -> dict:
+    """One pass: kill stuck PENDING jobs + sync DB state for finished Ray jobs.
+    Returns a summary for logging / API responses.
+    """
+    import requests as _req
+    summary = {"stopped_pending": [], "synced_errors": [], "errors": []}
+    # Refresh _active_ray_subs from DB. The module-level set is only
+    # populated at startup; without this refresh, jobs created after
+    # the API booted aren't tracked and the "thread still alive" defer
+    # below would never fire for them.
+    try:
+        with get_db() as _rc:
+            for _r in _rc.execute(
+                "SELECT ray_submission_id FROM jobs "
+                "WHERE ray_submission_id != '' AND status IN ('running','queued')"
+            ).fetchall():
+                _active_ray_subs.add(_r["ray_submission_id"])
+    except Exception:
+        pass
+    try:
+        r = _req.get(f"{RAY_URL}/api/jobs/?limit=200", timeout=10)
+        if not r.ok:
+            summary["errors"].append(f"list jobs HTTP {r.status_code}")
+            return summary
+        data = r.json()
+        ray_jobs = data if isinstance(data, list) else data.get("data", [])
+    except Exception as e:
+        summary["errors"].append(f"list jobs: {e}")
+        return summary
+
+    now_ms = time.time() * 1000
+    ray_status_by_sub = {}
+    for j in ray_jobs:
+        sid = j.get("submission_id")
+        st  = j.get("status")
+        st_ms = j.get("start_time") or 0
+        if sid:
+            ray_status_by_sub[sid] = (st, st_ms)
+
+    # 1) Stop PENDING jobs that are either:
+    #    (a) Older than 5 min and have no active medimage training thread
+    #        polling them (DB status = 'running' = thread is alive). These
+    #        are orphans the autoscaler can't place.
+    #    (b) Owned by a DB row whose status is no longer 'running' or
+    #        'queued' (cancelled by user, error, etc). The Ray job lingers
+    #        in PENDING forever and holds GPU slots — kill it regardless
+    #        of age so the cluster frees up immediately.
+    _active_ray_subs = set()
+    _terminated_ray_subs = set()
+    with get_db() as conn:
+        for row in conn.execute(
+            "SELECT ray_submission_id, status FROM jobs WHERE ray_submission_id != ''"
+        ).fetchall():
+            sid_ = row["ray_submission_id"]
+            if not sid_:
+                continue
+            if row["status"] in ("running", "queued"):
+                _active_ray_subs.add(sid_)
+            else:
+                _terminated_ray_subs.add(sid_)
+
+    for j in ray_jobs:
+        if j.get("type") != "SUBMISSION":
+            continue
+        sid  = j.get("submission_id")
+        st   = j.get("status")
+        st_t = j.get("start_time") or 0
+        if st != "PENDING":
+            continue
+        # A PENDING-in-Ray + running-in-DB job is stale if older than the
+        # threshold — the training thread can't possibly be alive because
+        # Ray hasn't even started executing the submission yet.
+        if sid in _active_ray_subs and (now_ms - st_t) < _RAY_STUCK_PENDING_AGE_S * 1000:
+            continue   # young active job — leave alone
+        if sid in _ray_stopped_pending:
+            continue   # already stopped — don't re-log every 60s
+        # (b) DB row already terminated (cancelled/error/etc) — kill
+        # immediately. Retry the stop call up to 3 times to defeat the
+        # Ray dashboard's intermittent "stop ack" bug for never-allocated
+        # jobs (where the job_id is null and the cluster sometimes
+        # doesn't reap the submission on the first attempt).
+        if sid in _terminated_ray_subs:
+            if sid not in _ray_stopped_pending:
+                _stop_attempts = 0
+                for _ in range(3):
+                    if _stop_ray_submission(sid):
+                        _stop_attempts += 1
+                    import time as _t
+                    _t.sleep(0.3)
+                _ray_stopped_pending.add(sid)
+                summary["stopped_pending"].append(sid)
+                _append_log_for_sub(sid, f"[reconcile] Stopped orphaned PENDING job (DB row already terminated, {_stop_attempts}/3 stop acks)")
+            continue
+        # (a) Stale PENDING with no active thread — only after threshold.
+        # Same retry trick to maximise the chance the dashboard reaps
+        # the submission.
+        if (now_ms - st_t) > _RAY_STUCK_PENDING_AGE_S * 1000:
+            _stop_attempts = 0
+            for _ in range(3):
+                if _stop_ray_submission(sid):
+                    _stop_attempts += 1
+                import time as _t
+                _t.sleep(0.3)
+            _ray_stopped_pending.add(sid)
+            summary["stopped_pending"].append(sid)
+            _append_log_for_sub(sid, f"[reconcile] Stopped stuck PENDING job after {int((now_ms - st_t)/1000)}s (no active training thread, {_stop_attempts}/3 stop acks)")
+
+    # 2) Sync DB for FAILED/STOPPED/SUCCEEDED Ray jobs whose medimage row
+    #    is still 'running' or 'queued' (run_training thread crashed
+    #    before updating the status).
+    finished = ["FAILED", "STOPPED", "SUCCEEDED"]
+    for sid, (st, st_ms) in ray_status_by_sub.items():
+        if st not in finished:
+            continue
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, status, error, started_at, finished_at FROM jobs "
+                "WHERE ray_submission_id=? AND status IN ('running','queued') LIMIT 1",
+                (sid,),
+            ).fetchone()
+        if not row:
+            continue
+        d = dict(row)
+        medimage_id = d["id"]
+        if st == "SUCCEEDED":
+            # Ray says success but DB is still running — odd. Don't claim
+            # victory ourselves (the training thread will set weights path
+            # + 'completed'). Just log it.
+            _append_log(medimage_id, f"[reconcile] Ray job reports SUCCEEDED but DB is still '{d['status']}' — leaving for training thread")
+            continue
+        # FAILED or STOPPED → mark DB as error.
+        # IMPORTANT: set a SHORT message here so the training thread's later
+        # _set_status() call overwrites it with the real reason. The previous
+        # behavior set a verbose "(reconciled — training thread may have
+        # crashed)" message that masked the actual error when the thread
+        # eventually did update — confusing for users reading the report.
+        # If the training thread is dead (e.g. killed by an API restart),
+        # the user will see this short message + can read the full log for
+        # the captured stdout.
+        # rtdetr-l incident: Ray can report FAILED before the wrapper
+        # training thread has had a chance to write its real log lines
+        # (log fetch loop returns empty 15/15). Defer until the thread
+        # has actually exited, so the captured stdout from the real
+        # crash isn't masked by our short "Ray job ended: FAILED" string.
+        if sid in _active_ray_subs:
+            _append_log(medimage_id, f"[reconcile] Ray reports {st} but training thread still active — deferring error sync")
+            continue
+        err_msg = f"Ray job ended: {st} (status set by reconciler)"
+        _append_log(medimage_id, f"[reconcile] {err_msg} — if the training thread is still alive, it will overwrite this with the real reason; otherwise check the wrapper stdout above")
+        _set_status(medimage_id, "error", err_msg)
+        summary["synced_errors"].append({"medimage_id": medimage_id, "ray_submission_id": sid, "ray_status": st})
+
+    return summary
+
+
+def _append_log_for_sub(submission_id: str, line: str):
+    """Append a log line to the medimage job that owns this Ray submission."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM jobs WHERE ray_submission_id=? LIMIT 1", (submission_id,),
+        ).fetchone()
+    if row:
+        _append_log(row["id"], line)
+
+
+def _ray_reconcile_watchdog():
+    """Background loop: reconcile Ray cluster state every N seconds."""
+    while True:
+        try:
+            time.sleep(_RAY_RECONCILE_INTERVAL_S)
+            _reconcile_ray_jobs()
+        except Exception as e:
+            print(f"[reconcile] watchdog error: {e}")
+
+
+# Start the watchdog once when the module loads (API container has a single
+# worker process, so we don't worry about multiple instances).
+try:
+    _t = threading.Thread(target=_ray_reconcile_watchdog, daemon=True, name="ray-reconcile-watchdog")
+    _t.start()
+    print(f"[reconcile] watchdog started (interval={_RAY_RECONCILE_INTERVAL_S}s, stuck_pending>{_RAY_STUCK_PENDING_AGE_S}s)")
+except Exception as _e:
+    print(f"[reconcile] failed to start watchdog: {e}")
+
 # ─── Keycloak JWT Auth ────────────────────────────────────────────────────────
 
 _KC_ENABLED = os.getenv("KEYCLOAK_ENABLED", "true").lower() == "true"
@@ -182,8 +480,8 @@ def _sync_verify_token(token: str):
 
 
 # Paths excluded from JWT auth
-_KC_PUBLIC_PATHS = {"/api/health", "/api/diag/minio"}
-_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/")
+_KC_PUBLIC_PATHS = {"/api/health", "/api/diag/minio", "/api/gpu-util"}
+_KC_PUBLIC_PREFIXES = ("/api/ls-goto/", "/api/jupyter/", "/api/inference/thumbnail/", "/api/inference/image/", "/api/ray/gpu-stats", "/api/ray/api/", "/api/ray/nodes", "/api/gpu-util")
 
 @app.middleware("http")
 async def jwt_auth_middleware(request: Request, call_next):
@@ -201,10 +499,27 @@ async def jwt_auth_middleware(request: Request, call_next):
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     token = auth[7:]
     try:
-        await asyncio.to_thread(_sync_verify_token, token)
+        payload = await asyncio.to_thread(_sync_verify_token, token)
     except Exception as exc:
         return JSONResponse({"detail": f"Invalid token: {exc}"}, status_code=401)
+    # Stash the user_id (Keycloak 'sub' claim) on request.state so
+    # downstream endpoints can scope data per-user (user_prefs, etc).
+    request.state.user_id = (payload or {}).get("sub", "") or ""
     return await call_next(request)
+
+
+def _current_user_id(request: Request) -> str:
+    """Return the user_id from the JWT attached to this request.
+
+    Falls back to "default" when Keycloak is disabled (no auth), so the
+    user_prefs table still has a stable per-user key.
+    """
+    uid = getattr(request.state, "user_id", "")
+    if uid:
+        return uid
+    if not _KC_ENABLED:
+        return "default"
+    return ""
 
 
 @app.get("/api/health")
@@ -826,6 +1141,7 @@ class TrainRequest(BaseModel):
     grad_accum: int = 4
     text_dataset: str = ""          # text_dataset id or name
     cluster: str = "ray"            # ray | modal
+    num_gpus: int = 1               # GPUs per training job (1=sequential, 2-4=data-parallel)
 
 
 # ─── Training runner ─────────────────────────────────────────────────────────
@@ -835,8 +1151,61 @@ LS_TOKEN   = os.getenv("LS_TOKEN", "medimage-ls-token-2026")
 MINIO_URL  = os.getenv("MINIO_URL", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-# Public URL for MinIO accessible from Ray/Modal clusters (set to external/VPN IP)
-MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", MINIO_URL)
+
+# Public URL the Ray cluster (running on a different host) uses to reach
+# THIS API. Used by the Ray training wrapper to download the training
+# script via HTTP — the script is too big (~97KB source, ~130KB b64) to
+# fit in a single env var (Linux ARG_MAX is ~128KB). Default to the same
+# host as MinIO since they typically live on the same network.
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", os.getenv("LS_PUBLIC_URL", "http://100.68.3.42:8000").rsplit(":", 1)[0] + ":8000")
+
+
+def _verify_weights_uploaded(s3_path: str) -> tuple[bool, str]:
+    """Confirm an s3://bucket/key path actually has an object in MinIO.
+
+    Ray reporting SUCCEEDED only means the wrapper script exited 0 — it
+    does NOT guarantee the training script actually ran end-to-end. The
+    common "phantom SUCCEEDED" cases are:
+      - main() falls through without matching a (engine, type) branch
+      - the engine raises but main() catches it and returns cleanly
+      - upload_to_minio() silently no-ops (e.g., no checkpoint to save)
+
+    This check turns a "phantom" success into a real error by verifying
+    the expected object exists. Returns (ok, message).
+    """
+    if not s3_path or not s3_path.startswith("s3://"):
+        return False, f"not an s3:// path: {s3_path!r}"
+    path = s3_path[5:]
+    if "/" not in path:
+        return False, f"s3 path missing bucket/key: {s3_path!r}"
+    bucket, key = path.split("/", 1)
+    try:
+        import boto3 as _b3
+        from botocore.config import Config as _Cfg
+        from botocore.exceptions import ClientError as _CE
+        s3 = _b3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_Cfg(signature_version="s3v4"),
+        )
+        try:
+            resp = s3.head_object(Bucket=bucket, Key=key)
+            size = resp.get("ContentLength", 0)
+            if size <= 0:
+                return False, f"object exists but is empty (0 bytes): s3://{bucket}/{key}"
+            return True, f"verified s3://{bucket}/{key} ({size} bytes)"
+        except _CE as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False, f"object NOT found in MinIO: s3://{bucket}/{key}"
+            return False, f"head_object failed: {e}"
+    except Exception as e:
+        return False, f"verify failed: {e}"
+# Public URL for MinIO accessible from Ray/Modal clusters (set to external/VPN IP).
+# Falls back to MINIO_HOST_IP on port 9000 (set in docker-compose) when
+# MINIO_PUBLIC_URL isn't explicitly set — the Ray cluster can't resolve
+# the docker-internal "minio" hostname.
+MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", f"http://{os.getenv('MINIO_HOST_IP', '')}:9000" if os.getenv("MINIO_HOST_IP") else MINIO_URL)
 # Public URL for Label Studio accessible from Ray cluster
 LS_PUBLIC_URL = os.getenv("LS_PUBLIC_URL", LS_API_URL)
 # On-prem Ray cluster URL
@@ -927,7 +1296,199 @@ def _diagnose_minio_for_ray() -> str:
         lines.append(f"  {'✓' if ok else '✗'} {host}:{port} {'reachable' if ok else 'UNREACHABLE'}")
     return "\n".join(lines)
 
+# ─── VLM/LLM module shipping (Ray runtime_env) ───────────────────────────────
+# vlm_llm_train.py is shipped to workers via Ray's runtime_env["py_modules"].
+# Ray requires this to be set at job level (ray.init), not per-task, so we
+# resolve the path once at API startup and pass the same runtime_env to every
+# ray.init() call — the first one wins (ignore_reinit_error=True on the rest).
+# Workers cache the module, so edits to vlm_llm_train.py are picked up on the
+# next job without restarting the cluster.
+_VLM_LLM_MODULE_PATH: str = ""
+try:
+    _candidate = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "vlm_llm_train.py"
+    )
+    if os.path.isfile(_candidate):
+        _VLM_LLM_MODULE_PATH = _candidate
+except Exception:
+    pass
+
+_VLM_LLM_RUNTIME_ENV: dict = (
+    {
+        "py_modules": [_VLM_LLM_MODULE_PATH],
+        "env_vars": {
+            # The Modal Ray image ships conda's cuda-driver-dev package
+            # which puts no-op libcuda.so stubs in
+            # /home/ray/anaconda3/lib/stubs/. libtorch_cuda.so has these
+            # paths in its DT_RPATH, so LD_LIBRARY_PATH is ignored —
+            # torch always loads the stub and cuda.is_available() is
+            # False. LD_PRELOAD forces the real driver to be loaded
+            # first, ahead of any DT_RPATH lookup, and its symbols
+            # occupy the global table before the stub gets a chance.
+            "LD_PRELOAD": "/lib/x86_64-linux-gnu/libcuda.so.1",
+        },
+        # Ray runs this on every worker once, before any task body.
+        # It aliases ctypes.RTLD_* onto os.RTLD_* so the baked
+        # /app/main.py's `mode=_ct.RTLD_NOW | _ct.RTLD_GLOBAL` works
+        # without an image rebuild, and it pre-loads the real
+        # libcuda.so.1 to defeat the conda stub. Shipped per-task
+        # via py_modules above — main.py is baked into the image
+        # and only updates on rebuild.
+        "setup_hook": "vlm_llm_train._vlm_setup_hook",
+    } if _VLM_LLM_MODULE_PATH else {}
+)
+
 # ─── Real Training Helpers ────────────────────────────────────────────────────
+
+def upload_to_minio(local_path, bucket, key, minio_url, minio_access, minio_secret):
+    """Upload a local file to MinIO/S3 and return the s3:// URI.
+    The bucket is created on demand if it doesn't exist yet.
+
+    NOTE: A *copy* of this function is also defined inside _VISION_TRAIN_SCRIPT
+    below — that copy is part of the training script that runs on the Ray
+    cluster, and it has its own boto3 import. Don't delete this one without
+    also fixing the inline copy (or vice versa).
+    """
+    import boto3
+    from botocore.config import Config
+    s3 = boto3.client(
+        "s3", endpoint_url=minio_url,
+        aws_access_key_id=minio_access, aws_secret_access_key=minio_secret,
+        config=Config(signature_version="s3v4"),
+    )
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except Exception:
+        s3.create_bucket(Bucket=bucket)
+    s3.upload_file(str(local_path), bucket, key)
+    return f"s3://{bucket}/{key}"
+
+
+def _convert_ls_json_to_yolo_zip(json_data: list, ls_url: str, ls_token: str,
+                                task: str, image_bytes_map: dict | None = None) -> bytes:
+    """Convert a Label Studio JSON export into a YOLO-format zip in memory.
+
+    Used by main()'s JSON→YOLO branch in the dataset prep stage. Lives
+    at module top level (rather than inside the _VISION_TRAIN_SCRIPT
+    raw string) so the API container can call it directly at runtime.
+
+    task='detect'  → cls + cx cy w h (normalised, 5 cols per line)
+    task='segment' → cls + polygon points (variable cols; rectanglelabels
+                     get expanded to a 4-corner polygon since LS
+                     rectanglelabels don't carry their own polygon
+                     vertices — that's enough for YOLO-seg's
+                     assign_targets stage which only needs the bbox
+                     anyway and won't crash on degenerate "boxes" that
+                     span the full image).
+    """
+    import base64 as _b64
+    import requests as _req
+    from PIL import Image as _Image
+    import io as _io
+    import tempfile as _tmpf
+    import zipfile as _zf
+    ls_url = ls_url.rstrip("/")
+    tmp = _tmpf.mkdtemp(prefix="yolozip_")
+    try:
+        images_dir = os.path.join(tmp, "images")
+        labels_dir = os.path.join(tmp, "labels")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        class_map: dict[str, int] = {}
+        for task_item in json_data:
+            image_url = task_item.get("data", {}).get("image", "")
+            if not image_url:
+                continue
+            task_id = task_item.get("id", "unknown")
+            fname = f"task_{task_id}.jpg"
+            img_path = os.path.join(images_dir, fname)
+            try:
+                if image_bytes_map and fname in image_bytes_map:
+                    img_bytes = image_bytes_map[fname]
+                elif image_url.startswith("data:"):
+                    _, data = image_url.split(",", 1)
+                    img_bytes = _b64.b64decode(data)
+                else:
+                    url = re.sub(r"https?://[^/]+", ls_url, image_url)
+                    r = _req.get(url, headers={"Authorization": f"Token {ls_token}"}, timeout=60)
+                    r.raise_for_status()
+                    img_bytes = r.content
+                _Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path, "JPEG")
+            except Exception as e:
+                print(f"[warn] Cannot fetch image task {task_id}: {e}")
+                continue
+            yolo_lines: list[str] = []
+            for ann in task_item.get("annotations", []):
+                for res in ann.get("result", []):
+                    val = res.get("value", {})
+                    res_type = res.get("type", "")
+                    if res_type == "polygonlabels" or "polygonlabels" in val:
+                        labels_list = val.get("polygonlabels", [])
+                        if not labels_list:
+                            continue
+                        label = labels_list[0]
+                        if label not in class_map:
+                            class_map[label] = len(class_map)
+                        cls_id = class_map[label]
+                        points = val.get("points", [])
+                        if len(points) < 3:
+                            continue
+                        norm_pts = " ".join(f"{p[0]/100:.6f} {p[1]/100:.6f}" for p in points)
+                        yolo_lines.append(f"{cls_id} {norm_pts}")
+                    elif res_type == "rectanglelabels" or "rectanglelabels" in val:
+                        labels_list = val.get("rectanglelabels", [])
+                        if not labels_list:
+                            continue
+                        label = labels_list[0]
+                        if label not in class_map:
+                            class_map[label] = len(class_map)
+                        cls_id = class_map[label]
+                        x_pct = float(val.get("x", 0))
+                        y_pct = float(val.get("y", 0))
+                        w_pct = float(val.get("width", 0))
+                        h_pct = float(val.get("height", 0))
+                        if task == "segment":
+                            # bbox → 4-corner polygon (YOLO-seg format)
+                            x1, y1 = x_pct / 100.0, y_pct / 100.0
+                            x2, y2 = (x_pct + w_pct) / 100.0, y1
+                            x3, y3 = x2, (y_pct + h_pct) / 100.0
+                            x4, y4 = x1, y3
+                            yolo_lines.append(
+                                f"{cls_id} {x1:.6f} {y1:.6f} {x2:.6f} {y2:.6f} "
+                                f"{x3:.6f} {y3:.6f} {x4:.6f} {y4:.6f}"
+                            )
+                        else:
+                            # YOLO detect: cx cy w h
+                            cx = (x_pct + w_pct / 2) / 100.0
+                            cy = (y_pct + h_pct / 2) / 100.0
+                            nw = w_pct / 100.0
+                            nh = h_pct / 100.0
+                            yolo_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+            if yolo_lines:
+                label_path = os.path.join(labels_dir, fname.replace(".jpg", ".txt"))
+                with open(label_path, "w") as lf:
+                    lf.write("\n".join(yolo_lines) + "\n")
+        if not class_map:
+            raise RuntimeError("No labelled bounding boxes found in JSON export")
+        names_list = [k for k, _ in sorted(class_map.items(), key=lambda kv: kv[1])]
+        yaml_path = os.path.join(tmp, "dataset.yaml")
+        with open(yaml_path, "w") as yf:
+            yf.write(f"path: .\n")
+            yf.write(f"train: images\n")
+            yf.write(f"val: images\n")
+            yf.write(f"nc: {len(names_list)}\n")
+            yf.write(f"names: {json.dumps(names_list)}\n")
+        buf = _io.BytesIO()
+        with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(tmp):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    arc = os.path.relpath(full, tmp)
+                    zf.write(full, arc)
+        return buf.getvalue()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 # Vision training script (runs on Ray cluster — supports Ultralytics YOLO and PyTorch/TIMM)
 _VISION_TRAIN_SCRIPT = r'''
@@ -998,10 +1559,21 @@ def download_images_from_ls(json_data, out_dir, ls_url, ls_token):
     return downloaded
 
 
-def prepare_yolo_dataset_from_json(json_data, out_dir, ls_url, ls_token, task="detect"):
+def prepare_yolo_dataset_from_json(json_data, out_dir, ls_url, ls_token, task="detect",
+                                  image_bytes_map=None):
     """Convert Label Studio JSON export → YOLO detection or segmentation format.
-    task='detect'  → cx cy w h (normalised)
-    task='segment' → polygon points (4-corner rect from bbox, or actual polygonlabels)
+
+    task='detect'  → cls + cx cy w h (normalised, 5 cols per line)
+    task='segment' → cls + polygon points (variable cols; rectanglelabels get
+                     converted to a 4-corner polygon since LS rectanglelabels
+                     don't carry their own polygon vertices).
+
+    image_bytes_map (optional): dict[str, bytes] mapping filename → raw image
+    bytes. When provided, the function uses these instead of fetching via
+    ls_url/ls_token. Used by the inline JSON→YOLO zip conversion in
+    main() which already has the data-URI images decoded in memory and
+    needs to avoid a second round-trip through the Label Studio server.
+
     Creates out_dir/images/ and out_dir/labels/, then writes dataset.yaml.
     Returns path to dataset.yaml.
     """
@@ -1027,7 +1599,10 @@ def prepare_yolo_dataset_from_json(json_data, out_dir, ls_url, ls_token, task="d
 
         # Download / decode image
         try:
-            if image_url.startswith("data:"):
+            if fname in (image_bytes_map or {}):
+                # Caller already decoded the data URI / fetched the URL.
+                img_bytes = image_bytes_map[fname]
+            elif image_url.startswith("data:"):
                 _, data = image_url.split(",", 1)
                 img_bytes = _b64.b64decode(data)
             else:
@@ -1310,6 +1885,62 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
 
     random.shuffle(samples)
     n_val = max(1, int(0.2 * len(samples)))
+    # Some models (e.g. efficientvit_m5) have a FIXED input size — they
+    # will hard-fail with feature-map mismatches if we feed the wrong
+    # resolution. Always honour the model's default in that case.
+    timm_name = model_name.replace("-", "_")
+    # ── Model name alias map ──────────────────────────────────────────────────
+    # The catalog uses torchvision-style names for some models (e.g.
+    # `regnet_y_400mf`), but the rest of this function talks to TIMM,
+    # which uses different names (e.g. `regnety_004`). Without this map
+    # TIMM raises "Unknown model" and the user sees a confusing error
+    # with no hint about the right name to use. Keys are catalog names;
+    # values are the TIMM equivalent.
+    _TIMM_ALIAS = {
+        "regnet_y_400mf":   "regnety_004",
+        "regnet_y_800mf":   "regnety_008",
+        "regnet_y_1_6gf":   "regnety_016",
+        "regnet_y_3_2gf":   "regnety_032",
+        "regnet_y_8gf":     "regnety_080",
+        "regnet_y_16gf":    "regnety_160",
+        "regnet_y_32gf":    "regnety_320",
+        "regnet_z_500mf":   "regnetz_005",
+        # EfficientNet — TIMM ships the original TF-pretrained weights under
+        # `tf_efficientnet_b{0..7}`; the plain `efficientnet_b4` only has
+        # noisy-students weights. We default to the TF version (the
+        # smaller, faster, better-known checkpoint).
+        "efficientnet-b0":  "tf_efficientnet_b0",
+        "efficientnet-b1":  "tf_efficientnet_b1",
+        "efficientnet-b2":  "tf_efficientnet_b2",
+        "efficientnet-b3":  "tf_efficientnet_b3",
+        "efficientnet-b4":  "tf_efficientnet_b4",
+        "efficientnet-b5":  "tf_efficientnet_b5",
+        "efficientnet-b6":  "tf_efficientnet_b6",
+        "efficientnet-b7":  "tf_efficientnet_b7",
+    }
+    if timm_name in _TIMM_ALIAS:
+        _alias_target = _TIMM_ALIAS[timm_name]
+        print(f"[train] aliasing {timm_name} → {_alias_target} for TIMM", flush=True)
+        timm_name = _alias_target
+    _model_default_input = None
+    _model_fixed = False
+    try:
+        import timm as _timm
+        _cfg = _timm.get_pretrained_cfg(timm_name)
+        if _cfg is not None:
+            _in = getattr(_cfg, "input_size", None)
+            if isinstance(_in, (list, tuple)) and len(_in) >= 3:
+                _model_default_input = _in[-1]  # H or W
+            _model_fixed = bool(getattr(_cfg, "fixed_input_size", False))
+    except Exception:
+        pass
+    if _model_fixed and _model_default_input:
+        if imgsz != _model_default_input:
+            print(f"[train] {timm_name} requires input_size={_model_default_input} (fixed) — overriding imgsz={imgsz}")
+            imgsz = _model_default_input
+    elif _model_default_input and abs(_model_default_input - imgsz) > 32:
+        print(f"[train] imgsz={imgsz} doesn't match {timm_name} default {_model_default_input} — using {_model_default_input}")
+        imgsz = _model_default_input
     tf_tr = transforms.Compose([
         transforms.Resize((imgsz, imgsz)),
         transforms.RandomHorizontalFlip(),
@@ -1322,14 +1953,118 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-    train_dl = DataLoader(ImgDS(samples[:-n_val], tf_tr), batch_size=batch, shuffle=True)
-    val_dl   = DataLoader(ImgDS(samples[-n_val:], tf_vl), batch_size=batch)
+    train_dl = DataLoader(ImgDS(samples[:-n_val], tf_tr), batch_size=batch, shuffle=True, drop_last=True)
+    val_dl   = DataLoader(ImgDS(samples[-n_val:], tf_vl), batch_size=batch, drop_last=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # TIMM uses underscores: efficientnet-b2 → efficientnet_b2
-    timm_name = model_name.replace("-", "_")
-    print(f"[train] Device: {device} | model: {timm_name}")
-    model = timm.create_model(timm_name, pretrained=True, num_classes=nc).to(device)
+    print(f"[train] Device: {device} | model: {timm_name} | imgsz={imgsz}")
+    # ── torchxrayvision branch ──────────────────────────────────────────────
+    # `densenet121-res224-all` and other TorchXRayVision medical models are
+    # NOT in the TIMM registry — they're a separate library with a different
+    # loader API (xrv.models.DenseNet(weights="densenet121-res224-all")).
+    # TIMM's create_model() raises a confusing "not a valid model" error if
+    # we route them through here, so detect and dispatch instead.
+    # Note: xrv's weights param uses the original dashed name, not the
+    # underscored `timm_name` we computed above.
+    _is_xrv_model = model_name.lower().startswith("densenet") and "res224" in model_name.lower()
+    if _is_xrv_model:
+        import torchxrayvision as xrv
+        # xrv expects a single-channel 224x224 input with specific mean/std
+        # normalization. We override the user's imgsz since the weights are
+        # trained on 224. Also the model outputs (1, num_classes_xrv) for the
+        # 18 X-ray pathologies, not the user's label count — we wrap it with
+        # a fresh linear head to map to our `nc` classes.
+        if imgsz != 224:
+            print(f"[train] {timm_name} is fixed at 224x224 (xrv weights) — overriding imgsz={imgsz}")
+            imgsz = 224
+        xrv_model = xrv.models.DenseNet(weights=model_name)
+        # The xrv DenseNet.forward() runs an internal `op_norm()` step that
+        # multiplies the features by a buffer sized to the model's
+        # pathology count (18 for densenet121-res224-all). Simply swapping
+        # `self.classifier` to a different output size makes op_norm
+        # broadcast a (1, 18) tensor against a (B, nc) feature map → crash
+        # with "tensor a (3) must match tensor b (18)". The clean fix is
+        # to bypass xrv's full forward() entirely and use only its feature
+        # extractor (the conv stack) + our own linear classifier.
+        class _XRVEncoderClassifier(nn.Module):
+            def __init__(self, xrv_base: nn.Module, num_classes: int):
+                super().__init__()
+                # Pull out the conv backbone (everything up to the
+                # adaptive pool + flatten) and discard the pathology head.
+                self.features = xrv_base.features
+                feat_dim = self._infer_feature_dim()
+                self.classifier = nn.Linear(feat_dim, num_classes)
+            def _infer_feature_dim(self) -> int:
+                # xrv.features ends in adaptive_avg_pool2d((7,7)) NOT (1,1),
+                # so the output is (1, C, 7, 7). We must run the pool
+                # ourselves to get the per-image feature size (C), not
+                # C*7*7 = 50176.
+                with torch.no_grad():
+                    self.features.eval()
+                    dummy = torch.zeros(1, 1, imgsz, imgsz)
+                    out = self.features(dummy)
+                    if out.dim() > 2:
+                        out = nn.functional.adaptive_avg_pool2d(out, (1, 1))
+                    return int(out.flatten(1).shape[-1])
+            def forward(self, x):
+                f = self.features(x)
+                if f.dim() > 2:
+                    f = nn.functional.adaptive_avg_pool2d(f, (1, 1)).view(f.size(0), -1)
+                return self.classifier(f)
+        model = _XRVEncoderClassifier(xrv_model, nc).to(device)
+        # Use a single-channel transform (xrv default) instead of 3-channel
+        tf_tr_xrv = transforms.Compose([
+            transforms.Resize((imgsz, imgsz)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),  # xrv's default mean/std
+        ])
+        tf_vl_xrv = transforms.Compose([
+            transforms.Resize((imgsz, imgsz)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+        train_dl = DataLoader(ImgDS(samples[:-n_val], tf_tr_xrv), batch_size=batch, shuffle=True, drop_last=True)
+        val_dl   = DataLoader(ImgDS(samples[-n_val:], tf_vl_xrv), batch_size=batch, drop_last=False)
+    elif (
+        # ── DINOv2-style encoder models ─────────────────────────────────────
+        # DINOv2 (and HF models that use DINOv2 backbones — MahmoodLab/UNI,
+        # microsoft/rad-dino) ship as VISION ENCODERS: they output
+        # (batch, embed_dim) features, NOT (batch, num_classes) logits.
+        # `timm.create_model("vit_base_patch14_dinov2", num_classes=nc)`
+        # works for downstream linear-probe because TIMM has a registered
+        # classification head, BUT it ignores the self-supervised
+        # pretraining (uses the head, not the encoder features). For
+        # linear-probe the cleanest approach is:
+        #   1. Load the model with num_classes=0 → no head, just features
+        #   2. Pool the output (DINOv2 ViT-B/14 uses [CLS]-style tokens)
+        #   3. Add a fresh nn.Linear(embed_dim, num_classes)
+        # This works the same for HF models that share the DINOv2
+        # architecture (rad-dino, UNI) when called via timm.create_model
+        # with the hf-hub:org/repo prefix stripped.
+        (timm_name.startswith("vit_base_patch14_dinov2")
+         or timm_name == "vit_small_patch14_dinov2"
+         or timm_name in ("vit_small_patch14_reg4_dinov2",
+                          "vit_base_patch14_reg4_dinov2"))
+    ):
+        print(f"[train] loading {timm_name} as DINOv2-style encoder (no head) + custom classifier")
+        # num_classes=0 makes timm drop the classification head and
+        # return the pooled feature vector.
+        encoder = timm.create_model(timm_name, pretrained=True, num_classes=0)
+        embed_dim = encoder.num_features
+        class _DinoV2LinearProbe(nn.Module):
+            def __init__(self, enc: nn.Module, embed_dim: int, num_classes: int):
+                super().__init__()
+                self.encoder = enc
+                self.classifier = nn.Linear(embed_dim, num_classes)
+            def forward(self, x):
+                feats = self.encoder(x)
+                return self.classifier(feats)
+        model = _DinoV2LinearProbe(encoder, embed_dim, nc).to(device)
+    else:
+        model = timm.create_model(timm_name, pretrained=True, num_classes=nc).to(device)
 
     crit = nn.CrossEntropyLoss()
     opt_map = {
@@ -1368,97 +2103,6 @@ def train_pytorch_classification(img_dir, model_name, epochs, imgsz, batch, lr, 
             }, best_path)
     print(f"[train] Best val_acc: {best_acc:.4f}")
     upload_to_minio(best_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
-
-
-def train_unsloth_llm(model_name, text_dataset, max_seq_len, lora_rank, quantization,
-                       epochs, batch, grad_accum, lr, chat_template,
-                       job_id, w_bucket, w_key, minio_url, minio_access, minio_secret):
-    """Fine-tune an LLM with Unsloth + TRL SFTTrainer. Saves LoRA adapter to MinIO."""
-    import zipfile as _zf, tempfile as _tmp, shutil as _sh
-    from unsloth import FastLanguageModel
-    from trl import SFTTrainer, SFTConfig
-    from datasets import load_dataset, Dataset as HFDataset
-    import torch as _torch
-
-    load_in_4bit = (quantization in ("4bit", "4-bit", "bnb-4bit"))
-    print(f"[train] Loading {model_name}  4bit={load_in_4bit}  lora_r={lora_rank}  seq={max_seq_len}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name, max_seq_length=max_seq_len,
-        dtype=None, load_in_4bit=load_in_4bit,
-    )
-    model = FastLanguageModel.get_peft_model(
-        model, r=lora_rank,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=lora_rank, lora_dropout=0, bias="none",
-        use_gradient_checkpointing="unsloth", random_state=42,
-    )
-    # Load dataset  (HuggingFace dataset id or JSONL string)
-    print(f"[train] Loading text dataset: {text_dataset}")
-    try:
-        ds = load_dataset(text_dataset, split="train")
-    except Exception as e:
-        print(f"[warn] HF load failed ({e}), treating as JSONL string / inline data")
-        import json as _json
-        rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
-        ds = HFDataset.from_list(rows)
-
-    # Build conversation field
-    text_field = None
-    for candidate in ("text", "conversations", "messages", "instruction"):
-        if candidate in ds.column_names:
-            text_field = candidate
-            break
-    if text_field is None:
-        raise RuntimeError(f"Dataset has no recognized text column. Columns: {ds.column_names}")
-    print(f"[train] Dataset: {len(ds)} rows, text_field='{text_field}'")
-
-    # Format conversations if needed
-    if text_field in ("conversations", "messages"):
-        def fmt_conv(ex):
-            parts = ex[text_field]
-            out = ""
-            for turn in (parts if isinstance(parts, list) else []):
-                role = turn.get("from", turn.get("role", "user"))
-                content = turn.get("value", turn.get("content", ""))
-                if role in ("human", "user"):
-                    out += f"<|user|>\n{content}\n"
-                else:
-                    out += f"<|assistant|>\n{content}\n"
-            return {"text": out}
-        ds = ds.map(fmt_conv)
-        text_field = "text"
-
-    save_dir = f"/tmp/lora_{job_id}"
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=ds,
-        args=SFTConfig(
-            dataset_text_field=text_field,
-            per_device_train_batch_size=batch,
-            gradient_accumulation_steps=grad_accum,
-            warmup_steps=5,
-            num_train_epochs=epochs,
-            learning_rate=lr,
-            fp16=not _torch.cuda.is_bf16_supported(),
-            bf16=_torch.cuda.is_bf16_supported(),
-            logging_steps=1,
-            output_dir=save_dir,
-            save_strategy="no",
-        ),
-    )
-    trainer.train()
-    print("[train] LLM training complete, saving LoRA adapter ...")
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    # Zip the adapter and upload
-    zip_path = f"/tmp/lora_{job_id}.zip"
-    with _zf.ZipFile(zip_path, "w", _zf.ZIP_DEFLATED) as zf:
-        for fp in Path(save_dir).rglob("*"):
-            if fp.is_file():
-                zf.write(fp, fp.relative_to(save_dir))
-    upload_to_minio(zip_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
 
 
 def train_monai(data_dir, model_name, training_type, epochs, imgsz, batch, lr,
@@ -2062,6 +2706,50 @@ def train_self_supervised(img_dir, model_name, epochs, imgsz, batch, lr, job_id,
     print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
 
 
+def _move_batch_to_device(batch, device):
+    """Recursively move every tensor inside a batch dict/list/BatchFeature to ``device``.
+
+    HuggingFace detection pipelines return a BatchFeature like
+    ``{"pixel_values": Tensor, "labels": [{"boxes": Tensor, "class_labels": Tensor}, ...]}``
+    where ``labels`` is a list of per-image dicts. BatchFeature's own
+    ``.to()`` is shallow — it moves the top-level Tensor values
+    (``pixel_values``) but does NOT descend into the nested list-of-dicts
+    in ``labels``. The Hungarian matcher then crashes at
+    ``torch.cdist(out_bbox, target_bbox, p=1)`` with
+    "Expected all tensors to be on the same device, but found at least
+    two devices, cuda:0 and cpu!".
+
+    Implementation:
+    - Detect BatchFeature (duck-typed: has ``data`` dict attribute) and
+      unwrap to that dict, so we recursively walk the same way.
+    - Duck-type ``Tensor`` as anything with a ``.to(device)`` method.
+    - Recurse into dicts, lists, tuples.
+    - Leaves everything else (strs, ints, None) untouched.
+
+    Using duck-typing for the tensor check also lets the helper work
+    before ``torch`` is imported at module top level — calling
+    ``isinstance(batch, torch.Tensor)`` from inside the _VISION_TRAIN_SCRIPT
+    string would NameError because the helper runs before any
+    ``import torch`` statement executes.
+    """
+    # Unwrap BatchFeature: it has a `.data` dict but its own shallow .to()
+    if hasattr(batch, "data") and isinstance(getattr(batch, "data", None), dict) \
+            and not isinstance(batch, dict):
+        return _move_batch_to_device(dict(batch.data), device)
+    if hasattr(batch, "to") and callable(batch.to):
+        # Real Tensor / numpy / etc. Try to move; fall back to original on error.
+        try:
+            return batch.to(device)
+        except Exception:
+            return batch
+    if isinstance(batch, dict):
+        return {k: _move_batch_to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        moved = [_move_batch_to_device(v, device) for v in batch]
+        return type(batch)(moved) if isinstance(batch, tuple) else moved
+    return batch
+
+
 def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, optimizer,
                     job_id, w_bucket, w_key, minio_url, minio_access, minio_secret):
     """Fine-tune a HuggingFace vision model (DETR detection or ViT classification)."""
@@ -2124,7 +2812,68 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
     split = max(1, int(len(all_images) * 0.9))
     train_imgs, val_imgs = all_images[:split], all_images[split:] or all_images[:1]
 
-    processor = AutoImageProcessor.from_pretrained(model_name)
+    # ── Validate HF access BEFORE doing dataset prep (fail fast) ──────────
+    # Gated models (e.g. MahmoodLab/UNI, microsoft/rad-dino) return 401/403
+    # with an opaque "Access to model ... is restricted" message that's
+    # hard to debug in the worker log. Two checks up front:
+    #   1. If no HF_TOKEN at all → tell user to set one
+    #   2. If gated AND has token, probe a real file download — many
+    #      gated models (UNIs, rad-dino) require EXPLICIT APPROVAL on
+    #      the HF model page before any token works. A 403 here means
+    #      the user needs to go to the model page and click "Agree and
+    #      access repository", then retry.
+    _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+    _hf_token_present = bool(_hf_token)
+    _is_gated = False
+    _gated_kind = None  # "auto" / "manual" / "false"
+    try:
+        from huggingface_hub import HfApi
+        _api = HfApi(token=_hf_token)
+        _model_info = _api.model_info(model_name)
+        _g = getattr(_model_info, "gated", False)
+        _gated_kind = _g if isinstance(_g, str) else ("true" if _g else "false")
+        _is_gated = bool(_g) and _gated_kind != "false"
+    except Exception:
+        pass  # probe itself failed — let the actual download report the error
+
+    if _is_gated and not _hf_token_present:
+        raise RuntimeError(
+            f"Model '{model_name}' is a GATED HuggingFace model — it requires "
+            f"a HuggingFace token.\n"
+            f"  → In this UI: Profile → HuggingFace Token → paste your token (from "
+            f"https://huggingface.co/settings/tokens) → Save.\n"
+            f"  → Or set HF_TOKEN in the medimage-api container's environment."
+        )
+
+    if _is_gated and _hf_token_present and _gated_kind in ("manual", "auto", "true"):
+        # Many gated repos require the user to explicitly request
+        # access on the HF model page BEFORE their token works. Probe
+        # by trying to fetch a tiny metadata file — if the HF API
+        # returns 403/401 the user hasn't been approved yet.
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(
+                repo_id=model_name, filename="config.json",
+                token=_hf_token, cache_dir=None,
+            )
+        except Exception as _probe_err:
+            _err_str = str(_probe_err).lower()
+            if any(t in _err_str for t in ("403", "401", "gated", "restricted", "authorized list")):
+                raise RuntimeError(
+                    f"Model '{model_name}' is GATED and your HF token is not in the "
+                    f"authorized list.\n"
+                    f"  → Go to https://huggingface.co/{model_name} in a browser\n"
+                    f"  → Click the 'Agree and access repository' button (you may need "
+                    f"to log in with the same HF account that owns the token set in "
+                    f"your Profile)\n"
+                    f"  → Wait ~1 min for HF to propagate the approval\n"
+                    f"  → Retry the test-all run\n"
+                    f"\nUnderlying error: {_probe_err}"
+                ) from _probe_err
+
+    processor = AutoImageProcessor.from_pretrained(
+        model_name, trust_remote_code=True, token=_hf_token or True
+    )
 
     if training_type == "detection":
         from transformers import AutoModelForObjectDetection
@@ -2150,10 +2899,26 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
                                 cls_id, cx, cy, w, h = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
                                 boxes.append([cx, cy, w, h])
                                 labels.append(cls_id)
-                # DETR expects center format [cx,cy,w,h] normalised — matches YOLO
+                # COCO format expected by DETR/YOLOS ImageProcessor:
+                #   bbox = [x_top_left, y_top_left, width, height]  in ABSOLUTE pixels
+                #   category_id = int class index
+                #   area = w * h
+                #   iscrowd = 0
+                # The image processor's do_convert_annotations=True (default)
+                # then re-projects these to relative [cx, cy, w, h] in [0, 1] and
+                # builds the final {"class_labels": LongTensor, "boxes": FloatTensor}
+                # entry that YolosForObjectDetection.forward expects.
+                img_w, img_h = image.size
                 annotations = {"image_id": idx, "annotations": [
-                    {"bbox": b, "category_id": l, "area": b[2]*b[3], "iscrowd": 0}
-                    for b, l in zip(boxes, labels)
+                    {
+                        "bbox": [cx * img_w - w * img_w / 2,
+                                 cy * img_h - h * img_h / 2,
+                                 w * img_w, h * img_h],
+                        "category_id": l,
+                        "area": (w * img_w) * (h * img_h),
+                        "iscrowd": 0,
+                    }
+                    for (cx, cy, w, h), l in zip(boxes, labels)
                 ]}
                 return image, annotations
 
@@ -2167,7 +2932,9 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         _UNSUPPORTED_DET = ("grounding_dino", "owlvit", "owlv2", "sam", "gdino")
         try:
             from transformers import AutoConfig
-            _cfg_type = type(AutoConfig.from_pretrained(model_name)).__name__.lower()
+            _cfg_type = type(AutoConfig.from_pretrained(
+                model_name, trust_remote_code=True, token=_hf_token or True
+            )).__name__.lower()
             if any(u in _cfg_type for u in _UNSUPPORTED_DET):
                 raise RuntimeError(
                     f"Model '{model_name}' ({_cfg_type}) is a zero-shot / open-vocabulary detector "
@@ -2183,7 +2950,8 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         model = AutoModelForObjectDetection.from_pretrained(
             model_name, num_labels=num_classes,
             id2label=id2label, label2id=label2id,
-            ignore_mismatched_sizes=True
+            ignore_mismatched_sizes=True,
+            trust_remote_code=True, token=_hf_token or True,
         )
 
     elif training_type == "classification":
@@ -2215,7 +2983,8 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         model = AutoModelForImageClassification.from_pretrained(
             model_name, num_labels=num_classes,
             id2label=id2label, label2id=label2id,
-            ignore_mismatched_sizes=True
+            ignore_mismatched_sizes=True,
+            trust_remote_code=True, token=_hf_token or True,
         )
     else:
         raise RuntimeError(f"HuggingFace training not supported for type={training_type}")
@@ -2241,8 +3010,7 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         model.train()
         total_loss = 0.0
         for batch_enc in train_dl:
-            batch_enc = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                         for k, v in batch_enc.items()}
+            batch_enc = _move_batch_to_device(batch_enc, device)
             optimizer_fn.zero_grad()
             outputs = model(**batch_enc)
             loss = outputs.loss
@@ -2256,8 +3024,7 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         val_loss = 0.0
         with torch.no_grad():
             for batch_enc in val_dl:
-                batch_enc = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch_enc.items()}
+                batch_enc = _move_batch_to_device(batch_enc, device)
                 outputs = model(**batch_enc)
                 val_loss += outputs.loss.item()
         avg_val = val_loss / max(len(val_dl), 1)
@@ -2278,133 +3045,10 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
 
     print(f"[train] Best val_loss: {best_loss:.4f}")
     upload_to_minio(best_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
-    print(f"WEIGHTS_UPLOADED:{w_key}")
-
-
-def train_vlm_finetune(model_name, text_dataset, max_seq_len, lora_rank, quantization,
-                        epochs, batch, grad_accum, lr, chat_template, job_id,
-                        w_bucket, w_key, minio_url, minio_access, minio_secret,
-                        img_dir=None):
-    """Fine-tune a Vision Language Model (LLaVA-style) using HuggingFace transformers + PEFT LoRA."""
-    import zipfile as _zf
-    import torch
-    from transformers import (
-        AutoProcessor, AutoModelForVision2Seq,
-        BitsAndBytesConfig, TrainingArguments, Trainer,
-    )
-    from peft import LoraConfig, get_peft_model
-    from datasets import load_dataset, Dataset as HFDataset
-    from PIL import Image as _Image
-    import io as _io, base64 as _b64, glob as _glob
-
-    print(f"[train] VLM fine-tune — model: {model_name}  lora_r={lora_rank}")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Quantization config
-    load_in_4bit = quantization in ("4bit", "4-bit", "bnb-4bit")
-    bnb_cfg = BitsAndBytesConfig(
-        load_in_4bit=load_in_4bit,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    ) if load_in_4bit else None
-
-    print(f"[train] Loading processor and model ...")
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-    vlm = AutoModelForVision2Seq.from_pretrained(
-        model_name,
-        quantization_config=bnb_cfg,
-        torch_dtype=torch.bfloat16 if not load_in_4bit else None,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-
-    # Apply LoRA
-    lora_cfg = LoraConfig(
-        r=lora_rank, lora_alpha=lora_rank * 2,
-        target_modules="all-linear",
-        lora_dropout=0.05, bias="none",
-        task_type="CAUSAL_LM",
-    )
-    vlm = get_peft_model(vlm, lora_cfg)
-    vlm.print_trainable_parameters()
-
-    # Load text/vision dataset
-    print(f"[train] Loading dataset: {text_dataset}")
-    try:
-        ds = load_dataset(text_dataset, split="train")
-    except Exception as e:
-        print(f"[warn] HF load failed ({e}), trying as JSONL")
-        import json as _json
-        rows = [_json.loads(l) for l in text_dataset.splitlines() if l.strip()]
-        ds = HFDataset.from_list(rows)
-
-    # Collect local images if img_dir provided
-    local_imgs = {}
-    if img_dir and os.path.isdir(img_dir):
-        for ext in ("*.jpg", "*.jpeg", "*.png"):
-            for p in _glob.glob(os.path.join(img_dir, "**", ext), recursive=True):
-                local_imgs[os.path.basename(p)] = p
-
-    # Tokenize and format for VLM
-    def preprocess(examples):
-        texts, images = [], []
-        for i in range(len(examples.get("text", examples.get("instruction", [""]*len(examples))))):
-            # Build prompt
-            instr_key = "text" if "text" in examples else "instruction"
-            output_key = "output" if "output" in examples else "response"
-            instruction = examples[instr_key][i] if instr_key in examples else ""
-            output = examples[output_key][i] if output_key in examples else ""
-            prompt = f"<|user|>\n{instruction}\n<|assistant|>\n{output}"
-            texts.append(prompt)
-            # Image: try to get from dataset or local
-            img = None
-            if "image" in examples and examples["image"][i] is not None:
-                raw = examples["image"][i]
-                if isinstance(raw, str) and raw.startswith("data:"):
-                    _, data = raw.split(",", 1)
-                    img = _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
-                elif isinstance(raw, _Image.Image):
-                    img = raw.convert("RGB")
-            if img is None:
-                img = _Image.new("RGB", (imgsz if 'imgsz' in dir() else 224,
-                                          imgsz if 'imgsz' in dir() else 224), (128, 128, 128))
-            images.append(img)
-        enc = processor(text=texts, images=images, return_tensors="pt",
-                        padding=True, truncation=True, max_length=max_seq_len)
-        enc["labels"] = enc["input_ids"].clone()
-        return enc
-
-    imgsz = 224  # default VLM image size
-    print(f"[train] Preprocessing {len(ds)} examples ...")
-    ds = ds.map(preprocess, batched=True, batch_size=4, remove_columns=ds.column_names)
-    ds.set_format("torch")
-
-    save_dir = f"/tmp/vlm_{job_id}"
-    train_args = TrainingArguments(
-        output_dir=save_dir,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        fp16=False, bf16=torch.cuda.is_bf16_supported(),
-        logging_steps=10,
-        save_strategy="no",
-        dataloader_num_workers=0,
-        remove_unused_columns=False,
-    )
-    trainer = Trainer(model=vlm, args=train_args, train_dataset=ds)
-    trainer.train()
-    print("[train] VLM training complete. Saving LoRA adapter ...")
-    vlm.save_pretrained(save_dir)
-    processor.save_pretrained(save_dir)
-
-    zip_path = f"/tmp/vlm_{job_id}.zip"
-    with _zf.ZipFile(zip_path, "w", _zf.ZIP_DEFLATED) as zf:
-        for fp in Path(save_dir).rglob("*"):
-            if fp.is_file():
-                zf.write(fp, fp.relative_to(save_dir))
-    upload_to_minio(zip_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
+    # Emit the full s3:// URI, not just the key. The outer reconciler
+    # parses WEIGHTS_UPLOADED lines and verifies the object exists in
+    # MinIO; if the line only has the key, the parser has to guess
+    # the bucket (and the previous version of that guesser was buggy).
     print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
 
 
@@ -2434,7 +3078,38 @@ def train_ultralytics(yaml_path, data_dir, model_name, training_type, epochs, im
             sys.modules[_m] = _types.ModuleType(_m)
     from ultralytics import YOLO
     print(f"[train] Loading model: {model_name}")
-    model = YOLO(model_name)
+    # Resolve non-standard .pt filenames to a HF Hub repo if the file isn't
+    # available locally. Ultralytics YOLO() will try to fetch `yolov8s.pt` etc.
+    # from its own model index, but community weights (road-damage-yolov8s.pt,
+    # rtdetr-l.pt etc.) need to be downloaded explicitly. Format: "hf_repo:filename"
+    # or just a HF repo path; we default to looking up the same basename.
+    _model_name = model_name
+    if not _model_name.endswith(".pt"):
+        pass  # not a .pt — assume Ultralytics knows it
+    else:
+        import os as _os
+        if not _os.path.isfile(_model_name):
+            # Try a few well-known HF repos for the same basename.
+            _basename = _os.path.basename(_model_name)
+            _candidates = []
+            if "road-damage" in _basename or "rdd" in _basename.lower():
+                _candidates.append(("oracl4/RoadDamageDetection", _basename))
+                _candidates.append(("oracl4/RoadDamageDetection", "best.pt"))
+                _candidates.append(("ozair23/yolov8-road-damage-detector", "best.pt"))
+            if "rtdetr" in _basename.lower():
+                _candidates.append(("Intel/RT-DETR", _basename))
+            for _repo, _fn in _candidates:
+                try:
+                    from huggingface_hub import hf_hub_download
+                    print(f"[train] weights {model_name!r} not found locally; trying {_repo}::{_fn} ...")
+                    _local = hf_hub_download(repo_id=_repo, filename=_fn, cache_dir=None)
+                    print(f"[train] Downloaded weights: {_local}")
+                    _model_name = _local
+                    break
+                except Exception as _dl_err:
+                    print(f"[train] HF download failed: {_dl_err}")
+                    continue
+    model = YOLO(_model_name)
     print(f"[train] Training started ...")
     results = model.train(
         data=yaml_path,
@@ -2442,10 +3117,18 @@ def train_ultralytics(yaml_path, data_dir, model_name, training_type, epochs, im
         optimizer=optimizer, project="/tmp/yolo_runs", name=job_id,
         exist_ok=True, verbose=True,
     )
-    print(f"[train] Training done. Save dir: {results.save_dir}")
-    best_pt = Path(results.save_dir) / "weights" / "best.pt"
+    # ultralytics >= 8.x: model.train() returns the Results object on
+    # success, but on certain validation/edge cases it can return None.
+    # We always fall back to the on-disk save dir + best.pt path so the
+    # training pipeline can continue even when results is None.
+    save_dir = getattr(results, "save_dir", None) if results is not None else None
+    if save_dir is None:
+        save_dir = f"/tmp/yolo_runs/{job_id}"
+        print(f"[train] results.save_dir is None; falling back to {save_dir}")
+    print(f"[train] Training done. Save dir: {save_dir}")
+    best_pt = Path(save_dir) / "weights" / "best.pt"
     if not best_pt.exists():
-        best_pt = Path(results.save_dir) / "weights" / "last.pt"
+        best_pt = Path(save_dir) / "weights" / "last.pt"
     if not best_pt.exists():
         print("[train] ERROR: No weights file found after training!")
         sys.exit(1)
@@ -2467,6 +3150,7 @@ def main():
     lr            = float(os.environ.get("LR", "0.001"))
     optimizer     = os.environ.get("OPTIMIZER", "AdamW")
     job_id        = os.environ.get("JOB_ID", "unknown")
+    project_id    = int(os.environ.get("PROJECT_ID", "0") or 0)
     dataset_url   = os.environ.get("DATASET_URL", "")
     w_bucket      = os.environ.get("WEIGHTS_BUCKET", "medimage-weights")
     w_key         = os.environ.get("WEIGHTS_KEY", f"{job_id}/best.pt")
@@ -2490,27 +3174,13 @@ def main():
     print(f"[train] Job {job_id} — engine={engine} type={training_type} model={model_name} epochs={epochs}")
 
     # ── Engines that do NOT need an image dataset zip ─────────────────────────
-    # 3-LLM. Unsloth LLM fine-tuning
-    if engine == "Unsloth":
-        if not text_dataset:
-            raise RuntimeError("TEXT_DATASET env var is required for LLM fine-tuning")
-        train_unsloth_llm(
-            model_name, text_dataset, max_seq_len, lora_rank, quantization,
-            epochs, batch, grad_accum, lr, chat_template,
-            job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
-        )
-        print("[train] Complete!")
-        return
-
-    # 3-VLM. HuggingFace VLM fine-tuning (LLaVA-style)
-    if training_type == "vlm-finetune":
-        train_vlm_finetune(
-            model_name, text_dataset, max_seq_len, lora_rank, quantization,
-            epochs, batch, grad_accum, lr, chat_template,
-            job_id, w_bucket, w_key, minio_url, minio_access, minio_secret,
-        )
-        print("[train] Complete!")
-        return
+    # VLM / LLM are handled by vlm_llm_train.py (separate module so changes
+    # to the deep-learning path don't affect them and vice versa). This
+    # _VISION_TRAIN_SCRIPT path only handles the image-dataset engines:
+    # PyTorch, TorchVision, TIMM, MONAI, MedSAM, nnU-Net, Anomalib,
+    # Ultralytics (YOLO), and the HuggingFace vision path. The dispatcher
+    # in main.py:_run_on_ray_cluster routes VLM/LLM jobs to the
+    # vlm_llm_train.run() entry point instead of exec'ing this script.
 
     # 3-HF. HuggingFace vision model fine-tuning (DETR detection, ViT classification)
     if engine == "HuggingFace" and training_type in ("detection", "classification", "segmentation"):
@@ -2946,7 +3616,8 @@ main()
 '''
 
 
-def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO") -> str | None:
+def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO",
+                        training_type: str = "detection") -> str | None:
     """Export Label Studio YOLO dataset, upload zip to MinIO, return presigned download URL."""
     try:
         import requests as _req
@@ -2981,38 +3652,129 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
 
         _append_log(job_id, f"[export] Project '{proj_title}': {task_count} tasks, {labeled} labeled")
 
-        # Try YOLO export first, fall back to JSON
+        # Try YOLO export first, fall back to JSON. If the YOLO zip is
+        # suspiciously small (< 16 KB) it almost certainly has no images
+        # (LS YOLO export plugin doesn't extract data:image/jpeg;base64,...
+        # URIs to files) — fall back to JSON and convert below.
         export_url = f"{LS_API_URL}/api/projects/{project_id}/export"
         fmt_order = [preferred_fmt] + [f for f in ("YOLO", "JSON") if f != preferred_fmt]
-        for fmt in fmt_order:
+        export_data = None
+        fmt = None
+        for _try_fmt in fmt_order:
             resp = _req.get(
                 export_url,
-                params={"exportType": fmt},
+                params={"exportType": _try_fmt},
                 headers={"Authorization": f"Token {LS_TOKEN}"},
                 timeout=300,
                 stream=True,
             )
-            if resp.status_code == 200:
-                _append_log(job_id, f"[export] Exported as {fmt} ({len(resp.content)//1024} KB)")
-                export_data = resp.content
-                break
-        else:
+            if resp.status_code != 200:
+                _append_log(job_id, f"[export] {_try_fmt} export failed (HTTP {resp.status_code})")
+                continue
+            _body = resp.content
+            _append_log(job_id, f"[export] Exported as {_try_fmt} ({len(_body)//1024} KB)")
+            # Inspect the zip — if it has no images/, we need the JSON path
+            # to extract data URI images ourselves.
+            _has_images = False
+            try:
+                import zipfile as _zfchk
+                with _zfchk.ZipFile(__import__("io").BytesIO(_body)) as _zf:
+                    for _n in _zf.namelist():
+                        if _n.startswith("images/") and not _n.endswith("/"):
+                            _has_images = True
+                            break
+            except Exception:
+                _has_images = True  # not a zip (e.g. JSON), keep going
+            if _try_fmt == "YOLO" and not _has_images:
+                _append_log(job_id, f"[export] {_try_fmt} zip has no images/ — falling back to JSON")
+                continue
+            export_data = _body
+            fmt = _try_fmt
+            break
+        if export_data is None or fmt is None:
             raise RuntimeError(
                 f"Label Studio export failed for project {project_id} "
-                f"(last HTTP status: {resp.status_code}) — {resp.text[:200]}"
+                f"(no format produced a zip with images) — last status: {resp.status_code}"
             )
 
         bucket = "medimage-datasets"
         key    = f"{job_id}/dataset.zip"
 
-        # If JSON export, wrap into a zip
+        # If JSON export, build a YOLO-format zip with images extracted
+        # from the base64 data URIs in the JSON. Label Studio's YOLO
+        # export plugin only writes image files for tasks whose `image`
+        # field is a http(s):// URL — tasks with data:image/jpeg;base64,...
+        # URIs (synthetic test projects, projects created via the API
+        # with inline images) end up with a 2KB zip that has dataset.yaml
+        # but no images/, so the training script crashes with "No images
+        # found". Converting the JSON export to a proper YOLO zip
+        # ourselves bypasses that plugin bug entirely.
         if fmt == "JSON":
-            import io, zipfile as _zipfile
-            buf = io.BytesIO()
-            with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("annotations.json", export_data)
-            export_data = buf.getvalue()
-            _append_log(job_id, "[export] Wrapped JSON export into zip")
+            import io as _io, zipfile as _zipfile, json as _json
+            json_data = _json.loads(export_data)
+            # Pre-decode every data-URI image into a dict so the shared
+            # prepare_yolo_dataset_from_json() helper can reuse the bytes
+            # without round-tripping back through the Label Studio server.
+            # URL-only images are skipped here and fetched by the helper
+            # via ls_url/ls_token at the usual endpoint.
+            import base64 as _b64
+            _image_bytes_map: dict[str, bytes] = {}
+            for _task in json_data:
+                _img_url = _task.get("data", {}).get("image", "")
+                if not _img_url or not _img_url.startswith("data:"):
+                    continue
+                _stem = f"task_{_task.get('id', len(_image_bytes_map))}.jpg"
+                try:
+                    _, _b64data = _img_url.split(",", 1)
+                    _image_bytes_map[_stem] = _b64.b64decode(_b64data)
+                except Exception:
+                    pass
+
+            # Delegate to the module-level helper. For YOLO detection we
+            # use the standard bbox format (cx cy w h); for segmentation
+            # we use polygon points — both honour rectangle→polygon or
+            # polygon→polygon natively.
+            _yolo_task = "segment" if training_type == "segmentation" else "detect"
+            try:
+                export_data = _convert_ls_json_to_yolo_zip(
+                    json_data, ls_url, ls_token,
+                    task=_yolo_task, image_bytes_map=_image_bytes_map,
+                )
+            except RuntimeError as _prep_err:
+                raise RuntimeError(
+                    f"Failed to convert LS JSON → YOLO {_yolo_task} format: {_prep_err}"
+                )
+            # Re-bundle the raw LS JSON for engines that look for any
+            # *.json list-of-tasks manifest (_find_ls_json helper in
+            # train_hf_vision / train_pytorch_segmentation).
+            import io as _io2, zipfile as _zf2
+            _tmp_buf = _io2.BytesIO(export_data)
+            _out_buf = _io2.BytesIO()
+            with _zf2.ZipFile(_tmp_buf, "r") as _src_zf, _zf2.ZipFile(_out_buf, "w", _zf2.ZIP_DEFLATED) as _out_zf:
+                for _item in _src_zf.namelist():
+                    _out_zf.writestr(_item, _src_zf.read(_item))
+                _out_zf.writestr("annotations.json", json.dumps(json_data, ensure_ascii=False))
+            export_data = _out_buf.getvalue()
+            _n_imgs = sum(1 for _ in _image_bytes_map)
+            # Count labels in zip
+            _n_lbls = 0
+            with _zf2.ZipFile(_io2.BytesIO(export_data), "r") as _cnt_zf:
+                for _n in _cnt_zf.namelist():
+                    if _n.startswith("labels/") and _n.endswith(".txt"):
+                        _n_lbls += 1
+            _classes_seen: list[str] = []
+            try:
+                with _zf2.ZipFile(_io2.BytesIO(export_data), "r") as _cfg_zf:
+                    if "dataset.yaml" in _cfg_zf.namelist():
+                        import yaml as _yl
+                        _yd = _yl.safe_load(_cfg_zf.read("dataset.yaml"))
+                        if isinstance(_yd, dict) and "names" in _yd:
+                            _classes_seen = list(_yd["names"])
+            except Exception:
+                pass
+            _append_log(job_id, f"[export] JSON→YOLO ({_yolo_task}) conversion: {_n_imgs} images, {_n_lbls} labels, {len(_classes_seen)} classes")
+            _append_log(job_id, f"[export] Wrapped converted YOLO into zip ({len(export_data)//1024} KB)")
+            fmt = "YOLO"  # downstream code already handles YOLO zip
 
         # Upload to MinIO (internal URL)
         s3 = _boto3.client(
@@ -3066,6 +3828,8 @@ def _run_training_remote(script_b64: str, env_vars: dict) -> dict:
 def _run_on_ray_cluster(job: dict) -> None:
     """Export dataset, submit real YOLO training task to Ray cluster, poll until done."""
     import os as _os
+    _os.environ["RAY_ADDRESS"] = ""
+    _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
     import ray
 
     _os.environ["RAY_IGNORE_VERSION_MISMATCH"] = "1"
@@ -3093,21 +3857,35 @@ def _run_on_ray_cluster(job: dict) -> None:
     _set_step(job_id, "connect")
     _append_log(job_id, f"[cluster] Connecting to Ray at {ray_addr}")
 
-    # Export dataset from Label Studio (skip for LLM/VLM — uses HF text_dataset instead)
+    # Export dataset from Label Studio. Skip only when the engine+training
+    # type doesn't need image data at all (LLM with text_dataset, self-supervised
+    # paths that fetch from a different source, etc.). VLM is special: it can
+    # use EITHER a JSONL text_dataset OR the project's image+annotation zip
+    # — so we only skip the export when the job has a text_dataset attached.
     engine = job.get("engine", "Ultralytics")
     training_type_for_export = job.get("training_type", "detection")
-    _is_llm = engine == "Unsloth" or training_type_for_export in ("llm-text", "vlm-finetune")
-    if _is_llm:
+    _job_text_dataset = job.get("text_dataset", "") or ""
+    _is_pure_llm = (engine == "Unsloth" and training_type_for_export == "llm-text")
+    _is_vlm_with_text = (training_type_for_export == "vlm-finetune" and bool(_job_text_dataset))
+    if _is_pure_llm or _is_vlm_with_text:
         dataset_url = ""
-        _append_log(job_id, "[cluster] LLM engine — skipping LS export (uses text_dataset)")
+        _append_log(job_id, "[cluster] Using text_dataset — skipping LS export")
     else:
         _set_step(job_id, "export")
         _append_log(job_id, f"[cluster] Exporting dataset from LS project {project_id} ...")
-        # SMP segmentation and self-supervised need image data from JSON export
-        # HuggingFace vision also needs JSON so we can download images from MinIO
-        _needs_json = engine in ("Segmentation Models PyTorch", "HuggingFace") or training_type_for_export == "self-supervised"
+        # SMP segmentation, self-supervised, HuggingFace vision, and VLM-without-
+        # text-dataset all need JSON so we can download images from MinIO.
+        _needs_json = (
+            engine in ("Segmentation Models PyTorch", "HuggingFace", "PyTorch", "PyTorch+TIMM", "TorchVision", "TIMM", "MONAI")
+            or training_type_for_export == "self-supervised"
+            or training_type_for_export == "vlm-finetune"
+            or training_type_for_export == "segmentation"  # all segmentation needs JSON
+            or training_type_for_export == "classification"  # classification needs LS JSON for image + label lookup
+        )
         _export_fmt = "JSON" if _needs_json else "YOLO"
-        dataset_url = _export_ls_to_minio(project_id, job_id, preferred_fmt=_export_fmt)
+        dataset_url = _export_ls_to_minio(project_id, job_id,
+                                       preferred_fmt=_export_fmt,
+                                       training_type=training_type_for_export)
         _append_log(job_id, "[cluster] Dataset exported and staged in MinIO ✓")
 
     weights_bucket = "medimage-weights"
@@ -3145,8 +3923,11 @@ def _run_on_ray_cluster(job: dict) -> None:
         "LS_TOKEN":        LS_TOKEN,
         "HF_TOKEN":        _hf_token,
         "HUGGING_FACE_HUB_TOKEN": _hf_token,
-        # LLM-specific
-        "TEXT_DATASET":    job.get("text_dataset", ""),
+        # LLM-specific — resolve the text_dataset id to a real local path
+        # so load_dataset() can read it. The training script first tries
+        # HF hub by that name and falls back to local JSONL if it fails,
+        # so passing the full path is the cleanest, most reliable option.
+        "TEXT_DATASET":    _resolve_text_dataset_path(job.get("text_dataset", "")),
         "LORA_RANK":       str(job.get("lora_rank", 16)),
         "QUANTIZATION":    job.get("quantization", "4bit"),
         "MAX_SEQ_LEN":     str(job.get("max_seq_len", 2048)),
@@ -3154,9 +3935,266 @@ def _run_on_ray_cluster(job: dict) -> None:
         "GRAD_ACCUM":      str(job.get("grad_accum", 4)),
     }
 
+    # ── VLM / LLM dispatch ─────────────────────────────────────────────────
+    # VLM (training_type=vlm-finetune) and LLM (engine=Unsloth) go through
+    # vlm_llm_train.py — a separate module with its own train functions,
+    # its own torch pre-flight, and its own triton/sklearn import-stub
+    # installer. The Ray worker image bakes the VLM/LLM deps in once at
+    # build time (transformers / peft / trl / bitsandbytes / accelerate /
+    # datasets / unsloth / numpy<2.0), so this path doesn't pip-install
+    # anything per-job. Keeps the VLM/LLM code isolated from the DL path
+    # below so changes to one don't affect the other.
+    #
+    # main.py is the dispatcher only — it does NOT import vlm_llm_train.
+    # The DL module is shipped to the worker via Ray's runtime_env
+    # (py_modules), so workers get the source without baking it into the
+    # image, and edits to vlm_llm_train.py are picked up on the next
+    # task without redeploying main.py.
+    _is_vlm_llm = (engine == "Unsloth") or (training_type == "vlm-finetune")
+    if _is_vlm_llm:
+        if not _VLM_LLM_MODULE_PATH:
+            raise RuntimeError(
+                "vlm_llm_train.py not found next to main.py — the VLM/LLM "
+                "training module is required for this job. Make sure "
+                "vlm_llm_train.py is in the backend/ directory."
+            )
+
+        # ── Submit via Ray Jobs REST API ──────────────────────────────────
+        # Ray 2.55.0's client server has a bug where _runtime_env_agent_address
+        # is None, making ray.init(address="ray://...") crash with:
+        #   TypeError: object of type 'NoneType' has no len()
+        # The Jobs API (dashboard REST) works fine and doesn't need ray.init().
+        #
+        # Shipping vlm_llm_train.py: runtime_env py_modules is validated on
+        # the dashboard node (which can't see /app/), so we embed the module
+        # as base64 in a wrapper script. The worker decodes, writes to /tmp,
+        # imports, and runs. Pip packages are specified via runtime_env["pip"].
+        import requests as _ray_req
+        import base64 as _b64
+
+        _ray_submit_url = f"{http_url}/api/jobs/"
+
+        # Read vlm_llm_train.py and base64-encode for embedding in entrypoint
+        with open(_VLM_LLM_MODULE_PATH, "rb") as _f:
+            _module_b64 = _b64.b64encode(_f.read()).decode("ascii")
+
+        # The entrypoint is a self-contained Python script that:
+        #  1) Decodes vlm_llm_train.py from an inline base64 string
+        #  2) Writes it to /tmp
+        #  3) Imports and runs it, calling _vlm_setup_hook() then main()
+        #
+        # This avoids all working_dir / runtime_env shipping issues:
+        #   - data: URIs aren't supported by the Jobs REST API
+        #   - http:// URIs are rejected (only https:// is allowed)
+        #   - s3:// URIs fail because env_vars aren't set during working_dir download
+        # By embedding everything in the entrypoint command itself, we bypass
+        # all of Ray's runtime_env validation and file-shipping mechanisms.
+        _entrypoint_script = (
+            "import base64,os,sys,tempfile;"
+            "mod_b64=" + repr(_module_b64) + ";"
+            "mod_path=os.path.join(tempfile.gettempdir(),'vlm_llm_train.py');"
+            "open(mod_path,'wb').write(base64.b64decode(mod_b64));"
+            "sys.path.insert(0,tempfile.gettempdir());"
+            "from vlm_llm_train import _vlm_setup_hook,main;"
+            "_vlm_setup_hook();"
+            "main()"
+        )
+        _entrypoint = f"python3 -c {_entrypoint_script!r}"
+
+        # Build clean runtime_env: env_vars only. All Python deps are
+        # pre-installed on the Ray cluster image, so the runtime_env.pip
+        # list is empty — telling Ray to skip its own pip resolver (which
+        # is what was causing VLM/LLM jobs to sit PENDING while the head
+        # node spent several minutes resolving and installing the same
+        # packages we already have on disk). No working_dir / py_modules /
+        # setup_hook — everything is embedded in the entrypoint command.
+        _re_env = {
+            "env_vars": {"RAY_ADDRESS": "", "RAY_RUNTIME_ENV_HOOK_DISABLED": "1", "RAY_ENABLE_AUTO_CONNECT": "0"},
+            "pip": [],
+        }
+        if _VLM_LLM_RUNTIME_ENV and "env_vars" in _VLM_LLM_RUNTIME_ENV:
+            for _ek, _ev in _VLM_LLM_RUNTIME_ENV["env_vars"].items():
+                _re_env["env_vars"][_ek] = str(_ev)
+        for _k, _v in env_vars.items():
+            _re_env["env_vars"][_k] = str(_v)
+
+        _num_gpus = int(job.get("num_gpus") or 1)
+        _payload = {
+            "entrypoint": _entrypoint,
+            "runtime_env": _re_env,
+        }
+        # Pass GPU count via env var so the training script can use
+        # it for ray.remote(num_gpus=...) or os.environ lookups.
+        # NOTE: Do NOT use "entrypoint_num_gpus" — Ray 2.55.0 silently
+        # PENDINGs jobs that request GPUs via that field (never allocates
+        # the head).  GPU scheduling must happen inside the script via
+        # ray.remote(num_gpus=...) or torch.cuda .
+        _payload["runtime_env"]["env_vars"]["MEDIMAGE_NUM_GPUS"] = str(_num_gpus)
+
+        _set_step(job_id, "submit")
+        _append_log(job_id, f"[cluster] Submitting VLM/LLM job via Ray Jobs API ...")
+        try:
+            _resp = _ray_req.post(_ray_submit_url, json=_payload, timeout=30)
+            _resp.raise_for_status()
+            _job_data = _resp.json()
+            _ray_job_id = _job_data.get("submission_id") or _job_data.get("job_id")
+            _append_log(job_id, f"[cluster] Ray job submitted: {_ray_job_id}")
+            with get_db() as _c:
+                _c.execute("UPDATE jobs SET ray_submission_id=? WHERE id=?", (_ray_job_id, job_id))
+                _c.commit()
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Ray job submission failed: {_e}")
+            raise
+
+        # Poll for job completion via the dashboard REST API
+        _set_step(job_id, "training")
+        _last_status = ""
+        elapsed = 0
+        poll_sec = 15
+        while True:
+            time.sleep(poll_sec)
+            elapsed += poll_sec
+            # If the user cancelled the job in the UI, the DB row will be
+            # 'error' but Ray may still report PENDING (the autoscaler
+            # never allocated a slot). Stop polling, signal stop to Ray,
+            # and let the surrounding code surface the DB error.
+            try:
+                with get_db() as _c:
+                    _db_row = _c.execute(
+                        "SELECT status FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                if _db_row and _db_row["status"] not in ("running", "queued"):
+                    _append_log(job_id, f"[cluster] DB status is '{_db_row['status']}' — abandoning Ray poll")
+                    try:
+                        _ray_req.post(f"{http_url}/api/jobs/{_ray_job_id}/stop", timeout=5)
+                    except Exception:
+                        pass
+                    _ray_status = "STOPPED"
+                    break
+            except Exception:
+                pass
+            try:
+                _status_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}", timeout=10)
+                _status_resp.raise_for_status()
+                _ray_status = _status_resp.json().get("status", "UNKNOWN")
+            except Exception as _e:
+                _append_log(job_id, f"[cluster] Status poll failed: {_e}")
+                _ray_status = _last_status
+
+            if _ray_status != _last_status:
+                _append_log(job_id, f"[cluster] Ray job status: {_ray_status}")
+                _last_status = _ray_status
+
+            if _ray_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+                break
+
+            _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s) ...")
+
+        # Ray cluster: flush stdout/stderr of the finished job to the
+        # dashboard before we try to read it back. Without this gap
+        # the /logs endpoint returns an empty body even though the
+        # job is reported as SUCCEEDED.
+        if _ray_status == "SUCCEEDED":
+            time.sleep(8)
+
+        # Fetch logs and parse weights path from WEIGHTS_UPLOADED lines.
+        # The Ray dashboard can take a few seconds after status flips
+        # to SUCCEEDED before the job's stdout is queryable, so we
+        # retry a few times before giving up.
+        _weights_path = None
+        _all_log_lines = []
+        # Fallback: even if the dashboard log endpoint never returns
+        # the WEIGHTS_UPLOADED line (cluster-side buffering, or the
+        # log file was GC'd before the line made it through), the
+        # upload_to_minio() call always writes to the standard
+        # {WEIGHTS_BUCKET}/{WEIGHTS_KEY} pair, so we can construct the
+        # path directly.
+        _expected_weights = f"s3://{weights_bucket}/{weights_key}"
+        for _log_attempt in range(15):
+            try:
+                _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
+                # Parse JSON wrapper first — Ray returns {"logs": "..."}
+                # so _logs_resp.text length is misleading (e.g. {"logs":""}
+                # is 12 bytes but contains zero log lines).
+                _logs_str = ""
+                if _logs_resp.ok:
+                    try:
+                        _logs_str = _logs_resp.json().get("logs", "") or ""
+                    except Exception:
+                        _logs_str = _logs_resp.text if _logs_resp.text else ""
+                _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} json_len={len(_logs_str)}")
+                if _logs_str.strip():
+                    _all_log_lines = []
+                    for _line in _logs_str.splitlines():
+                        _line_s = _line.strip()
+                        if _line_s:
+                            _all_log_lines.append(_line_s)
+                            _append_log(job_id, _line_s)
+                            if "WEIGHTS_UPLOADED" in _line_s:
+                                _payload = _line_s.split("WEIGHTS_UPLOADED", 1)[1].lstrip(":").strip()
+                                if not _payload:
+                                    continue
+                                if _payload.startswith("s3://"):
+                                    _weights_path = _payload
+                                elif "/" in _payload and _payload.count("/") == 1:
+                                    # 2-part path like "jobid/best.pt" — assume
+                                    # the default medimage-weights bucket
+                                    # because the inline _VISION_TRAIN_SCRIPT's
+                                    # `print(f"WEIGHTS_UPLOADED:{w_key}")` (line
+                                    # ~2907) only emits the key, not the full URI.
+                                    _weights_path = f"s3://medimage-weights/{_payload}"
+                                else:
+                                    _weights_path = f"s3://medimage-weights/{_payload}"
+                    if _weights_path:
+                        break
+                _append_log(job_id, f"[cluster] Log fetch attempt {_log_attempt+1}/15 empty, retrying...")
+                time.sleep(3)
+            except Exception as _e:
+                _append_log(job_id, f"[cluster] Could not fetch logs (attempt {_log_attempt+1}): {_e}")
+                time.sleep(3)
+
+        if _ray_status != "SUCCEEDED":
+            raise RuntimeError(f"Ray job {_ray_job_id} ended with status: {_ray_status}")
+
+        # If we couldn't parse the WEIGHTS_UPLOADED line, fall back to
+        # the bucket/key pair the worker was told to use. This is the
+        # correct path in the common case because upload_to_minio()
+        # always writes to exactly that S3 location.
+        if not _weights_path:
+            _append_log(job_id, f"[cluster] Falling back to expected weights path: {_expected_weights}")
+            _weights_path = _expected_weights
+
+        _set_step(job_id, "saving")
+        if _weights_path:
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET s3_weights_path = ? WHERE id = ?",
+                    (_weights_path, job_id),
+                )
+                conn.commit()
+        # Verify the weights actually exist in MinIO before declaring success.
+        # Ray SUCCEEDED + missing object = "phantom" success (training script
+        # returned without uploading). See _verify_weights_uploaded docstring.
+        if _weights_path:
+            _ok, _msg = _verify_weights_uploaded(_weights_path)
+            _append_log(job_id, f"[cluster] weight check: {_msg}")
+            if not _ok:
+                raise RuntimeError(
+                    f"Training script returned 0 but weights are missing in MinIO: {_msg}. "
+                    f"This usually means the training script exited without uploading — "
+                    f"check the captured stdout above for the actual failure."
+                )
+        _append_log(job_id, f"✓ Training complete — weights: {_weights_path or '(not found)'}")
+        _set_step(job_id, "done")
+        _set_status(job_id, "completed")
+        return
+
+    # ── Deep-learning dispatch ─────────────────────────────────────────────
     # pip packages depend on engine
     if engine in ("PyTorch", "PyTorch+TIMM", "TIMM"):
-        pip_pkgs = ["timm>=0.9", "boto3>=1.34", "requests", "Pillow"]
+        # torchxrayvision needed for medical DenseNet ("densenet121-res224-all"
+        # etc.) which TIMM doesn't ship. ~50MB wheel, only used by that branch.
+        pip_pkgs = ["timm>=0.9", "torchxrayvision>=1.2", "boto3>=1.34", "requests", "Pillow"]
     elif engine == "TorchVision" and training_type == "classification":
         pip_pkgs = ["timm>=0.9", "boto3>=1.34", "requests", "Pillow"]
     elif engine in ("Segmentation Models PyTorch", "TorchVision"):
@@ -3169,51 +4207,394 @@ def _run_on_ray_cluster(job: dict) -> None:
         pip_pkgs = ["segment-anything", "monai>=1.3", "nibabel", "boto3>=1.34", "Pillow"]
     elif engine == "nnU-Net":
         pip_pkgs = ["nnunetv2", "nibabel", "boto3>=1.34", "Pillow"]
-    elif engine == "Unsloth":
-        pip_pkgs = ["unsloth", "trl>=0.8", "datasets>=2.18", "boto3>=1.34", "peft"]
-    elif engine == "HuggingFace" or training_type == "vlm-finetune":
-        pip_pkgs = ["transformers>=4.40", "peft>=0.10", "accelerate>=0.28",
-                    "bitsandbytes>=0.43", "datasets>=2.18", "boto3>=1.34", "Pillow"]
+    elif engine == "HuggingFace":
+        # numpy<2.0 keeps ABI compatibility with the cluster's pre-installed
+        # pandas (built against numpy 1.x dtype size 96). Without the pin, the
+        # transformers/datasets deps pull numpy 2.x (size 88) and break
+        # pandas._libs.interval import — which crashes Trainer import via the
+        # transformers -> sklearn -> pandas chain before training can even start.
+        pip_pkgs = ["transformers>=4.40,<5.0", "peft>=0.10", "accelerate>=0.28",
+                    "bitsandbytes>=0.43", "datasets>=2.18",
+                    "boto3>=1.34", "Pillow", "numpy<2.0"]
     elif training_type == "self-supervised":
         pip_pkgs = ["boto3>=1.34", "requests", "Pillow"]  # torch/torchvision pre-installed
     else:
         # ultralytics is pre-installed on Ray cluster — do NOT reinstall (causes numpy binary conflict)
-        pip_pkgs = ["boto3>=1.34", "pyyaml", "requests"]
+        # Pin numpy<2.0 — cluster has pandas compiled against numpy 1.x ABI
+        pip_pkgs = ["boto3>=1.34", "pyyaml", "requests", "ultralytics",
+                    "opencv-python-headless", "numpy<2.0"]
 
-    # Define the worker function inline so cloudpickle serializes the full body
-    # (not a reference to 'main' module which doesn't exist on the Ray worker).
-    # pip packages are installed inside the function via subprocess to avoid
-    # requiring virtualenv on the worker node (runtime_env pip needs virtualenv).
+    # ── Submit deep-learning job via Ray Jobs API (avoids Ray Client port) ──
+    # VLM/LLM jobs use the dispatch path above (line 2996+) — don't touch them.
+    # Only Mask R-CNN, YOLO, MONAI, etc. land here, and they now go through
+    # the dashboard REST API instead of ray.init(address="ray://...").
+    import base64 as _b64lib, requests as _ray_req
+    # All Python deps are now pre-installed on the Ray cluster image, so the
+    # wrapper just sets env vars and exec()s the training script — no more
+    # subprocess.run(pip install) calls (those were the cause of jobs
+    # sitting PENDING for several minutes while the head node fought over
+    # pip resolver locks). Opencv swap is kept as an idempotent safety net
+    # in case a future pip install pulls opencv-python back in.
+    _wrapper = (
+        "import os, sys, subprocess, base64, time\n"
+        f"_env = {env_vars!r}\n"
+        "# Training script can arrive in 2 ways:\n"
+        "#  (1) MEDIMAGE_SCRIPT_URL — wrapper downloads from API cache (used\n"
+        "#      for big scripts > 60KB b64 that wouldn't fit in env vars).\n"
+        "#  (2) MEDIMAGE_TRAIN_SCRIPT_B64_0, _1, ... chunks — back-compat\n"
+        "#      path for small scripts.\n"
+        "_chunks = []\n"
+        "_idx = 0\n"
+        "while True:\n"
+        "    _part = os.environ.get(f'MEDIMAGE_TRAIN_SCRIPT_B64_{_idx}')\n"
+        "    if _part is None:\n"
+        "        break\n"
+        "    _chunks.append(_part)\n"
+        "    _idx += 1\n"
+        "_b64 = ''.join(_chunks) if _chunks else os.environ.get('MEDIMAGE_TRAIN_SCRIPT_B64', '')\n"
+        "print(f'[wrapper] python={sys.executable} pid={os.getpid()}', flush=True)\n"
+        "print(f'[wrapper] env keys={len(_env)} script_chunks={len(_chunks)} script_b64_len={len(_b64)}', flush=True)\n"
+        "print(f'[wrapper] JOB_ID={os.environ.get(\"JOB_ID\", \"?\")}', flush=True)\n"
+        "# Idempotent opencv fix: if opencv-python got pulled back in (it needs\n"
+        "# libGL.so.1, missing on the cluster), swap it for opencv-python-headless.\n"
+        "# If headless is already there, this is a no-op (subprocess rc=0, fast).\n"
+        "try:\n"
+        "    import cv2  # noqa\n"
+        "    print('[opencv-fix] cv2 import ok, version:', cv2.__version__, flush=True)\n"
+        "except Exception as _e:\n"
+        "    print(f'[opencv-fix] cv2 import failed ({_e!r}) — swapping opencv-python -> opencv-python-headless', flush=True)\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', '-q', 'opencv-python', 'opencv-contrib-python'], capture_output=True, text=True)\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall', '--no-deps', 'opencv-python-headless'], capture_output=True, text=True)\n"
+        "    import cv2  # noqa\n"
+        "    print(f'[opencv-fix] cv2 ok after swap: {cv2.__version__}', flush=True)\n"
+        "for k, v in _env.items(): os.environ[k] = v\n"
+        "# Resolve the training script. Two delivery modes are supported:\n"
+        "#  (a) MinIO URL — API uploads the script to MinIO and passes the\n"
+        "#      URL. Used when the script is too big to fit in env vars\n"
+        "#      (Linux ARG_MAX is ~128KB, _VISION_TRAIN_SCRIPT is ~130KB\n"
+        "#      b64). MinIO is used because the API itself isn't reachable\n"
+        "#      from the Ray cluster's network but MinIO is — it already\n"
+        "#      has the dataset zip + weights keys.\n"
+        "#  (b) Inline env var(s) — used for short scripts. Kept for back-compat.\n"
+        "_job_id = os.environ.get('JOB_ID', 'unknown')\n"
+        "_script_url = os.environ.get('MEDIMAGE_SCRIPT_URL', '')\n"
+        "if _script_url:\n"
+        "    print(f'[wrapper] downloading training script from {_script_url}', flush=True)\n"
+        "    import urllib.request\n"
+        "    with urllib.request.urlopen(_script_url, timeout=60) as _r:\n"
+        "        _script_src = _r.read().decode('utf-8')\n"
+        "    print(f'[wrapper] downloaded {len(_script_src)} chars', flush=True)\n"
+        "else:\n"
+        "    _script_src = base64.b64decode(_b64).decode('utf-8')\n"
+        "from io import StringIO\n"
+        "_cap = StringIO()\n"
+        "_so, _se = sys.stdout, sys.stderr\n"
+        "sys.stdout = sys.stderr = _cap\n"
+        "print('[wrapper] exec training script ...', flush=True)\n"
+        "try:\n"
+        "    exec(_script_src, {'__name__': '__main__'})\n"
+        "except SystemExit as _e:\n"
+        "    if _e.code not in (None, 0):\n"
+        "        sys.stdout = _so; sys.stderr = _se\n"
+        "        raise RuntimeError(f'Script exited {_e.code}\\n{_cap.getvalue()}')\n"
+        "except BaseException as _e:\n"
+        "    sys.stdout = _so; sys.stderr = _se\n"
+        "    raise RuntimeError(f'Script crashed: {type(_e).__name__}: {_e}\\n{_cap.getvalue()}')\n"
+        "finally:\n"
+        "    sys.stdout, sys.stderr = _so, _se\n"
+        "print(_cap.getvalue())\n"
+    )
+    _wrapper_b64 = _b64lib.b64encode(_wrapper.encode()).decode()
+    # Upload the training script to MinIO and pass a presigned URL to the
+    # wrapper. The base64 of the ~97KB _VISION_TRAIN_SCRIPT is ~130KB which
+    # exceeds Linux's per-payload env var limit (~128KB = ARG_MAX/2). When
+    # that limit is hit, Ray silently PENDINGS the job forever with no logs.
+    # We can't GET the script from the API (the API isn't exposed to the
+    # Ray cluster's network) but MinIO is — we already use it for the
+    # dataset zip + weights. Bucket: "medimage-scripts" (auto-created).
+    # The presigned URL is generated against MINIO_PUBLIC_URL so the
+    # signature matches the hostname the Ray cluster uses to GET it.
+    import tempfile as _tf
+    _script_text = base64.b64decode(script_b64).decode("utf-8")
+    _tmp = _tf.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+    _tmp.write(_script_text)
+    _tmp.close()
+    _script_bucket = "medimage-scripts"
+    _script_key = f"{job_id}/train_script.py"
+    _script_presigned_url = ""
+    try:
+        # Upload via the docker-internal endpoint (always reachable from
+        # inside the API container).
+        upload_to_minio(
+            _tmp.name, _script_bucket, _script_key,
+            MINIO_URL, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+        )
+        # Sign the presigned URL using the public endpoint so the signature
+        # matches the host the Ray cluster will use to GET it.
+        import boto3 as _boto
+        from botocore.config import Config as _Cfg
+        _s3_pub = _boto.client(
+            "s3",
+            endpoint_url=MINIO_PUBLIC_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_Cfg(signature_version="s3v4"),
+        )
+        _script_presigned_url = _s3_pub.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _script_bucket, "Key": _script_key},
+            ExpiresIn=3600,
+        )
+    except Exception as _e:
+        _append_log(job_id, f"[cluster] WARN: could not upload training script to MinIO: {_e}")
+    finally:
+        try:
+            os.unlink(_tmp.name)
+        except Exception:
+            pass
+    _env_for_job = dict(env_vars)
+    # Don't pass the script in env vars — just point at the MinIO URL.
+    _env_for_job.pop("MEDIMAGE_TRAIN_SCRIPT_B64", None)
+    _env_for_job["MEDIMAGE_SCRIPT_URL"] = _script_presigned_url
+    _env_for_job["MEDIMAGE_SCRIPT_BUCKET"] = _script_bucket
+    _env_for_job["MEDIMAGE_SCRIPT_KEY"] = _script_key
+    _num_gpus = int(job.get("num_gpus") or 1)
+    _env_for_job["MEDIMAGE_NUM_GPUS"] = str(_num_gpus)
+    _deploy_payload = {
+        "entrypoint": f"bash -c 'echo {_wrapper_b64} | base64 -d > /tmp/dl_train.py && python3 /tmp/dl_train.py'",
+        "runtime_env": {"env_vars": _env_for_job},
+    }
+    try:
+        _resp = _ray_req.post(f"{http_url}/api/jobs/", json=_deploy_payload, timeout=30)
+        _resp.raise_for_status()
+        _ray_job_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+        _append_log(job_id, f"[cluster] DL training job submitted: {_ray_job_id}")
+        with get_db() as _c:
+            _c.execute("UPDATE jobs SET ray_submission_id=? WHERE id=?", (_ray_job_id, job_id))
+            _c.commit()
+    except Exception as _e:
+        _append_log(job_id, f"[cluster] DL job submission failed: {_e}")
+        raise
+
+    _set_step(job_id, "training")
+    _last_status = ""
+    elapsed = 0
+    poll_sec = 15
+    while True:
+        time.sleep(poll_sec)
+        elapsed += poll_sec
+        # Check if the job was cancelled in the DB (DELETE endpoint sets
+        # status to 'error' with the cancellation message). The Ray job
+        # may still report PENDING/RUNNING because the autoscaler
+        # hasn't reaped it yet, but the user wants the training thread
+        # to stop polling and exit so the row doesn't keep "training in
+        # progress" forever.
+        try:
+            with get_db() as _c:
+                _db_row = _c.execute(
+                    "SELECT status FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()
+            if _db_row and _db_row["status"] not in ("running", "queued"):
+                # DB no longer says the job is live — assume cancellation
+                # or external error. Stop the Ray job, exit the loop, and
+                # let the surrounding handler surface the DB error.
+                _append_log(job_id, f"[cluster] DB status is '{_db_row['status']}' — abandoning Ray poll")
+                try:
+                    _req_stop = _ray_req.post(
+                        f"{http_url}/api/jobs/{_ray_job_id}/stop", timeout=5
+                    )
+                    _append_log(job_id, f"[cluster] best-effort stop: {_req_stop.status_code}")
+                except Exception:
+                    pass
+                _ray_status = "STOPPED"
+                break
+        except Exception:
+            pass
+        try:
+            _status_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}", timeout=10)
+            _status_resp.raise_for_status()
+            _ray_status = _status_resp.json().get("status", "UNKNOWN")
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Status poll failed: {_e}")
+            _ray_status = _last_status
+        if _ray_status != _last_status:
+            _append_log(job_id, f"[cluster] Ray job status: {_ray_status}")
+            _last_status = _ray_status
+        if _ray_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+            break
+        _append_log(job_id, f"[cluster] Training in progress ({elapsed // 60}m {elapsed % 60}s) ...")
+
+    if _ray_status == "SUCCEEDED":
+        time.sleep(8)
+
+    _weights_path = None
+    _expected_weights = f"s3://{weights_bucket}/{weights_key}"
+    for _log_attempt in range(15):
+        try:
+            _logs_resp = _ray_req.get(f"{http_url}/api/jobs/{_ray_job_id}/logs", timeout=30)
+            # Parse JSON wrapper first — Ray returns {"logs": "..."}
+            # so raw text length is misleading (e.g. {"logs":""} = 12 bytes but 0 lines).
+            _logs_str = ""
+            if _logs_resp.ok:
+                try:
+                    _logs_str = _logs_resp.json().get("logs", "") or ""
+                except Exception:
+                    _logs_str = _logs_resp.text if _logs_resp.text else ""
+            _append_log(job_id, f"[cluster] log attempt {_log_attempt+1}/15: ok={_logs_resp.ok} json_len={len(_logs_str)}")
+            if _logs_str.strip():
+                for _line in _logs_str.splitlines():
+                    _line_s = _line.strip()
+                    if not _line_s: continue
+                    if _line_s.startswith("Running entrypoint") or "Runtime env is" in _line_s or "Connecting to existing" in _line_s or "Connected to Ray" in _line_s or "Using address" in _line_s:
+                        continue
+                    _append_log(job_id, _line_s)
+                    if "WEIGHTS_UPLOADED" in _line_s:
+                        _payload = _line_s.split("WEIGHTS_UPLOADED", 1)[1].lstrip(":").strip()
+                        if not _payload:
+                            continue
+                        if _payload.startswith("s3://"):
+                            _weights_path = _payload
+                        elif "/" in _payload and _payload.count("/") == 1:
+                            _weights_path = f"s3://{_payload}"
+                        else:
+                            _weights_path = f"s3://medimage-weights/{_payload}"
+                if _weights_path:
+                    break
+            _append_log(job_id, f"[cluster] Log fetch attempt {_log_attempt+1}/15 empty, retrying...")
+            time.sleep(3)
+        except Exception as _e:
+            _append_log(job_id, f"[cluster] Could not fetch logs (attempt {_log_attempt+1}): {_e}")
+            time.sleep(3)
+
+    if _ray_status != "SUCCEEDED":
+        raise RuntimeError(f"DL training job {_ray_job_id} ended with status: {_ray_status}")
+
+    if not _weights_path:
+        _append_log(job_id, f"[cluster] Falling back to expected weights path: {_expected_weights}")
+        _weights_path = _expected_weights
+
+    # Save weights path to DB
+    if _weights_path:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET s3_weights_path = ? WHERE id = ?",
+                (_weights_path, job_id),
+            )
+            conn.commit()
+    # Verify the weights actually exist in MinIO before declaring success.
+    # See _verify_weights_uploaded docstring — Ray SUCCEEDED ≠ training done.
+    if _weights_path:
+        _ok, _msg = _verify_weights_uploaded(_weights_path)
+        _append_log(job_id, f"[cluster] weight check: {_msg}")
+        if not _ok:
+            raise RuntimeError(
+                f"Training script returned 0 but weights are missing in MinIO: {_msg}. "
+                f"This usually means the training script exited without uploading — "
+                f"check the captured stdout above for the actual failure."
+            )
+    _append_log(job_id, f"✓ Training complete — weights: {_weights_path or '(not found)'}")
+    _set_step(job_id, "done")
+    _set_status(job_id, "completed")
+    return
     _pip_pkgs_for_worker = pip_pkgs
     def _run_training_inline(script_b64_arg: str, env_vars_arg: dict) -> dict:
+        """Inline runner for the deep-learning path (YOLO, MONAI, nnU-Net,
+        HuggingFace vision, etc.). Installs the DL-specific pip_pkgs,
+        force-reinstalls numpy<2.0 as a safety net against stale 2.x
+        wheels from a previous run, and execs _VISION_TRAIN_SCRIPT.
+
+        VLM/LLM jobs go through a different code path (vlm_llm_train.run)
+        which has its own torch pre-flight and import-stub installer.
+        This function is only called when (engine, training_type) is in
+        the deep-learning set — see the dispatch in _run_on_ray_cluster.
+        """
         import os as _os, base64 as _b64, sys as _sys, subprocess as _sp
         from io import StringIO as _StringIO
-        # Install required packages directly — avoids the virtualenv requirement
-        if _pip_pkgs_for_worker:
-            _sp.run(
-                [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
-                capture_output=True,
-            )
-        for k, v in env_vars_arg.items():
-            _os.environ[k] = v
-        captured = _StringIO()
-        _orig_out, _orig_err = _sys.stdout, _sys.stderr
-        _sys.stdout = _sys.stderr = captured
-        try:
-            exec(_b64.b64decode(script_b64_arg).decode(), {"__name__": "__main__"})  # noqa: S102
-        except SystemExit as e:
-            if e.code not in (None, 0):
-                raise RuntimeError(f"Script exited code {e.code}\n{captured.getvalue()}")
-        finally:
-            _sys.stdout, _sys.stderr = _orig_out, _orig_err
-        output = captured.getvalue()
-        wp = next((ln.split(":", 1)[1].strip() for ln in output.splitlines() if ln.startswith("WEIGHTS_UPLOADED:")), None)
-        return {"stdout": output, "weights_path": wp}
+        # Force numpy to a 1.x version FIRST. Without --force-reinstall, pip's
+        # resolver can leave a numpy 2.x in place from a previous run (since
+        # the other deps in pip_pkgs don't directly require numpy, pip sees
+        # the existing 2.x as "already satisfied"). The pre-installed pandas
+        # was built for numpy 1.x ABI (dtype size 96), so any later import of
+        # pandas._libs will crash with "numpy.dtype size changed" until numpy
+        # is back on 1.x. This explicit reinstall runs before the other
+        # packages so its resolved version sticks.
+    # Force-reinstall numpy<2.0 LAST so it overrides ultralytics's pull.
+    # ultralytics requires opencv-python (not -headless) which needs libGL.so.1
+    # on the cluster. After ultralytics installs opencv-python, we swap it
+    # for opencv-python-headless to avoid the missing libGL dep.
+    _sp.run(
+        [_sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "numpy<2.0"],
+        capture_output=True,
+    )
+    # Install required packages directly — avoids the virtualenv requirement
+    if _pip_pkgs_for_worker:
+        _sp.run(
+            [_sys.executable, "-m", "pip", "install", "-q"] + _pip_pkgs_for_worker,
+            capture_output=True,
+        )
+    # Replace full opencv-python with headless variant to skip libGL dep.
+    # ultralytics pulls opencv-python (which needs libGL.so.1, missing on
+    # the cluster). We must uninstall opencv-python AND force-reinstall
+    # opencv-python-headless with --no-deps to ensure the headless .so
+    # files actually overwrite the non-headless ones on next import.
+    r_uninst = _sp.run(
+        [_sys.executable, "-m", "pip", "uninstall", "-y", "-q",
+         "opencv-python", "opencv-contrib-python"],
+        capture_output=True, text=True,
+    )
+    print(f"[opencv-fix] uninstall rc={r_uninst.returncode}", flush=True)
+    r_inst = _sp.run(
+        [_sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+         "--no-deps", "opencv-python-headless"],
+        capture_output=True, text=True,
+    )
+    print(f"[opencv-fix] headless install rc={r_inst.returncode}", flush=True)
+    # Verify cv2 import works without libGL dep
+    r_check = _sp.run(
+        [_sys.executable, "-c", "import cv2; print('cv2 ok:', cv2.__version__)", ],
+        capture_output=True, text=True,
+    )
+    print(f"[opencv-fix] cv2 check: {r_check.stdout.strip()} {r_check.stderr.strip()}", flush=True)
+    for k, v in env_vars_arg.items():
+        _os.environ[k] = v
+    # Force unbuffered stdout/stderr in the exec'd training script so
+    # Ray's log endpoint (and the API's 15x log-fetch loop) see
+    # crash output as it happens. Without this, a failing script
+    # buffers everything until exit — by which time the log fetcher
+    # has already given up and reported an empty "15/15 empty" log.
+    _os.environ["PYTHONUNBUFFERED"] = "1"
+    # Synchronous CUDA errors. Default is async, so a device-side
+    # assert is reported at some later random API call and the
+    # traceback points to a line that has nothing to do with the
+    # real failure. CUDA_LAUNCH_BLOCKING=1 makes each kernel report
+    # its own error inline, so the traceback matches the real crash
+    # site (yolov8n, monai-unet, etc. all hit "Log fetch 15/15 empty"
+    # because the async assert never made it back before the script
+    # was killed by the next crash).
+    _os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    captured = _StringIO()
+    _orig_out, _orig_err = _sys.stdout, _sys.stderr
+    _sys.stdout = _sys.stderr = captured
+    try:
+        exec(_b64.b64decode(script_b64_arg).decode(), {"__name__": "__main__"})  # noqa: S102
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            raise RuntimeError(f"Script exited code {e.code}\n{captured.getvalue()}")
+    finally:
+        _sys.stdout, _sys.stderr = _orig_out, _orig_err
+    output = captured.getvalue()
+    wp = next((ln.split(":", 1)[1].strip() for ln in output.splitlines() if ln.startswith("WEIGHTS_UPLOADED:")), None)
+    return {"stdout": output, "weights_path": wp}
 
     # Keep Ray connection alive after training (don't shutdown — other threads may
     # be using it for serve deployments concurrently)
     with _run_on_ray_cluster._lock:
-        ray.init(address=ray_addr, ignore_reinit_error=True)
+        ray.init(
+            address=ray_addr,
+            ignore_reinit_error=True,
+            allow_multiple=True,
+            runtime_env=_VLM_LLM_RUNTIME_ENV,
+        )
         _append_log(job_id, f"[cluster] Connected ({len(ray.nodes())} node(s))")
 
         _set_step(job_id, "submit")
@@ -3227,6 +4608,23 @@ def _run_on_ray_cluster(job: dict) -> None:
         while True:
             time.sleep(poll_sec)
             elapsed += poll_sec
+            # Honour user cancellation even when using ray.wait (the
+            # future may stay PENDING forever if the cluster can't
+            # allocate a slot).
+            try:
+                with get_db() as _c:
+                    _db_row = _c.execute(
+                        "SELECT status FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                if _db_row and _db_row["status"] not in ("running", "queued"):
+                    _append_log(job_id, f"[cluster] DB status is '{_db_row['status']}' — abandoning Ray wait")
+                    try:
+                        ray.cancel(future)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                pass
             ready, _ = ray.wait([future], timeout=0)
             if ready:
                 break
@@ -3415,6 +4813,33 @@ def _normalize_model_name(model_name: str) -> str:
     return _MODEL_ID_FIXES.get(model_name, model_name)
 
 
+def _resolve_text_dataset_path(ds_id_or_path: str) -> str:
+    """Resolve a text_dataset value (ds_id, basename, or full path) to an
+    absolute local path the Ray worker can read. Falls back to the input
+    unchanged so HF hub dataset names still work."""
+    if not ds_id_or_path:
+        return ""
+    # Already a path
+    if ds_id_or_path.startswith("/"):
+        return ds_id_or_path
+    # Try to look up by id in DB
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT path FROM text_datasets WHERE id = ?",
+                (ds_id_or_path,),
+            ).fetchone()
+        if row and row["path"]:
+            return row["path"]
+    except Exception:
+        pass
+    # Treat as relative path under /data/text-datasets/
+    candidate = f"/data/text-datasets/{ds_id_or_path}"
+    if os.path.isfile(candidate):
+        return candidate
+    return ds_id_or_path
+
+
 _EXPORT_ENGINES = {"TF-Lite", "ONNX", "NVIDIA", "Intel", "Apple"}
 
 
@@ -3475,8 +4900,8 @@ def submit_job(project_id: int, req: TrainRequest, request: Request):
                (id, name, project_id, dataset, training_type, model_name, engine,
                 epochs, batch_size, learning_rate, optimizer, imgsz, notes,
                 lora_rank, quantization, max_seq_len, chat_template, grad_accum, text_dataset,
-                cluster, status, progress, log, created_at, user_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?,?)""",
+                cluster, num_gpus, status, progress, log, created_at, user_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',0,'',?,?)""",
             (
                 job_id, name, project_id, dataset_label,
                 req.training_type, req.model_name, req.engine,
@@ -3484,7 +4909,7 @@ def submit_job(project_id: int, req: TrainRequest, request: Request):
                 req.optimizer, req.imgsz, req.notes,
                 req.lora_rank, req.quantization, req.max_seq_len,
                 req.chat_template, req.grad_accum, req.text_dataset,
-                cluster,
+                cluster, req.num_gpus,
                 time.time(),
                 submitter_user_id,
             ),
@@ -3546,6 +4971,353 @@ def get_job(job_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
     return dict(row)
+
+
+# ─── WebSocket for real-time job updates ─────────────────────────────────────
+_ws_clients: list[WebSocket] = []
+_ws_broadcast_task: asyncio.Task | None = None
+
+
+async def _ws_broadcast_loop():
+    """Push job updates to all connected WebSocket clients every 2 seconds."""
+    while True:
+        await asyncio.sleep(2)
+        if not _ws_clients:
+            continue
+        try:
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT id, name, training_type, model_name, engine, status, "
+                    "progress, pipeline_step, created_at, started_at, finished_at, "
+                    "error, dataset, epochs, batch_size "
+                    "FROM jobs WHERE hidden_in_jobs = 0 ORDER BY created_at DESC"
+                ).fetchall()
+            payload = []
+            for r in rows:
+                d = dict(r)
+                d["model"] = d.pop("model_name", "")
+                payload.append(d)
+            msg = _json.dumps({"type": "jobs", "data": payload})
+            disconnected = []
+            for ws in _ws_clients:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    disconnected.append(ws)
+            for ws in disconnected:
+                _ws_clients.remove(ws)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/jobs")
+async def ws_jobs(websocket: WebSocket):
+    """WebSocket endpoint for real-time job status updates.
+
+    Accepts an optional ``token`` query parameter for JWT auth when Keycloak
+    is enabled. Clients should pass the same Bearer token as the REST API.
+    When Keycloak is disabled, the connection is accepted without auth.
+    """
+    global _ws_broadcast_task
+    if _KC_ENABLED and _jwks_client is not None:
+        token = websocket.query_params.get("token", "")
+        if not token:
+            await websocket.close(code=4001, reason="Missing token")
+            return
+        try:
+            await asyncio.to_thread(_sync_verify_token, token)
+        except Exception:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    await websocket.accept()
+    _ws_clients.append(websocket)
+    if _ws_broadcast_task is None or _ws_broadcast_task.done():
+        _ws_broadcast_task = asyncio.create_task(_ws_broadcast_loop())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if websocket in _ws_clients:
+            _ws_clients.remove(websocket)
+
+
+# ─── Bulk-run state: persisted in SQLite, broadcast over WebSocket ───────────
+# All Test-All "Run all compatible" state lives in the bulk_runs and
+# bulk_run_jobs tables (already in init_db). Frontend connects to
+# /ws/testall, sends/receives the latest snapshot every 2s. This replaces
+# the previous localStorage + 3s polling scheme.
+
+_bulk_ws_clients: list[WebSocket] = []
+_bulk_ws_task: asyncio.Task | None = None
+
+
+def _load_bulk_snapshot() -> dict:
+    """Build a single JSON snapshot of all bulk runs + their jobs.
+
+    Only the latest 5 runs are returned to keep the payload small.
+    The job status is enriched with the live status from the jobs
+    table (when a job_id is set) so the TestAll UI reflects the
+    actual backend state without polling.
+    """
+    with get_db() as conn:
+        runs = conn.execute(
+            "SELECT * FROM bulk_runs ORDER BY started_at DESC LIMIT 5"
+        ).fetchall()
+        if not runs:
+            return {"runs": [], "jobs_by_run": {}}
+        run_ids = [r["id"] for r in runs]
+        placeholders = ",".join("?" for _ in run_ids)
+        jobs = conn.execute(
+            f"SELECT * FROM bulk_run_jobs WHERE bulk_run_id IN ({placeholders})",
+            run_ids,
+        ).fetchall()
+        # Enrich with live job status so single-test submissions (which
+        # only update bulk_run_jobs at submit time) get the running /
+        # completed / error status as the backend updates it.
+        # sqlite3.Row supports [] but not .get(); convert upfront.
+        job_ids = [j["job_id"] for j in jobs if j["job_id"]]
+        live_status: dict[str, dict] = {}
+        if job_ids:
+            jplace = ",".join("?" for _ in job_ids)
+            for row in conn.execute(
+                f"SELECT id, status, error, started_at, finished_at, pipeline_step FROM jobs WHERE id IN ({jplace})",
+                job_ids,
+            ).fetchall():
+                live_status[row["id"]] = dict(row)
+        jobs_by_run: dict[str, list] = {rid: [] for rid in run_ids}
+        for j in jobs:
+            d = dict(j)
+            # Overlay the live job status onto the bulk row. The bulk
+            # row stores the status at submit time, which stays at
+            # "queued" forever unless the frontend (or a "Run all"
+            # loop) explicitly updates it. The jobs table is the
+            # source of truth for the actual training state.
+            if d.get("job_id") and d["job_id"] in live_status:
+                live = live_status[d["job_id"]]
+                d["status"] = live.get("status") or d.get("status") or "queued"
+                if live.get("error") and d["status"] == "error":
+                    d["error"] = live["error"]
+                if live.get("started_at"):
+                    d["started_at"] = live["started_at"]
+                if live.get("finished_at"):
+                    d["finished_at"] = live["finished_at"]
+            jobs_by_run[j["bulk_run_id"]].append(d)
+        return {
+            "runs": [dict(r) for r in runs],
+            "jobs_by_run": jobs_by_run,
+        }
+
+
+async def _bulk_ws_broadcast_loop():
+    """Push the latest bulk-run snapshot every 1s to subscribed clients.
+    The Jobs page polls /api/jobs directly so it doesn't need this,
+    but TestAllModels shows the bulk_run_jobs snapshot overlaid with the
+    live jobs-table status — 1s keeps the displayed row status in
+    sync with the actual job state without burning the database.
+    """
+    while True:
+        await asyncio.sleep(1)
+        if not _bulk_ws_clients:
+            continue
+        try:
+            snap = _load_bulk_snapshot()
+            msg = _json.dumps({"type": "bulk_snapshot", "data": snap})
+            disconnected = []
+            for ws in _bulk_ws_clients:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    disconnected.append(ws)
+            for ws in disconnected:
+                _bulk_ws_clients.remove(ws)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/testall")
+async def ws_testall(websocket: WebSocket):
+    """WebSocket endpoint for Test-All bulk run state.
+
+    Server pushes the current bulk_runs + bulk_run_jobs snapshot every
+    2s. Clients may also send a {"action":"create_run", "id":...} to
+    register a new bulk run row, and use REST endpoints to update jobs.
+    """
+    global _bulk_ws_task
+    if _KC_ENABLED and _jwks_client is not None:
+        token = websocket.query_params.get("token", "")
+        if not token:
+            await websocket.close(code=4001, reason="Missing token")
+            return
+        try:
+            await asyncio.to_thread(_sync_verify_token, token)
+        except Exception:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    await websocket.accept()
+    _bulk_ws_clients.append(websocket)
+    if _bulk_ws_task is None or _bulk_ws_task.done():
+        _bulk_ws_task = asyncio.create_task(_bulk_ws_broadcast_loop())
+    # Send an initial snapshot immediately so the client doesn't wait 2s
+    try:
+        snap = _load_bulk_snapshot()
+        await websocket.send_text(_json.dumps({"type": "bulk_snapshot", "data": snap}))
+    except Exception:
+        pass
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if websocket in _bulk_ws_clients:
+            _bulk_ws_clients.remove(websocket)
+
+
+@app.get("/api/bulk-runs/latest")
+def get_latest_bulk_run():
+    """Return the latest bulk run + its jobs (used for initial mount)."""
+    return _load_bulk_snapshot()
+
+
+@app.post("/api/bulk-runs")
+def create_bulk_run(payload: dict, request: Request):
+    """Create a new bulk_runs row. Returns the row's id.
+
+    Body: {id?: str, provider?: 'ray'|'modal', deploy_enabled?: bool, total?: int}
+    The frontend supplies a stable id (usually the same as a previous
+    run, so the row upserts instead of growing the table forever).
+    """
+    import uuid
+    rid = payload.get("id") or f"bulk_{uuid.uuid4().hex[:12]}"
+    user_id = _current_user_id(request)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO bulk_runs(id, started_at, provider, deploy_enabled, total, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, time.time(),
+             payload.get("provider", "ray"),
+             1 if payload.get("deploy_enabled") else 0,
+             int(payload.get("total", 0)),
+             user_id),
+        )
+        conn.commit()
+    return {"id": rid}
+
+
+@app.patch("/api/bulk-runs/{run_id}")
+def update_bulk_run(run_id: str, payload: dict):
+    """Update a bulk_runs row (finished_at, stopped, counts, etc)."""
+    fields, params = [], []
+    for k in ("finished_at", "stopped", "total", "ok", "failed", "deployed_count"):
+        if k in payload:
+            fields.append(f"{k}=?")
+            params.append(payload[k])
+    if not fields:
+        return {"updated": 0}
+    params.append(run_id)
+    with get_db() as conn:
+        cur = conn.execute(f"UPDATE bulk_runs SET {', '.join(fields)} WHERE id=?", params)
+        conn.commit()
+    return {"updated": cur.rowcount}
+
+
+@app.post("/api/bulk-runs/{run_id}/stop")
+def stop_bulk_run(run_id: str):
+    """Mark a bulk run as stopped on the server. The frontend's "Stop
+    Bulk" button calls this so a stop request survives a page refresh /
+    tab close / JS loop crash — the in-flight train job on the Ray
+    cluster is not cancelled (that would need a separate call to the
+    jobs endpoint) but the bulk_runs row is finalised so the next WS
+    push reflects a finished, stopped state and the UI gets unstuck.
+    Idempotent: safe to call when the run is already finished.
+    """
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE bulk_runs SET stopped = 1, "
+            "finished_at = COALESCE(finished_at, ?) "
+            "WHERE id = ? AND finished_at IS NULL",
+            (time.time(), run_id),
+        )
+        conn.commit()
+    return {"updated": cur.rowcount, "run_id": run_id}
+
+
+@app.delete("/api/bulk-runs")
+def delete_bulk_runs(request: Request):
+    """Wipe all bulk_runs (and their bulk_run_jobs) for the current
+    user. The frontend's "Reset" button calls this so a reset survives
+    a page refresh — without a server-side delete, the next WS push
+    would just refill the snapshot with the same rows and the UI would
+    flicker for 2s before looking identical to before the click.
+    Per-user: each user only wipes their own rows. The dismissed-flag
+    in user_prefs is intentionally NOT cleared — that preference is
+    per-run and outlives the run's lifetime.
+    """
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="authentication required")
+    with get_db() as conn:
+        # Delete child rows first (FK not enforced in SQLite by default
+        # but be explicit so the orphan check is obvious).
+        conn.execute(
+            "DELETE FROM bulk_run_jobs WHERE bulk_run_id IN "
+            "(SELECT id FROM bulk_runs WHERE user_id = ?)",
+            (uid,),
+        )
+        cur = conn.execute("DELETE FROM bulk_runs WHERE user_id = ?", (uid,))
+        conn.commit()
+    return {"deleted": cur.rowcount}
+
+
+@app.post("/api/bulk-runs/{run_id}/jobs")
+def upsert_bulk_run_job(run_id: str, payload: dict):
+    """Upsert a single bulk_run_jobs row (per-model state)."""
+    row_key = payload.get("row_key")
+    if not row_key:
+        raise HTTPException(status_code=400, detail="row_key required")
+    # Build column list and VALUES placeholders separately. The
+    # "column = excluded.column" form on the UPDATE branch is built
+    # by joining each column name with the SQLite "excluded" pseudo-
+    # table alias — NEVER embed "?" twice (the previous version of
+    # this query produced "status=?=excluded.status" which SQLite
+    # parses as 14 placeholders but the params list only has 8).
+    cols = ["status", "error", "elapsed_sec", "deployed", "deploy_url", "job_id"]
+    placeholders = ", ".join("?" for _ in cols)
+    update_set = ", ".join(f"{c}=excluded.{c}" for c in cols)
+    params = [
+        payload.get("status", "idle"),
+        payload.get("error"),
+        float(payload.get("elapsed_sec", 0) or 0),
+        1 if payload.get("deployed") else 0,
+        payload.get("deploy_url"),
+        payload.get("job_id"),
+        run_id,
+        row_key,
+    ]
+    with get_db() as conn:
+        conn.execute(
+            f"INSERT INTO bulk_run_jobs({', '.join(cols)}, bulk_run_id, row_key) "
+            f"VALUES ({placeholders}, ?, ?) "
+            f"ON CONFLICT(bulk_run_id, row_key) DO UPDATE SET {update_set}",
+            params,
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.get("/api/bulk-runs/{run_id}/jobs")
+def list_bulk_run_jobs(run_id: str):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bulk_run_jobs WHERE bulk_run_id = ?", (run_id,)
+        ).fetchall()
+    return {"jobs": [dict(r) for r in rows]}
 
 
 @app.get("/api/jobs/{job_id}/download-weights")
@@ -3688,13 +5460,16 @@ async def get_ray_status(job_id: str):
     if not row or not row["ray_serve_url"]:
         return {"online": False, "status": "no_url"}
     try:
+        import os as _os
+        _os.environ["RAY_ADDRESS"] = ""
+        _os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
         import ray as _ray
         from ray import serve as _serve
         from urllib.parse import urlparse as _up
         _host = _up(row["ray_serve_url"]).hostname or "100.68.53.118"
         _addr = f"ray://{_host}:10001"
         if not _ray.is_initialized():
-            _ray.init(address=_addr, ignore_reinit_error=True, log_to_driver=False)
+            _ray.init(address=_addr, ignore_reinit_error=True, allow_multiple=True, log_to_driver=False)
 
         # 1) Detached Ray actor (model-{job_id}) — preferred, since
         #    that's what the modal-model-deploy path creates and what
@@ -3745,24 +5520,58 @@ def delete_job(job_id: str, from_view: str = "jobs"):
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
-        # Safety net: refuse to delete (even hide-from-list) a model that
-        # is currently deployed. The user must explicitly clear the
-        # deployment via the Models → Deploy → Undeploy flow first.
+        # Verify the deployment is still actually live before refusing
+        # the delete. The DB column can be stale (Ray cluster restarted,
+        # Pod killed, network blip) — in that case there's nothing to
+        # protect, so we auto-clear the stale URL and proceed.
         provider = (row["inference_provider"] or "").strip()
-        if provider == "ray"   and (row["ray_serve_url"] or "").strip():
-            raise HTTPException(
-                status_code=409,
-                detail="Model is deployed on Ray Serve — undeploy first (Deploy tab → Undeploy).",
-            )
-        if provider == "modal" and (row["modal_url"] or "").strip():
-            raise HTTPException(
-                status_code=409,
-                detail="Model is deployed on Modal — undeploy first (Deploy tab → Stop).",
-            )
+        ray_url  = (row["ray_serve_url"] or "").strip()
+        modal_url = (row["modal_url"] or "").strip()
+        if provider == "ray" and ray_url:
+            try:
+                _ping = httpx.get(ray_url.rstrip("/") + "/health", timeout=4)
+                if _ping.status_code < 500:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Model is deployed on Ray Serve — undeploy first (Deploy tab → Undeploy).",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                # Endpoint unreachable → stale DB state. Clear it.
+                conn.execute(
+                    "UPDATE jobs SET ray_serve_url='', inference_provider='' WHERE id=?",
+                    (job_id,),
+                )
+                ray_url = ""
+                provider = ""
+        if provider == "modal" and modal_url:
+            _modal_health = modal_url.replace("inference", "health").rstrip("/")
+            try:
+                _ping = httpx.get(_modal_health, timeout=4)
+                if _ping.status_code < 500:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Model is deployed on Modal — undeploy first (Deploy tab → Stop).",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                conn.execute(
+                    "UPDATE jobs SET modal_url='', modal_api_key='', inference_provider='' WHERE id=?",
+                    (job_id,),
+                )
+                modal_url = ""
+                provider = ""
         if from_view == "models":
-            conn.execute("UPDATE jobs SET hidden_in_models = 1 WHERE id = ?", (job_id,))
+            # Deleting from the Models page removes the model entity
+            # entirely — hide it from both views.
+            conn.execute(
+                "UPDATE jobs SET hidden_in_models = 1, hidden_in_jobs = 1 WHERE id = ?",
+                (job_id,),
+            )
         else:
-            # Cancel if still active, then hide from jobs view
+            # Cancel if still active, then hide from jobs view only.
             if row["status"] in ("queued", "running"):
                 conn.execute("UPDATE jobs SET status = 'error', error = 'Cancelled by user' WHERE id = ?", (job_id,))
             conn.execute("UPDATE jobs SET hidden_in_jobs = 1 WHERE id = ?", (job_id,))
@@ -4025,6 +5834,55 @@ def save_setting(key: str, body: dict):
     return {"ok": True}
 
 
+# ─── Per-user preferences (replaces localStorage) ────────────────────────────
+# All small per-user UI state (filter selections, dashboard URLs, MinIO
+# credentials, API keys, etc.) lives here. The frontend has a small
+# useUserPrefs() hook that mirrors this in memory so reads are sync.
+@app.get("/api/user-prefs")
+def list_user_prefs(request: Request):
+    """Return all of the current user's prefs as {key: value, ...}."""
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with get_db() as conn:
+        rows = conn.execute("SELECT key, value FROM user_prefs WHERE user_id=?", (uid,)).fetchall()
+    return {"prefs": {r["key"]: r["value"] for r in rows}}
+
+
+@app.get("/api/user-prefs/{key}")
+def get_user_pref(key: str, request: Request):
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM user_prefs WHERE user_id=? AND key=?", (uid, key)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"key": key, "value": row["value"]}
+
+
+@app.put("/api/user-prefs/{key}")
+def put_user_pref(key: str, body: dict, request: Request):
+    """Upsert a single preference. Use {"value": "..."} or {"value": null} to delete."""
+    uid = _current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    value = body.get("value", "")
+    if value is None:
+        with get_db() as conn:
+            conn.execute("DELETE FROM user_prefs WHERE user_id=? AND key=?", (uid, key))
+            conn.commit()
+        return {"ok": True, "deleted": True}
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO user_prefs(user_id, key, value, updated_at) VALUES(?,?,?,strftime('%s','now')) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (uid, key, str(value)),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
 # ─── Modal.com Cloud Deploy ──────────────────────────────────────────────────
 
 import re as _re
@@ -4055,7 +5913,7 @@ class ModalStartRequest(BaseModel):
 
 def _modal_script(req: ModalStartRequest) -> str:
     gpu_spec = f'gpu="{req.gpu_type}"' if req.gpu_type != "cpu" else "gpu=None"
-    return textwrap.dedent(f"""\
+    return textwrap.dedent(f"""
         import modal, subprocess, time, socket
 
         app = modal.App("medimage-ray")
@@ -4067,6 +5925,30 @@ def _modal_script(req: ModalStartRequest) -> str:
             modal.Image.debian_slim(python_version="3.11")
             .pip_install("ray[serve]>=2.30", "fastapi", "uvicorn",
                          "python-multipart", "pillow")
+            # VLM/LLM training deps — baked in once at image build time.
+            # The Ray worker (which runs vlm_llm_train.py) needs these
+            # available without per-job pip install. Loose pins (>=) so
+            # pip's resolver picks the latest compatible versions, which
+            # become the "version that exists" for every job that runs on
+            # this image. numpy<2.0 is kept pinned to preserve pandas
+            # 1.x ABI on this cluster (pandas._libs.interval breaks with
+            # numpy 2.x dtype size 88 vs 96).
+            #
+            # Torch is NOT baked here — the cluster's pre-installed torch
+            # is what ultralytics has been using successfully on the DL
+            # path. The VLM torch pre-flight in vlm_llm_train.py still
+            # force-reinstalls cu wheels if the pre-installed torch
+            # can't see a GPU.
+            #
+            # vlm_llm_train.py is NOT baked into the image — it's shipped
+            # per-task via Ray's runtime_env["py_modules"] from the API
+            # container. Edits to the DL module are picked up on the
+            # next job without rebuilding this image.
+            .pip_install(
+                "transformers<5.0", "peft", "trl", "bitsandbytes",
+                "accelerate", "datasets", "numpy<2.0",
+                "Pillow", "boto3", "requests",
+            )
         )
 
         # Head node — min_containers=0 so 'modal app stop' actually tears
@@ -4507,7 +6389,7 @@ def _modal_model_script(
         volumes_spec = ""
         run_bake = "\n            .run_function(_bake_weights)"
 
-    return textwrap.dedent(f"""\
+    return textwrap.dedent(f"""
         import modal, os, io, zipfile, json, time
         from pathlib import Path
         from fastapi import Request
@@ -4692,10 +6574,16 @@ def _modal_model_script(
                     _model = UNet(spatial_dims=2, in_channels=in_ch, out_channels=NUM_CLASSES, channels=(16,32,64,128,256), strides=(2,2,2,2)).eval()
             elif tt in ("llm-text", "vlm-finetune"):
                 import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                from peft import PeftModel
-                _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-                _model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if tt == "vlm-finetune":
+                    from transformers import AutoProcessor, AutoModelForVision2Seq
+                    from peft import PeftModel
+                    _hf_processor = AutoProcessor.from_pretrained(MODEL_NAME)
+                    _model = AutoModelForVision2Seq.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                else:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    from peft import PeftModel
+                    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                    _model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
                 if wp is not None:
                     _model = PeftModel.from_pretrained(_model, str(wp))
             else:
@@ -5091,7 +6979,7 @@ _ray_serve_state: dict = {
     "logs": [],
 }
 
-_SERVE_APP_PY = textwrap.dedent("""\
+_SERVE_APP_PY = textwrap.dedent("""
     from ray import serve
     from fastapi import FastAPI, File, Form, UploadFile
     from typing import Optional
@@ -5124,7 +7012,7 @@ _SERVE_APP_PY = textwrap.dedent("""\
 """)
 
 # ─── Per-model Ray Serve script ───────────────────────────────────────────────
-_SERVE_MODEL_PY = textwrap.dedent("""\
+_SERVE_MODEL_PY = textwrap.dedent("""
     import os, io, zipfile, json, time
     from pathlib import Path
 
@@ -5179,17 +7067,11 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
     import ray
     from ray import serve
 
-    _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
-    if not ray.is_initialized():
-        ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
-
-    # Pin actors to the head node using the built-in internal head resource.
-    # Ray always exposes node:__internal_head__ on the head node.
-    _node_resource = {"node:__internal_head__": 0.001}
+    _ray_address = os.environ.get("RAY_URL", "ray://100.68.53.118:10001")
+    _ray_address = _ray_address.replace("http://", "ray://").replace(":8265", ":10001") if _ray_address else _ray_address
+    ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
 
     # ── Deployment class — plain __call__, NO @serve.ingress(FastAPI()) ───────
-    # NOTE: runtime_env pip is intentionally NOT used here because Ray cluster
-    # nodes may not have virtualenv. All required packages must be pre-installed.
     @serve.deployment(
         num_replicas=1,
         ray_actor_options={
@@ -5209,7 +7091,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
             self._load_error = None
             try:
                 weights = _download_weights()
-                self._load(weights)  # None → load pretrained from MODEL_NAME
+                self._load(weights)
                 print(f"[serve] Model {MODEL_ID} ({TRAINING_TYPE}/{ENGINE}) loaded (fine-tuned={weights is not None})")
             except Exception as _e:
                 self._load_error = str(_e)
@@ -5288,10 +7170,16 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     self._smp_engine = True
             elif tt in ("llm-text", "vlm-finetune"):
                 import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                from peft import PeftModel
-                self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-                self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if tt == "vlm-finetune":
+                    from transformers import AutoProcessor, AutoModelForVision2Seq
+                    from peft import PeftModel
+                    self._hf_processor = AutoProcessor.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForVision2Seq.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                else:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    from peft import PeftModel
+                    self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
                 if wp is not None:
                     self.model = PeftModel.from_pretrained(self.model, str(wp))
             else:
@@ -5306,10 +7194,42 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                 return {"error": self._load_error or "Model not loaded"}
             tt = TRAINING_TYPE
             try:
-                # ── 1. HuggingFace transformers (detection / classification / segmentation) ──
+                # ── 1. LLM / VLM text generation (must be before HF image check) ──
+                if tt in ("llm-text", "vlm-finetune"):
+                    import torch
+                    if not prompt:
+                        return {"error": "Prompt required for LLM inference"}
+                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
+                    if tt == "vlm-finetune" and self._hf_processor is not None:
+                        from PIL import Image as _PILImage
+                        import io as _io
+                        img_obj = None
+                        if image_bytes:
+                            img_obj = _PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+                            messages = [{"role": "user", "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": full_prompt},
+                            ]}]
+                        else:
+                            messages = [{"role": "user", "content": [{"type": "text", "text": full_prompt}]}]
+                        chat_text = self._hf_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self._hf_processor(text=[chat_text], images=[img_obj] if img_obj else None, return_tensors="pt").to(self.model.device)
+                    else:
+                        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
+                    t0 = time.time()
+                    with torch.no_grad():
+                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
+                    ms = int((time.time() - t0) * 1000)
+                    n_tok = out.shape[1] - inputs.input_ids.shape[1] if hasattr(inputs, "input_ids") else 0
+                    processor = self._hf_processor if (tt == "vlm-finetune" and self._hf_processor) else self.tokenizer
+                    resp = processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True) if hasattr(inputs, "input_ids") else processor.decode(out[0], skip_special_tokens=True)
+                    return {"type": tt, "response": resp, "tokens_generated": n_tok,
+                            "inference_time_ms": ms, "model_name": MODEL_NAME}
+
+                # ── 2. HuggingFace image models (detection / classification / segmentation) ──
                 if self._hf_processor is not None:
                     if not image_bytes:
-                        return {"error": "Image required for this model type"}
+                        return {"error": "Image required"}
                     from PIL import Image as _Img
                     import torch
                     img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -5335,7 +7255,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                         return {"type": "classification", "predictions": preds[:5],
                                 "top_label": preds[0]["label"]}
                     elif tt == "segmentation":
-                        logits = outputs.logits  # (1, C, H, W)
+                        logits = outputs.logits
                         up = torch.nn.functional.interpolate(
                             logits, size=img.size[::-1], mode="bilinear", align_corners=False)
                         mask = up.argmax(dim=1)[0]
@@ -5352,7 +7272,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     else:
                         return {"error": f"HuggingFace inference not implemented for type={tt}"}
 
-                # ── 2. Ultralytics YOLO (detection + instance segmentation) ─────────────
+                # ── 3. Ultralytics YOLO (detection + instance segmentation) ──
                 if tt in ("detection", "segmentation") and hasattr(self.model, "predict"):
                     if not image_bytes:
                         return {"error": "Image required"}
@@ -5379,7 +7299,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                                 masks.append({"class_name": name, "confidence": float(r.boxes.conf[i])})
                         return {"type": "segmentation", "masks": masks, "num_masks": len(masks)}
 
-                # ── 3. Segmentation Models PyTorch (semantic segmentation) ───────────────
+                # ── 4. Segmentation Models PyTorch (semantic segmentation) ──
                 if tt == "segmentation" and self._smp_engine:
                     import torch
                     import torchvision.transforms as T
@@ -5391,7 +7311,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     tfm = T.Compose([T.Resize((256, 256)), T.ToTensor(),
                                      T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
                     with torch.no_grad():
-                        logits = self.model(tfm(img).unsqueeze(0))  # (1, C, H, W)
+                        logits = self.model(tfm(img).unsqueeze(0))
                     mask = logits.argmax(dim=1)[0]
                     total_px = mask.numel()
                     segs = []
@@ -5404,7 +7324,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                     return {"type": "segmentation", "segments": segs,
                             "num_classes": len(segs), "image_size": [orig_w, orig_h]}
 
-                # ── 4. PyTorch / TIMM classification ─────────────────────────────────────
+                # ── 5. PyTorch / TIMM classification ──
                 if tt == "classification":
                     import torch
                     import torchvision.transforms as T
@@ -5421,22 +7341,6 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
                                      "confidence": p} for i, p in enumerate(probs)],
                                    key=lambda x: -x["confidence"])
                     return {"type": "classification", "predictions": preds, "top_label": preds[0]["label"]}
-
-                # ── 5. LLM / VLM text generation ─────────────────────────────────────────
-                if tt in ("llm-text", "vlm-finetune"):
-                    import torch
-                    if not prompt:
-                        return {"error": "Prompt required for LLM inference"}
-                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
-                    inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
-                    t0 = time.time()
-                    with torch.no_grad():
-                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
-                    ms = int((time.time() - t0) * 1000)
-                    n_tok = out.shape[1] - inputs.input_ids.shape[1]
-                    resp = self.tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                    return {"type": tt, "response": resp, "tokens_generated": n_tok,
-                            "inference_time_ms": ms, "model_name": MODEL_NAME}
 
                 return {"error": f"No inference handler for engine={ENGINE}, type={tt}"}
             except Exception as exc:
@@ -5496,7 +7400,7 @@ _SERVE_MODEL_PY = textwrap.dedent("""\
 # ── Ray Actor deployment script (avoids Ray Serve + Job Agent issues) ────────
 # Uses @ray.remote named detached actor instead of Ray Serve.
 # No pandas/numpy ABI issue since we don't import ray.serve.
-_RAY_ACTOR_PY = textwrap.dedent("""\
+_RAY_ACTOR_PY = textwrap.dedent("""
     import os, io, zipfile, json, time
     from pathlib import Path
 
@@ -5513,30 +7417,49 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
     CLASS_NAMES    = json.loads(os.environ.get("CLASS_NAMES", "[]")) or [f"class_{i}" for i in range(NUM_CLASSES)]
 
     def _download_weights():
-        import boto3
+        '''Download weights via presigned HTTPS URL (more compatible than boto3 on
+        heterogeneous Ray worker nodes).'''
+        import requests as _req
         from botocore.exceptions import ClientError
         if not WEIGHTS_KEY:
             return None
-        s3 = boto3.client("s3", endpoint_url=MINIO_URL,
-                          aws_access_key_id=MINIO_ACCESS, aws_secret_access_key=MINIO_SECRET,
-                          region_name="us-east-1",
-                          config=boto3.session.Config(s3={"addressing_style": "path"}))
-        local_dir = Path(f"/tmp/mweights/{MODEL_ID}")
+        # Use unique path per actor instance to avoid conflicts with stale state
+        import uuid as _uuid
+        _unique = _uuid.uuid4().hex[:12]
+        local_dir = Path(f"/tmp/mweights/{MODEL_ID}_{_unique}")
         local_dir.mkdir(parents=True, exist_ok=True)
         raw = local_dir / "raw_weights"
+        # Get presigned URL from the API server (which is on the docker network
+        # and has boto3 working correctly)
         try:
-            s3.download_file(WEIGHTS_BUCKET, WEIGHTS_KEY, str(raw))
-        except ClientError as _ce:
-            _code = _ce.response.get("Error", {}).get("Code", "")
-            if _code in ("404", "NoSuchKey", "400", "BadRequest"):
-                print(f"[actor] No weights at {WEIGHTS_KEY} — loading pretrained")
-                return None
-            raise
+            _api_resp = _req.get(
+                f"http://medimage-api:8000/api/internal/weights-url",
+                params={"bucket": WEIGHTS_BUCKET, "key": WEIGHTS_KEY},
+                timeout=15,
+            )
+            _api_resp.raise_for_status()
+            _presigned = _api_resp.json()["url"]
+        except Exception as _e:
+            print(f"[actor] Failed to get presigned URL: {_e}", flush=True)
+            return None
+        try:
+            with _req.get(_presigned, stream=True, timeout=300) as _resp:
+                _resp.raise_for_status()
+                with open(raw, "wb") as _f:
+                    for _chunk in _resp.iter_content(1024 * 1024):
+                        _f.write(_chunk)
+        except Exception as _e:
+            print(f"[actor] download failed: {_e}", flush=True)
+            return None
+        if not raw.is_file():
+            print(f"[actor] weights at {WEIGHTS_KEY} is not a file — loading pretrained", flush=True)
+            return None
         with open(raw, "rb") as f:
             magic = f.read(4)
         if magic[:2] == b"PK":
             out = local_dir / "extracted"
             out.mkdir(exist_ok=True)
+            import zipfile
             with zipfile.ZipFile(raw) as z:
                 z.extractall(out)
             return out
@@ -5546,13 +7469,42 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
             return pt
 
     import ray
-    _ray_address = os.environ.get("RAY_ADDRESS", "ray://100.68.53.118:10001")
-    if not ray.is_initialized():
-        ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
+    _ray_address = os.environ.get("RAY_ADDRESS", "")
+    if not _ray_address:
+        _ray_address = "auto"
+    ray.init(address=_ray_address, ignore_reinit_error=True, log_to_driver=False)
 
-    @ray.remote(num_cpus=1)
+    # Base packages needed by all inference paths
+    _actor_pip = ["transformers>=4.40,<5.0", "accelerate>=0.28", "Pillow"]
+    if ENGINE in ("PyTorch", "HuggingFace", "Segmentation Models PyTorch", "MONAI"):
+        _actor_pip.append("torch")
+    if TRAINING_TYPE in ("llm-text", "vlm-finetune"):
+        _actor_pip += ["torch", "peft>=0.10"]
+
+    _needs_gpu = TRAINING_TYPE in ("llm-text", "vlm-finetune") or ENGINE in ("HuggingFace", "PyTorch", "MONAI", "Segmentation Models PyTorch")
+    _actor_opts = {"num_cpus": 1}
+    if _needs_gpu:
+        _actor_opts["num_gpus"] = 1
+
+    @ray.remote(**_actor_opts)
     class ModelInferenceActor:
         def __init__(self):
+            import subprocess as _sp, sys as _sys
+            # Install packages needed by the actor — may run on a node where
+            # they're not pre-installed. Keep this minimal and silent.
+            _pkgs = ["transformers>=4.40,<5.0", "accelerate>=0.28", "Pillow",
+                      "boto3", "numpy<2.0", "opencv-python-headless"]
+            if ENGINE in ("HuggingFace", "PyTorch", "MONAI", "Segmentation Models PyTorch"):
+                _pkgs.append("torch")
+                _pkgs.append("torchvision")
+            if ENGINE == "Segmentation Models PyTorch":
+                _pkgs.append("segmentation-models-pytorch")
+            if ENGINE == "Ultralytics":
+                _pkgs.append("ultralytics")
+            if TRAINING_TYPE in ("llm-text", "vlm-finetune"):
+                _pkgs += ["peft>=0.10"]
+            _sp.run([_sys.executable, "-m", "pip", "install", "-q"] + _pkgs,
+                    capture_output=True, timeout=600)
             self.model = None
             self.tokenizer = None
             self._hf_processor = None
@@ -5605,6 +7557,30 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
             if tt in ("detection", "segmentation") and eng == "Ultralytics":
                 from ultralytics import YOLO
                 self.model = YOLO(str(wp) if wp is not None else (MODEL_NAME or "yolov8n.pt"))
+            elif tt in ("detection", "segmentation") and eng == "TorchVision":
+                # Use SMP (segmentation-models-pytorch) — training code wrote SMP weights
+                # (encoder.conv1.weight keys match SMP UNet with ResNet backbone).
+                # NOTE: TorchVision's native Mask R-CNN is a different model family.
+                import torch
+                if "mask" in MODEL_NAME.lower() or "maskrcnn" in MODEL_NAME.lower():
+                    # Allow explicit Mask R-CNN via MODEL_NAME
+                    import torchvision
+                    from torchvision.models.detection import maskrcnn_resnet50_fpn
+                    m = maskrcnn_resnet50_fpn(weights=None, num_classes=NUM_CLASSES)
+                else:
+                    # Default: SMP UNet (matches what training produced)
+                    import segmentation_models_pytorch as smp
+                    arch = "Unet"  # SMP default
+                    enc = "resnet34"  # matches training pipeline default
+                    if "resnet50" in MODEL_NAME.lower(): enc = "resnet50"
+                    elif "efficientnet" in MODEL_NAME.lower(): enc = "efficientnet-b0"
+                    m = smp.Unet(encoder_name=enc, encoder_weights=None,
+                                 in_channels=3, classes=NUM_CLASSES)
+                if wp is not None:
+                    ckpt = torch.load(str(wp), map_location="cpu", weights_only=False)
+                    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    m.load_state_dict(state, strict=False)
+                self.model = m.eval()
             elif tt == "classification" and eng != "MONAI":
                 import torch, timm
                 arch = MODEL_NAME.replace("-", "_")
@@ -5679,10 +7655,16 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                                      channels=(16,32,64,128,256), strides=(2,2,2,2)).eval()
             elif tt in ("llm-text", "vlm-finetune"):
                 import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                from peft import PeftModel
-                self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-                self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                if tt == "vlm-finetune":
+                    from transformers import AutoProcessor, AutoModelForVision2Seq
+                    from peft import PeftModel
+                    self._hf_processor = AutoProcessor.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForVision2Seq.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
+                else:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    from peft import PeftModel
+                    self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                    self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
                 if wp is not None:
                     self.model = PeftModel.from_pretrained(self.model, str(wp))
             else:
@@ -5693,45 +7675,50 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                         self.model = torch.load(str(pt), map_location="cpu", weights_only=False)
 
         def infer(self, image_bytes=None, conf=0.5, prompt="", system_prompt=""):
+            import base64 as _b64
+            if isinstance(image_bytes, str) and len(image_bytes) > 20:
+                try:
+                    image_bytes = _b64.b64decode(image_bytes)
+                except Exception:
+                    pass
             if self.model is None:
                 return {"error": self._load_error or "Model not loaded"}
             tt = TRAINING_TYPE
             try:
-                if self._hf_processor is not None:
-                    if not image_bytes:
-                        return {"error": "Image required"}
-                    from PIL import Image as _Img
+                # ── 1. LLM / VLM text generation (must be before HF image check) ──
+                if tt in ("llm-text", "vlm-finetune"):
                     import torch
-                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
-                    inputs = self._hf_processor(images=img, return_tensors="pt")
+                    if not prompt:
+                        return {"error": "Prompt required for LLM inference"}
+                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
+                    if tt == "vlm-finetune" and self._hf_processor is not None:
+                        from PIL import Image as _PILImage
+                        import io as _io
+                        img_obj = None
+                        if image_bytes:
+                            img_obj = _PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+                            messages = [{"role": "user", "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": full_prompt},
+                            ]}]
+                        else:
+                            messages = [{"role": "user", "content": [{"type": "text", "text": full_prompt}]}]
+                        chat_text = self._hf_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self._hf_processor(text=[chat_text], images=[img_obj] if img_obj else None, return_tensors="pt").to(self.model.device)
+                    else:
+                        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
+                    t0 = time.time()
                     with torch.no_grad():
-                        outputs = self.model(**inputs)
-                    if tt == "detection":
-                        target_sizes = torch.tensor([img.size[::-1]])
-                        res = self._hf_processor.post_process_object_detection(outputs, threshold=conf, target_sizes=target_sizes)[0]
-                        dets = []
-                        for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
-                            name = (self._hf_id2label or {}).get(label.item(), f"class_{label.item()}")
-                            x1, y1, x2, y2 = box.tolist()
-                            dets.append({"class_name": name, "confidence": round(float(score), 4), "bbox": [x1, y1, x2 - x1, y2 - y1]})
-                        return {"type": "detection", "detections": dets}
-                    elif tt == "classification":
-                        probs = torch.softmax(outputs.logits, dim=-1)[0].tolist()
-                        id2label = self._hf_id2label or {}
-                        preds = sorted([{"label": id2label.get(i, f"class_{i}"), "confidence": p} for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
-                        return {"type": "classification", "predictions": preds[:5], "top_label": preds[0]["label"]}
-                    elif tt == "segmentation":
-                        logits = outputs.logits
-                        up = torch.nn.functional.interpolate(logits, size=img.size[::-1], mode="bilinear", align_corners=False)
-                        mask = up.argmax(dim=1)[0]
-                        total_px = mask.numel()
-                        id2label = self._hf_id2label or {}
-                        segs = [{"class_name": id2label.get(ci, f"class_{ci}"), "class_id": ci, "pixel_count": int((mask == ci).sum()), "coverage": round(int((mask == ci).sum()) / total_px, 4)} for ci in mask.unique().tolist()]
-                        segs.sort(key=lambda x: -x["pixel_count"])
-                        return {"type": "segmentation", "segments": segs, "num_classes": len(segs)}
-                    return {"error": f"HuggingFace inference not implemented for type={tt}"}
+                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
+                    ms = int((time.time() - t0) * 1000)
+                    n_tok = out.shape[1] - inputs.input_ids.shape[1] if hasattr(inputs, "input_ids") else 0
+                    tps = round(n_tok / (ms / 1000), 2) if ms > 0 else 0
+                    processor = self._hf_processor if (tt == "vlm-finetune" and self._hf_processor) else self.tokenizer
+                    resp = processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True) if hasattr(inputs, "input_ids") else processor.decode(out[0], skip_special_tokens=True)
+                    return {"type": tt, "response": resp, "tokens_generated": n_tok, "tokens_per_second": tps, "inference_time_ms": ms, "model_name": MODEL_NAME}
 
-                if tt in ("detection", "segmentation") and hasattr(self.model, "predict"):
+                # ── 2. HuggingFace image models (detection / classification / segmentation) ──
+                if self._hf_processor is not None:
                     if not image_bytes:
                         return {"error": "Image required"}
                     from PIL import Image as _Img
@@ -5773,6 +7760,81 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                     segs.sort(key=lambda x: -x["pixel_count"])
                     return {"type": "segmentation", "segments": segs, "num_classes": len(segs), "image_size": [orig_w, orig_h]}
 
+                # ── TorchVision detection / segmentation (Mask R-CNN, Faster R-CNN) ──
+                if tt in ("detection", "segmentation") and ENGINE == "TorchVision":
+                    import torch
+                    from PIL import Image as _Img
+                    import numpy as _np
+                    if not image_bytes:
+                        return {"error": "Image required"}
+                    img = _Img.open(io.BytesIO(image_bytes)).convert("RGB")
+                    orig_w, orig_h = img.size
+                    t0 = time.time()
+                    # SMP UNet: input is a normalized [0,1] tensor, shape (1, 3, H, W)
+                    img_t = T.functional.to_tensor(img).unsqueeze(0)
+                    # ImageNet normalization (SMP default for ResNet encoders)
+                    img_t = T.functional.normalize(img_t, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                    with torch.no_grad():
+                        logits = self.model(img_t)
+                    ms = int((time.time() - t0) * 1000)
+                    # logits shape: (1, num_classes, H, W)
+                    probs = logits.softmax(dim=1)[0]
+                    pred = probs.argmax(dim=0).cpu().numpy()  # (H, W)
+                    total_px = int(pred.size)
+                    # Collect unique classes
+                    unique_classes = _np.unique(pred).tolist()
+                    masks_out = []
+                    # Background class is 0; skip it
+                    for ci in unique_classes:
+                        if ci == 0:
+                            continue
+                        name = self.labels[ci] if ci < len(self.labels) else f"class_{ci}"
+                        binmask = (pred == ci).astype(_np.uint8)
+                        pixel_count = int(binmask.sum())
+                        coverage = round(pixel_count / total_px, 4)
+                        # Extract polygon outline (simplified) for frontend draw
+                        polygon = []
+                        try:
+                            import cv2 as _cv2  # type: ignore
+                            contours, _ = _cv2.findContours(
+                                binmask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE
+                            )
+                            if contours:
+                                c = max(contours, key=_cv2.contourArea)
+                                if len(c) > 60:
+                                    step = max(1, len(c) // 60)
+                                    c = c[::step]
+                                polygon = [
+                                    [float(p[0][0]) / orig_w, float(p[0][1]) / orig_h]
+                                    for p in c
+                                ]
+                        except ImportError:
+                            pass
+                        if not polygon:
+                            # Fallback: bounding box of the mask
+                            ys, xs = _np.where(binmask > 0)
+                            if len(xs) > 0:
+                                x1, x2 = int(xs.min()), int(xs.max())
+                                y1, y2 = int(ys.min()), int(ys.max())
+                                polygon = [
+                                    [x1 / orig_w, y1 / orig_h],
+                                    [x2 / orig_w, y1 / orig_h],
+                                    [x2 / orig_w, y2 / orig_h],
+                                    [x1 / orig_w, y2 / orig_h],
+                                ]
+                        masks_out.append({
+                            "label": name,
+                            "class_id": ci,
+                            "confidence": 1.0,  # SMP doesn't have per-region confidence
+                            "color": "#8b5cf6",
+                            "polygon": polygon,
+                            "mask_pixels": pixel_count,
+                            "coverage": coverage,
+                        })
+                    return {"type": "segmentation", "masks": masks_out,
+                            "count": len(masks_out), "inference_time_ms": ms,
+                            "image_size": [orig_w, orig_h]}
+
                 if tt == "classification":
                     import torch
                     import torchvision.transforms as T
@@ -5811,20 +7873,6 @@ _RAY_ACTOR_PY = textwrap.dedent("""\
                             probs = torch.softmax(logits, dim=1)[0].tolist()
                     preds = sorted([{"label": self.labels[i] if i < len(self.labels) else f"class_{i}", "confidence": p} for i, p in enumerate(probs)], key=lambda x: -x["confidence"])
                     return {"type": "classification", "predictions": preds, "top_label": preds[0]["label"]}
-
-                if tt in ("llm-text", "vlm-finetune"):
-                    import torch
-                    if not prompt:
-                        return {"error": "Prompt required for LLM inference"}
-                    full_prompt = (system_prompt + "\\n" + prompt).strip() if system_prompt else prompt
-                    inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
-                    t0 = time.time()
-                    with torch.no_grad():
-                        out = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
-                    ms = int((time.time() - t0) * 1000)
-                    n_tok = out.shape[1] - inputs.input_ids.shape[1]
-                    resp = self.tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                    return {"type": tt, "response": resp, "tokens_generated": n_tok, "inference_time_ms": ms, "model_name": MODEL_NAME}
 
                 return {"error": f"No inference handler for engine={ENGINE}, type={tt}"}
             except Exception as exc:
@@ -5950,18 +7998,16 @@ def _poll_model_job(ray_dashboard_url: str, submission_id: str, serve_url: str, 
 
 
 def _submit_model_deploy(ray_dashboard_url: str, payload: dict, serve_url: str, job_id: str, max_wait: int = 600) -> None:
-    """Deploy model as a named Ray Actor via Ray Client subprocess.
-    Avoids Ray Serve (numpy ABI mismatch) and Job Agent (not running on this cluster).
-    Named detached actors persist on the cluster after the subprocess exits.
+    """Deploy model as a named Ray Actor via Ray Jobs API.
+    Named detached actors persist on the cluster after the job exits.
     """
-    import subprocess, sys, tempfile, os as _os
+    import subprocess, sys, tempfile, os as _os, requests as _req, json as _json
     state = _get_model_deploy_state(job_id)
     env_vars = payload.get("runtime_env", {}).get("env_vars", {})
 
-    # Derive ray:// address from dashboard URL
     from urllib.parse import urlparse as _urlparse
     _p = _urlparse(ray_dashboard_url)
-    _ray_addr = f"ray://{_p.hostname}:10001"
+    _dashboard = f"{_p.scheme}://{_p.netloc}"
 
     # Phase 1: wait for at least one worker
     state["logs"] = ["Checking Ray cluster for available workers…"]
@@ -5979,56 +8025,85 @@ def _submit_model_deploy(ray_dashboard_url: str, payload: dict, serve_url: str, 
         state.update(status="error", logs=["Timed out — no Ray workers came online."])
         return
 
-    # Phase 2: run actor deployment script in a subprocess (Ray Client, no Ray Serve)
-    state["logs"] = ["Loading model weights and creating Ray actor (this may take several minutes)…"]
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+    # Phase 2: write actor script and submit via Ray Jobs API
+    state["logs"] = ["Submitting model deploy via Ray Jobs API…"]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir="/tmp") as f:
         f.write(_RAY_ACTOR_PY)
         script_path = f.name
+    # Read the script and embed as base64 in the entrypoint to avoid working_dir
+    import base64 as _b64lib
+    with open(script_path, "rb") as _f:
+        _script_b64 = _b64lib.b64encode(_f.read()).decode()
 
-    remaining = max(60, int(deadline - time.time()))
+    remaining = max(600, int(deadline - time.time()))
     try:
-        proc_env = {**_os.environ, **env_vars, "RAY_ADDRESS": _ray_addr}
-        result = subprocess.run(
-            [sys.executable, script_path],
-            env=proc_env,
-            capture_output=True,
-            text=True,
-            timeout=remaining,
-        )
+        # Send the script via env var to avoid "Argument list too long" (argv limit).
+        _deploy_env = dict(env_vars)
+        _deploy_env["MEDIMAGE_DEPLOY_SCRIPT_B64"] = _script_b64
+        _deploy_payload = {
+            "entrypoint": "bash -c 'echo $MEDIMAGE_DEPLOY_SCRIPT_B64 | base64 -d > /tmp/deploy_script.py && python3 /tmp/deploy_script.py'",
+            "runtime_env": {
+                "env_vars": _deploy_env,
+                "pip": ["transformers>=4.40,<5.0", "accelerate>=0.28", "Pillow",
+                        "boto3", "numpy<2.0", "torch", "peft>=0.10", "bitsandbytes>=0.43"],
+            },
+        }
+        _resp = _req.post(f"{_dashboard}/api/jobs/", json=_deploy_payload, timeout=30)
+        _resp.raise_for_status()
+        _submit_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+        state["logs"] = [f"Deploy job submitted: {_submit_id}. Waiting for completion…"]
+    except Exception as _e:
         try:
             _os.unlink(script_path)
         except Exception:
             pass
-
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-
-        if result.returncode != 0:
-            err = stderr[-600:] if stderr else stdout[-600:] or "Unknown error"
-            state.update(status="error", logs=[f"Deploy failed (exit {result.returncode}): {err}"])
-            return
-
-        if "ACTOR_READY:" not in stdout:
-            msg = stdout[-400:] if stdout else (stderr[-400:] if stderr else "No output from deploy script")
-            state.update(status="error", logs=[f"Deploy script completed but actor not ready: {msg}"])
-            return
-
-    except subprocess.TimeoutExpired:
-        try:
-            _os.unlink(script_path)
-        except Exception:
-            pass
-        state.update(status="error", logs=[f"Deploy timed out after {remaining}s — model weights may be too large to load"])
-        return
-    except Exception as exc:
-        try:
-            _os.unlink(script_path)
-        except Exception:
-            pass
-        state.update(status="error", logs=[f"Deploy subprocess error: {exc}"])
+        state.update(status="error", logs=[f"Deploy job submit failed: {_e}"])
         return
 
-    # Phase 3: actor is ready — update state and DB
+    # Phase 3: poll job status until done
+    _last_status = ""
+    while time.time() < deadline:
+        try:
+            _st = _req.get(f"{_dashboard}/api/jobs/{_submit_id}", timeout=10).json()
+            _ray_status = _st.get("status", "UNKNOWN")
+        except Exception:
+            _ray_status = _last_status
+        if _ray_status != _last_status:
+            state["logs"].append(f"Job status: {_ray_status}")
+            _last_status = _ray_status
+        if _ray_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+            break
+        time.sleep(5)
+    else:
+        try:
+            _os.unlink(script_path)
+        except Exception:
+            pass
+        state.update(status="error", logs=[f"Deploy timed out after {remaining}s"])
+        return
+
+    # Get logs
+    try:
+        _logs_resp = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=30)
+        _logs = _logs_resp.json().get("logs", "") if _logs_resp.ok else ""
+    except Exception:
+        _logs = ""
+    try:
+        _os.unlink(script_path)
+    except Exception:
+        pass
+
+    if _ray_status != "SUCCEEDED":
+        _tail = _logs[-500:] if _logs else "no logs"
+        state.update(status="error", logs=[f"Deploy failed ({_ray_status}): {_tail}"])
+        return
+
+    if "ACTOR_READY:" not in _logs:
+        _tail = _logs[-400:] if _logs else "no output"
+        state.update(status="error", logs=[f"Deploy completed but actor not ready: {_tail}"])
+        return
+
+    # Phase 4: actor is ready — update state and DB
     _actor_name = f"model-{job_id}"
     state.update(status="running", url=serve_url, logs=[f"Model actor '{_actor_name}' is running on Ray cluster!"])
     with get_db() as conn:
@@ -6241,6 +8316,171 @@ async def ray_clear_dead_nodes(request: Request):
     return {"cleared": cleared, "total_dead": len(seen), "errors": errors}
 
 
+@app.post("/api/ray/serve/stop-all")
+async def ray_serve_stop_all(request: Request):
+    """Stop every running Ray Serve deploy from the medimage API.
+
+    Called by the test-all bulk run as a pre-flight (and by the Stop-All
+    button on the Models page) to free the GPUs that persistent deploy
+    actors are holding. On a 4-GPU cluster, 4 deploys eat all the GPUs
+    and every subsequent training job sits PENDING until the reconciler
+    kills it — running stop-all first keeps the cluster usable for the
+    whole test-all sweep.
+
+    Two sources of actors to kill:
+      1. DB-tracked: jobs with ray_serve_url set + inference_provider='ray'
+      2. Orphan: any alive `model-*` actor on the cluster that the DB
+         doesn't know about (e.g. from a previous test-all run where the
+         API was restarted before the DB row was written)
+    """
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    import requests as _req
+    import base64 as _b64lib
+    import concurrent.futures as _cf
+
+    # 1) Collect DB-tracked deploys
+    with get_db() as conn:
+        db_rows = conn.execute(
+            "SELECT id, ray_serve_url FROM jobs "
+            "WHERE ray_serve_url != '' AND inference_provider='ray' "
+            "ORDER BY finished_at DESC"
+        ).fetchall()
+    db_ids = {r["id"] for r in db_rows}
+
+    # 2) Find orphan model-* actors (alive but not in DB)
+    orphan_actor_names = []
+    try:
+        _ar = _req.get(f"{RAY_URL}/api/v0/actors", timeout=5)
+        if _ar.ok:
+            for a in _ar.json().get("data", {}).get("result", {}).get("result", []):
+                name = a.get("name", "")
+                st = a.get("state", "")
+                if name.startswith("model-") and st == "ALIVE":
+                    jid = name[len("model-"):]
+                    if jid not in db_ids:
+                        orphan_actor_names.append(name)
+    except Exception:
+        pass
+
+    # Build work list: (job_id, actor_name). For DB-tracked, name =
+    # "model-{jid}". For orphans, name is what we discovered.
+    work = [(r["id"], f"model-{r['id']}") for r in db_rows] + \
+           [(None, name) for name in orphan_actor_names]
+    if not work:
+        return {"stopped": 0, "failed": 0, "orphans": 0, "ids": []}
+
+    # Stronger kill: no_restart=True (Ray supervisor can otherwise
+    # respawn the actor on the next health probe) + a follow-up
+    # ray.get_actor() check to confirm the death actually stuck.
+    # Without this, the actor state stays ALIVE for minutes even
+    # though ray.kill() returned — letting stale deploys keep
+    # holding the GPU.
+    def _kill_one(item) -> tuple[str | None, bool, str]:
+        jid, actor_name = item
+        kill_script = (
+            "import ray, sys, time, os\n"
+            "ray.init(address='auto', ignore_reinit_error=True, log_to_driver=False)\n"
+            "actor_name = os.environ.get('ACTOR_NAME','')\n"
+            "if not actor_name:\n"
+            "    print('NO_ACTOR_NAME', flush=True); sys.exit(1)\n"
+            "try:\n"
+            "    actor = ray.get_actor(actor_name, namespace='default')\n"
+            "    print(f'FOUND:{actor_name}', flush=True)\n"
+            "    ray.kill(actor, no_restart=True)\n"
+            "    print(f'KILLED:{actor_name}', flush=True)\n"
+            "    time.sleep(2)\n"
+            "    try:\n"
+            "        ray.get_actor(actor_name, namespace='default')\n"
+            "        print(f'STILL_ALIVE:{actor_name}', flush=True)\n"
+            "    except Exception:\n"
+            "        print(f'CONFIRMED_DEAD:{actor_name}', flush=True)\n"
+            "except Exception as e:\n"
+            "    print(f'NOT_FOUND:{e}', flush=True)\n"
+        )
+        b64 = _b64lib.b64encode(kill_script.encode()).decode()
+        try:
+            r = _req.post(
+                f"{RAY_URL}/api/jobs/",
+                json={"entrypoint": f"bash -c 'echo {b64} | base64 -d > /tmp/kill.py && ACTOR_NAME={actor_name} python3 /tmp/kill.py'",
+                      "runtime_env": {}},
+                timeout=15,
+            )
+            r.raise_for_status()
+            sub_id = r.json().get("submission_id") or r.json().get("job_id")
+            for _ in range(15):
+                time.sleep(1)
+                st = _req.get(f"{RAY_URL}/api/jobs/{sub_id}", timeout=5).json()
+                if st.get("status") in ("SUCCEEDED", "FAILED", "STOPPED"):
+                    break
+            if jid is not None:
+                with get_db() as _c:
+                    _c.execute("UPDATE jobs SET ray_serve_url='', inference_provider='' WHERE id=?", (jid,))
+                    _c.commit()
+            return (jid, True, "")
+        except Exception as e:
+            return (jid, False, str(e))
+
+    stopped, failed, errors = [], [], []
+    # Up to 4 kills in parallel (matches the cluster GPU count)
+    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(_kill_one, item) for item in work]
+        for f in _cf.as_completed(futs):
+            jid, ok, err = f.result()
+            if ok:
+                stopped.append(jid)
+            else:
+                failed.append(jid)
+                errors.append({"id": jid, "error": err})
+
+    # Wait until at least one GPU is free — same reason as the per-model
+    # stop endpoint above. The bulk loop's pre-flight calls this and then
+    # immediately submits the first training job, so we must hold until
+    # the cluster's GPU accounting reflects the freed slot.
+    try:
+        for _wait_i in range(30):
+            time.sleep(1)
+            _cs = _req.get(f"{RAY_URL}/api/cluster_status", timeout=4).json()
+            _ru = _cs.get("data", {}).get("autoscalingStatus", "")
+            try:
+                _gpu_chunk = _ru.split("ResourceUsage:")[1].split("\n")[0]
+                _used_g = float(_gpu_chunk.split("GPU,")[0].rsplit(" ", 1)[-1])
+                _total_g = float(_gpu_chunk.split("GPU,")[1].split(" ", 1)[0].rstrip("/"))
+                if _used_g < _total_g:
+                    break
+            except Exception:
+                pass
+        else:
+            pass  # caller will see PENDING; reconciler will clean up
+    except Exception:
+        pass
+
+    return {"stopped": len(stopped), "failed": len(failed), "orphans": len(orphan_actor_names), "ids": stopped, "errors": errors}
+
+
+@app.post("/api/ray/jobs/{submission_id}/stop")
+def ray_job_stop(submission_id: str, request: Request):
+    """Stop a single Ray job by submission_id. Used by the reconciler and the
+    test-all UI to free GPUs that are stuck on a PENDING job."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    ok = _stop_ray_submission(submission_id)
+    return {"stopped": ok, "submission_id": submission_id}
+
+
+@app.get("/api/ray/jobs/reconcile")
+def ray_reconcile(request: Request):
+    """Run one reconciliation pass: stop stuck PENDING Ray jobs + sync DB
+    state for finished jobs that the training thread forgot to update.
+    Returns a summary so the UI can show what was cleaned up."""
+    payload = _extract_token_payload(request)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
+    return _reconcile_ray_jobs()
+
+
 @app.post("/api/ray-serve/deploy")
 async def ray_infer_deploy(body: dict):
     ray_dashboard_url = (body.get("ray_dashboard_url") or "").rstrip("/")
@@ -6261,8 +8501,7 @@ async def ray_infer_deploy(body: dict):
     # Embed serve_app.py inline so no working_dir fetch needed
     script = _SERVE_APP_PY + textwrap.dedent("""
         import ray
-        if not ray.is_initialized():
-            ray.init(address="auto")
+        ray.init(address="auto", log_to_driver=False)
         serve.run(InferenceApp.bind(), name="medimage-inference", route_prefix="/")
         print("medimage-inference deployed successfully")
         import time
@@ -6276,7 +8515,7 @@ async def ray_infer_deploy(body: dict):
         "entrypoint": "python -c \"import base64,os; exec(base64.b64decode(os.environ['_SCRIPT']).decode())\"",
         "runtime_env": {
             "pip": ["ray[serve]", "fastapi", "uvicorn", "python-multipart", "pillow"],
-            "env_vars": {"_SCRIPT": script_b64},
+            "env_vars": {"_SCRIPT": script_b64, "RAY_ADDRESS": "", "RAY_ENABLE_AUTO_CONNECT": "0"},
         },
     }
 
@@ -6307,6 +8546,357 @@ def ray_infer_status_ep():
         "url": _ray_serve_state["url"],
         "logs": _ray_serve_state["logs"][-20:],
     }
+
+
+# ── GPU stats via nvidia-smi on Ray cluster ──────────────────────────────────
+_gpu_stats_cache: dict = {"ts": 0.0, "data": None}
+
+# ── GPU utilization cache: receives data from gpu-monitor sidecar ──────────
+# Structure: { "hostname1": {"util": 12.0, "gpus": [...], "ts": 1781...}, ... }
+_gpu_util_per_node: dict = {}
+
+# ── GPU status cache: consumes the team's /api/gpu-status (which already
+# filters to Ray-managed GPUs and attaches ray_node_index + ray_gpu_indices).
+# Keyed by ray_node_index so we can attribute data to the right Ray node
+# without brittle list-slicing across clusters.
+# Structure: {
+#   <ray_node_index>: {
+#     "hostname": "...", "internal_ip": "...",
+#     "ts": <float>, "gpus": [{"index","util_pct","power_watt",...}, ...]
+#   }, ...
+# }
+_gpu_status_cache: dict = {}
+GPU_STATUS_URL = os.getenv("GPU_STATUS_URL", f"{RAY_URL.rsplit(':', 1)[0]}:8085/api/gpu-status")
+
+# Per-GPU TDP map (Watts). Used as the denominator for power-based activity
+# estimation. Falls back to 700W (H200) when the model is unknown.
+GPU_TDP_W = {
+    "H200": 700, "H100": 700, "A100": 400, "L40S": 350, "L40": 300,
+    "A10": 150, "L4": 72, "T4": 70, "V100": 300, "A40": 300,
+    "RTX 4090": 450, "RTX 3090": 350, "RTX 3080": 320, "RTX A6000": 300,
+}
+
+
+def _tdp_for(name: str) -> int:
+    if not name:
+        return 700
+    n = name.upper()
+    for k, w in GPU_TDP_W.items():
+        if k.upper() in n:
+            return w
+    return 700
+
+
+def _estimate_activity_pct(util_pct: int, power_watt: float, tdp_w: int) -> int:
+    """nvidia-smi's utilization.gpu is a 1s rolling window that under-reports
+    whenever the GPU is mid-batch (data loader, sync, CPU prep). Power draw
+    is a more reliable proxy: idle H200 ≈ 30W, full load ≈ 700W. When
+    util_pct is 0 but power is significantly above idle (~50W+), report an
+    activity estimate derived from power."""
+    if util_pct and util_pct > 0:
+        return int(util_pct)
+    if power_watt and tdp_w > 0:
+        est = int(round(power_watt / tdp_w * 100))
+        return max(0, min(100, est))
+    return 0
+
+
+@app.put("/api/gpu-util")
+def update_gpu_util(body: dict):
+    """Endpoint for gpu-monitor sidecar containers to push real GPU utilization.
+    Accepts:
+      { "gpu_util_pct": 35.2, "hostname": "node1", "gpus": [{ "index": 0, "util_pct": 35, ... }] }
+    Or simple:
+      { "gpu_util_pct": 35.2 }
+    """
+    global _gpu_util_per_node
+    hostname = body.get("hostname", "")
+    util = float(body.get("gpu_util_pct", 0))
+    gpus = body.get("gpus", [])
+    ts = time.time()
+
+    if hostname:
+        _gpu_util_per_node[hostname] = {"util": util, "gpus": gpus, "ts": ts}
+    else:
+        # Legacy: cluster-wide average, store under empty key
+        _gpu_util_per_node[""] = {"util": util, "gpus": gpus, "ts": ts}
+
+    # Also write to file for persistence across restarts
+    try:
+        import json as _json
+        with open("/tmp/gpu_util_cache.json", "w") as f:
+            _json.dump({"per_node": _gpu_util_per_node, "ts": ts}, f)
+    except Exception:
+        pass
+
+    return {"ok": True, "hostname": hostname, "gpu_util_pct": util}
+
+
+def _get_cluster_gpu_util():
+    """Get cluster-wide average GPU utilization from sidecar cache."""
+    global _gpu_util_per_node
+
+    # Load from file if cache is empty (after restart)
+    if not _gpu_util_per_node:
+        try:
+            import json as _json
+            with open("/tmp/gpu_util_cache.json") as f:
+                cached = _json.load(f)
+                _gpu_util_per_node = cached.get("per_node", {})
+        except Exception:
+            pass
+
+    # Prune stale entries (> 60s old)
+    now = time.time()
+    _gpu_util_per_node = {k: v for k, v in _gpu_util_per_node.items() if now - v.get("ts", 0) < 60}
+
+    if not _gpu_util_per_node:
+        return 0.0, {}
+
+    # Calculate cluster average from all per-node entries
+    utils = [v["util"] for k, v in _gpu_util_per_node.items() if k and v.get("util", 0) > 0]
+    if utils:
+        return round(sum(utils) / len(utils), 1), _gpu_util_per_node
+
+    # Fallback to legacy cluster-wide value
+    legacy = _gpu_util_per_node.get("", {})
+    return legacy.get("util", 0), _gpu_util_per_node
+
+def _poll_gpu_status():
+    """Fetch the team's /api/gpu-status (which filters to Ray-managed GPUs
+    and tags each with ray_node_index) and store it in _gpu_status_cache
+    keyed by ray_node_index. Runs as a daemon thread so the UI gets fresh
+    data without paying the per-request HTTP cost."""
+    global _gpu_status_cache
+    import requests as _req
+    while True:
+        try:
+            r = _req.get(GPU_STATUS_URL, timeout=5)
+            if r.ok:
+                nodes = r.json()
+                now = time.time()
+                new_cache = {}
+                for n in nodes:
+                    rni = n.get("ray_node_index")
+                    if rni is None:
+                        continue
+                    gpus = []
+                    for g in n.get("gpus", []):
+                        tdp = _tdp_for(g.get("name", ""))
+                        power = float(g.get("power_watt") or 0)
+                        util = int(g.get("util_pct") or 0)
+                        # dmon is a per-GPU object: {sm_pct, mem_pct, dec_pct,
+                        # enc_pct, jpg_pct, ofa_pct}. We surface sm_pct as the
+                        # canonical SM utilization (it averages over a 1s
+                        # window so it's less spiky than --query-gpu util.gpu)
+                        # and keep mem_pct around for a future memory-channel
+                        # chart.
+                        dmon = g.get("dmon") or {}
+                        sm_pct = int(dmon.get("sm_pct") or 0)
+                        dmon_mem_pct = int(dmon.get("mem_pct") or 0)
+                        gpus.append({
+                            "index": int(g.get("index", 0)),
+                            "name": g.get("name", "GPU"),
+                            "util_pct": util,
+                            "power_watt": power,
+                            "tdp_w": tdp,
+                            "activity_pct": _estimate_activity_pct(util, power, tdp),
+                            "sm_pct": sm_pct,
+                            "dmon_mem_pct": dmon_mem_pct,
+                            "mem_used_mb": int(g.get("mem_used_mb") or 0),
+                            "mem_total_mb": int(g.get("mem_total_mb") or 0),
+                            "temp_c": int(g.get("temp_c") or 0),
+                        })
+                    new_cache[int(rni)] = {
+                        "hostname": n.get("hostname", "?"),
+                        "internal_ip": n.get("internal_ip", ""),
+                        "ts": now,
+                        "gpus": gpus,
+                    }
+                _gpu_status_cache = new_cache
+        except Exception as e:
+            print(f"[gpu-status] poll error: {e}", file=sys.stderr)
+        time.sleep(2)
+
+
+# Start the poller daemon (only once per process).
+if not getattr(_poll_gpu_status, "_started", False):
+    _t = threading.Thread(target=_poll_gpu_status, daemon=True, name="gpu-status-poller")
+    _t.start()
+    _poll_gpu_status._started = True
+
+
+@app.get("/api/ray/gpu-stats")
+def ray_gpu_stats():
+    """Return per-node GPU info from the Ray Dashboard API.
+    Since nvidia-smi cannot run on the head node (no NVML) and GPU resources
+    are fully allocated (blocking entrypoint_num_gpus jobs), we parse the
+    cluster status and node summary for allocation data instead."""
+    import requests as _req
+    now = time.time()
+    cached = _gpu_stats_cache.get("data")
+    if cached and (now - _gpu_stats_cache.get("ts", 0)) < 5:
+        return cached
+
+    nodes_data = []
+    total_gpu_allocated = 0
+    total_gpu_count = 0
+    total_cpu_pct = 0
+
+    # 1. Get cluster-level + per-node resource usage from cluster_status
+    node_gpu_usage: dict[str, dict] = {}
+    try:
+        cs = _req.get(f"{RAY_URL}/api/cluster_status", timeout=5).json()
+        lmr = cs.get("data", {}).get("clusterStatus", {}).get("loadMetricsReport", {})
+        usage = lmr.get("usage", {})
+        total_cpu_pct = (usage.get("CPU", [0, 1])[0] / usage.get("CPU", [0, 1])[1] * 100) if usage.get("CPU", [0, 1])[1] else 0
+        total_gpu_allocated = int(usage.get("GPU", [0, 0])[0])
+        total_gpu_count = int(usage.get("GPU", [0, 0])[1])
+        # Per-node usage from usageByNode
+        for _nid, nu in lmr.get("usageByNode", {}).items():
+            ng = nu.get("GPU", [0, 0])
+            ncpu = nu.get("CPU", [0, 0])
+            node_gpu_usage[_nid] = {
+                "gpu_alloc": int(ng[0]),
+                "gpu_total": int(ng[1]),
+                "cpu_pct": round(ncpu[0] / ncpu[1] * 100, 1) if ncpu[1] else 0,
+            }
+    except Exception:
+        pass
+
+    # 2. Fall back to local sidecar data if the team's endpoint isn't
+    # reachable. Used for the cluster-wide average only — per-GPU detail
+    # comes from the team's cache below.
+    _cluster_gpu_util, _per_node_util = _get_cluster_gpu_util()
+    _max_gpu_detail: list = []
+    for _nk, _nv in _per_node_util.items():
+        if _nk:
+            _ngpus = _nv.get("gpus", [])
+            if len(_ngpus) > len(_max_gpu_detail):
+                _max_gpu_detail = _ngpus
+
+    # Build per-node GPU count from usageByNode (Ray knows how many GPUs
+    # each node registered via --num-gpus, which is the correct count for
+    # NVLink clusters where nvidia-smi shows ALL GPUs on every node).
+    _node_gpu_total_by_id: dict[str, int] = {}
+    for _nid, _nu in node_gpu_usage.items():
+        _gt = _nu.get("gpu_total", 0)
+        if _gt > 0:
+            _node_gpu_total_by_id[_nid] = _gt
+
+    # Prune stale entries from the team's gpu-status cache (older than 30s).
+    _status_ts_fresh = {k: v for k, v in _gpu_status_cache.items() if now - v.get("ts", 0) < 30}
+
+    # 4. Get per-node details from nodes?view=summary
+    try:
+        ns = _req.get(f"{RAY_URL}/nodes?view=summary", timeout=5).json()
+        for n_idx, n in enumerate(ns.get("data", {}).get("summary", [])):
+            hn = n.get("hostname", "?")
+            if hn.startswith("?"):
+                continue
+            ip = n.get("ip", "")
+            cpu_pct = n.get("cpu", 0)
+            mem_info = n.get("mem", [0, 0, 0, 0])
+            mem_total = mem_info[1] if len(mem_info) > 1 else 0
+            mem_used = mem_info[3] if len(mem_info) > 3 else 0
+
+            # GPU count: prefer Ray's per-node total from usageByNode,
+            # then resourcesTotal, then worker slots (in that order).
+            node_id = n.get("raylet", {}).get("nodeId", "")
+            gpus_from_ray = _node_gpu_total_by_id.get(node_id, 0)
+            gpus_from_resources = round(n.get("raylet", {}).get("resourcesTotal", {}).get("GPU", 0))
+            gpu_count = gpus_from_ray or gpus_from_resources or 0
+
+            # Per-GPU detail: prefer the team's gpu-status (already filtered
+            # to Ray-managed GPUs and keyed by ray_node_index). Fall back to
+            # the local sidecar slice (works for NVLink, wrong for heterogeneous
+            # clusters) and finally to an empty list.
+            node_gpus_detail: list = []
+            node_gpu_util = 0.0
+            rni = n.get("raylet", {}).get("nodeIndex") if isinstance(n.get("raylet"), dict) else None
+            # Try a few ways to match: explicit ray_node_index from the team's
+            # feed, then n_idx (positional match), then IP.
+            status_match = _status_ts_fresh.get(n_idx)
+            if status_match is None and ip:
+                for v in _status_ts_fresh.values():
+                    if v.get("internal_ip") == ip:
+                        status_match = v
+                        break
+            if status_match:
+                node_gpus_detail = status_match.get("gpus", [])
+                if node_gpus_detail:
+                    node_gpu_util = round(
+                        sum(g["activity_pct"] for g in node_gpus_detail) / len(node_gpus_detail), 1
+                    )
+            elif _max_gpu_detail and gpu_count > 0:
+                # Legacy fallback: slice the longest sidecar array. Correct
+                # only for NVLink clusters where every node sees every GPU.
+                node_gpus_detail = _max_gpu_detail[:gpu_count]
+                if _cluster_gpu_util > 0:
+                    node_gpu_util = _cluster_gpu_util
+
+            nodes_data.append({
+                "hostname": hn,
+                "ip": ip,
+                "cpu_pct": round(cpu_pct, 1),
+                "mem_total_bytes": mem_total,
+                "mem_used_bytes": mem_used,
+                "gpus_allocated": gpu_count,
+                "gpu_util_pct": round(node_gpu_util, 1),
+                "gpus_detail": node_gpus_detail,
+            })
+    except Exception:
+        pass
+
+    # Cluster-wide activity: prefer the team's data (which uses
+    # power-based activity estimation), fall back to sidecar cluster avg.
+    team_activity_values = []
+    for v in _status_ts_fresh.values():
+        for g in v.get("gpus", []):
+            team_activity_values.append(g.get("activity_pct", 0))
+    if team_activity_values:
+        cluster_gpu_util = round(sum(team_activity_values) / len(team_activity_values), 1)
+        gpu_active_count = len(team_activity_values)
+    else:
+        cluster_gpu_util = _cluster_gpu_util
+        gpu_active_count = len(_max_gpu_detail)
+
+    result = {
+        "gpus_allocated": total_gpu_allocated,
+        "gpus_total": total_gpu_count or len(nodes_data),
+        "cpu_pct": round(total_cpu_pct, 1),
+        "nodes": nodes_data,
+        "cluster": {
+            "gpu_allocation_pct": round(total_gpu_allocated / total_gpu_count * 100, 1) if total_gpu_count else 0,
+            "gpu_util_pct": cluster_gpu_util,
+            "gpu_active_count": gpu_active_count,
+            "gpu_total_count": total_gpu_count or 0,
+        },
+    }
+    _gpu_stats_cache.update(ts=now, data=result)
+    return result
+
+
+@app.post("/api/deploy")
+async def deploy_model_generic(body: dict):
+    """Generic deploy endpoint used by test-all and DeployModels.
+    Accepts { job_id, model_id, model_name, provider }."""
+    job_id     = body.get("job_id", "") or body.get("model_id", "")
+    model_name = body.get("model_name", "")
+    provider   = body.get("provider", "ray")
+
+    if provider == "ray":
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, status, ray_serve_url, inference_provider FROM jobs WHERE id=? OR model_name=? ORDER BY created_at DESC LIMIT 1",
+                (job_id, model_name),
+            ).fetchone()
+        if row and row["status"] == "completed":
+            if row["inference_provider"] == "ray" and row["ray_serve_url"]:
+                return {"status": "running", "url": row["ray_serve_url"]}
+            return await deploy_model_to_ray(row["id"], body)
+        raise HTTPException(404, f"No completed training job found for model '{model_name}' (id={job_id})")
+    raise HTTPException(400, f"Provider '{provider}' not supported via /api/deploy. Use /api/jobs/{{id}}/deploy-ray directly.")
 
 
 @app.post("/api/jobs/{job_id}/deploy-ray")
@@ -6350,6 +8940,8 @@ async def deploy_model_to_ray(job_id: str, body: dict = {}):
         pip_base += ["ultralytics"]
     elif engine == "MONAI":
         pip_base += ["torch", "torchvision", "monai"]
+    elif engine == "HuggingFace":
+        pip_base += ["torch", "torchvision", "transformers", "accelerate"]
     elif tt == "classification":
         pip_base += ["torch", "torchvision", "timm"]
     elif tt == "segmentation" and engine == "Segmentation Models PyTorch":
@@ -6392,31 +8984,134 @@ async def deploy_model_to_ray(job_id: str, body: dict = {}):
 @app.get("/api/jobs/{job_id}/deploy-ray/status")
 def model_deploy_status(job_id: str):
     state = _get_model_deploy_state(job_id)
-    return {
-        "status": state["status"],
-        "url": state["url"],
-        "logs": state["logs"][-20:],
-    }
+    # If in-memory state shows we're working (deploying) or done (running)
+    # and we've already resolved a URL, trust it.
+    if state["status"] in ("deploying", "running") and state.get("url"):
+        return {
+            "status": state["status"],
+            "url": state["url"],
+            "logs": state["logs"][-20:],
+        }
+    # Fallback: in-memory state was reset (e.g. after API restart). Read
+    # the persisted deployment from the DB so the UI can offer Stop /
+    # Undeploy on already-deployed models.
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT inference_provider, ray_serve_url, modal_url FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return {"status": "idle", "url": None, "logs": []}
+    provider = (row["inference_provider"] or "").strip()
+    ray_url  = (row["ray_serve_url"] or "").strip()
+    if provider == "ray" and ray_url:
+        return {
+            "status": "running",
+            "url":    ray_url,
+            "logs":   ["Recovered from DB after API restart"],
+        }
+    return {"status": "idle", "url": None, "logs": []}
 
 
 @app.post("/api/jobs/{job_id}/deploy-ray/stop")
 def model_deploy_stop(job_id: str):
-    """Kill the named Ray Actor for this model."""
+    """Kill the named Ray Actor for this model via Ray Jobs API (no Ray Client)."""
     actor_name = f"model-{job_id}"
-    ray_client_addr = "ray://100.68.53.118:10001"
     logs = []
     try:
-        import ray as _ray
-        if not _ray.is_initialized():
-            _ray.init(address=ray_client_addr, ignore_reinit_error=True, log_to_driver=False)
+        import requests as _req
+        import base64 as _b64lib
+        # Stronger kill: no_restart=True (otherwise Ray's supervisor may
+        # respawn the actor on the next health probe) + a follow-up
+        # ray.get_actor() check to confirm the death actually stuck
+        # before returning. The previous plain ray.kill() reported
+        # KILLED but the actor state stayed ALIVE for minutes, which
+        # let stale deploys keep holding GPU resources.
+        _kill_script = (
+            "import ray, sys, time, os\n"
+            "ray.init(address='auto', ignore_reinit_error=True, log_to_driver=False)\n"
+            "actor_name = os.environ.get('ACTOR_NAME','')\n"
+            "if not actor_name:\n"
+            "    print('NO_ACTOR_NAME', flush=True); sys.exit(1)\n"
+            "try:\n"
+            "    actor = ray.get_actor(actor_name, namespace='default')\n"
+            "    print(f'FOUND:{actor_name}', flush=True)\n"
+            "    ray.kill(actor, no_restart=True)\n"
+            "    print(f'KILLED:{actor_name}', flush=True)\n"
+            "    time.sleep(2)\n"
+            "    try:\n"
+            "        ray.get_actor(actor_name, namespace='default')\n"
+            "        print(f'STILL_ALIVE:{actor_name}', flush=True)\n"
+            "    except Exception:\n"
+            "        print(f'CONFIRMED_DEAD:{actor_name}', flush=True)\n"
+            "except Exception as e:\n"
+            "    print(f'NOT_FOUND:{e}', flush=True)\n"
+        )
+        _b64 = _b64lib.b64encode(_kill_script.encode()).decode()
+        _payload = {
+            "entrypoint": f"bash -c 'echo {_b64} | base64 -d > /tmp/kill_actor.py && ACTOR_NAME={actor_name} python3 /tmp/kill_actor.py'",
+            "runtime_env": {},
+        }
+        # Use the same dashboard URL as deploy
+        _dashboard = "http://100.68.53.118:8265"
+        _resp = _req.post(f"{_dashboard}/api/jobs/", json=_payload, timeout=15)
+        _resp.raise_for_status()
+        _submit_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+        # Wait for completion (kill should be fast)
+        for _ in range(20):
+            time.sleep(1)
+            try:
+                _st = _req.get(f"{_dashboard}/api/jobs/{_submit_id}", timeout=5).json()
+                if _st.get("status") in ("SUCCEEDED", "FAILED", "STOPPED"):
+                    break
+            except Exception:
+                pass
+        # Fetch result from logs
         try:
-            _actor = _ray.get_actor(actor_name, namespace="default")
-            _ray.kill(_actor)
-            logs.append(f"[stop] Actor '{actor_name}' killed successfully")
-        except ValueError:
-            logs.append(f"[stop] Actor '{actor_name}' not found (already stopped)")
+            _lr = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=10)
+            if _lr.ok:
+                _lt = _lr.json().get("logs", "")
+                if "CONFIRMED_DEAD:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' killed + confirmed dead")
+                elif "KILLED:" in _lt and "STILL_ALIVE:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' kill reported but state stayed ALIVE — Ray supervisor didn't reap")
+                elif "KILLED:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' killed (verification inconclusive)")
+                elif "NOT_FOUND:" in _lt:
+                    logs.append(f"[stop] Actor '{actor_name}' not found (already stopped)")
+                else:
+                    logs.append(f"[stop] Job exited: {_lt[-200:]}")
+        except Exception as _e:
+            logs.append(f"[stop] Could not fetch kill job logs: {_e}")
     except Exception as e:
         logs.append(f"[stop] warning: {e}")
+    # After the actor is killed, wait until a GPU is actually free
+    # on the cluster. The kill completes on Ray's side but the resource
+    # accounting + actor reaping is async — without this wait the next
+    # training job submitted right after the stop API returns would
+    # still see "GPU: 4/4 used" and get stuck in PENDING. The test-all
+    # bulk loop calls this endpoint between every iteration precisely
+    # so we hold the loop until a GPU slot opens up.
+    try:
+        import requests as _req2
+        for _wait_i in range(30):  # up to ~30s
+            time.sleep(1)
+            _cs = _req2.get(f"{RAY_URL}/api/cluster_status", timeout=4).json()
+            _ru = _cs.get("data", {}).get("autoscalingStatus", "")
+            # ResourceUsage: 7.0/240.0 CPU, 4.0/4.0 GPU, ...
+            try:
+                _gpu_chunk = _ru.split("ResourceUsage:")[1].split("\n")[0]
+                _used_g = float(_gpu_chunk.split("GPU,")[0].rsplit(" ", 1)[-1])
+                _total_g = float(_gpu_chunk.split("GPU,")[1].split(" ", 1)[0].rstrip("/"))
+                if _used_g < _total_g:
+                    logs.append(f"[stop] GPU available: {_used_g}/{_total_g} (waited {_wait_i+1}s)")
+                    break
+            except Exception:
+                pass
+        else:
+            logs.append("[stop] GPU still not free after 30s — caller may see PENDING")
+    except Exception as _e:
+        logs.append(f"[stop] GPU-wait check failed (non-fatal): {_e}")
     # Clear DB state
     with get_db() as conn:
         conn.execute(
@@ -6523,6 +9218,100 @@ def delete_text_dataset(ds_id: str):
     return {"ok": True}
 
 
+@app.post("/api/text-datasets/create-sample")
+def create_sample_text_dataset(body: dict | None = None):
+    """Create a small sample text dataset for smoke-testing LLM/VLM training.
+
+    Writes a JSONL file with the requested format (alpaca | sharegpt |
+    plain) and registers it in the text_datasets table. If a sample
+    already exists, the existing id is returned.
+    """
+    body = body or {}
+    fmt = (body.get("format") or "alpaca").lower()
+    if fmt not in ("alpaca", "sharegpt", "plain"):
+        raise HTTPException(status_code=400, detail=f"Unknown format: {fmt}")
+    n_rows = int(body.get("rows") or 20)
+    n_rows = max(1, min(n_rows, 200))
+    name = (body.get("name") or f"sample-{fmt}").strip() or f"sample-{fmt}"
+
+    # If a sample with this name already exists, just return it.
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM text_datasets WHERE name = ?", (name,)
+        ).fetchone()
+    if existing:
+        d = dict(existing)
+        d.pop("preview", None)
+        return {"created": False, **d}
+
+    ds_id = str(uuid.uuid4())[:8]
+    save_dir = "/data/text-datasets"
+    _os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/{ds_id}.jsonl"
+
+    # Generate sample rows. Use small medical-industrial seed to make the
+    # smoke test reflect what the platform will actually fine-tune.
+    if fmt == "alpaca":
+        topics = [
+            ("What is the recommended torque for an M8 bolt?",
+             "For a standard M8 bolt (grade 8.8), apply 25 Nm of torque with a light oil film."),
+            ("How do I identify a defective PCB solder joint?",
+             "Look for: dull grainy surface, insufficient fillet, exposed copper pad, or a tombstone shape."),
+            ("What causes a YOLOv8 model to overfit on small datasets?",
+             "Insufficient data augmentation, too many epochs, batch size too small, or a backbone too large for the dataset size."),
+            ("How do I read a bearing fault vibration spectrum?",
+             "Identify the rotating frequency (1× RPM), then check for harmonics and sidebands; outer race defects appear at BPFO frequencies."),
+        ]
+        rows = [
+            {"instruction": inst, "input": "", "output": out}
+            for inst, out in (topics * ((n_rows // len(topics)) + 1))[:n_rows]
+        ]
+    elif fmt == "sharegpt":
+        topics = [
+            ("What is the difference between spot welding and projection welding?",
+             "Spot welding concentrates current at a single point via electrode tips; projection welding uses pre-formed projections on one workpiece to localize current without precision electrode alignment."),
+            ("How can I detect surface cracks in metal castings?",
+             "Use magnetic particle inspection for ferromagnetic alloys, or dye-penetrant testing for non-magnetic materials. Visual inspection under oblique lighting catches >0.5mm cracks."),
+            ("What is the optimal learning rate for fine-tuning a 7B LLM with LoRA?",
+             "For Unsloth 4-bit + LoRA r=16, start at 2e-4 with cosine schedule; reduce to 5e-5 if loss diverges in the first 50 steps."),
+        ]
+        rows = [
+            {"conversations": [
+                {"from": "human", "value": q},
+                {"from": "gpt",   "value": a},
+            ]}
+            for q, a in (topics * ((n_rows // len(topics)) + 1))[:n_rows]
+        ]
+    else:  # plain
+        topics = [
+            "Edge inference on Jetson Orin Nano achieves 25 FPS with quantized YOLOv8n at 320×320 input.",
+            "Defect recall improved from 0.78 to 0.91 after augmenting the training set with synthetic weld spatter overlays.",
+            "Ray cluster auto-scales from 1 to 8 workers based on queued job depth; the dashboard exposes live worker count.",
+        ]
+        rows = [{"text": t} for t in (topics * ((n_rows // len(topics)) + 1))[:n_rows]]
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    size_bytes = _os.path.getsize(save_path)
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO text_datasets (id, name, format, path, row_count, size_bytes, created_at) VALUES (?,?,?,?,?,?,?)",
+            (ds_id, name, fmt, save_path, len(rows), size_bytes, time.time()),
+        )
+        conn.commit()
+    return {
+        "created":   True,
+        "id":        ds_id,
+        "name":      name,
+        "format":    fmt,
+        "row_count": len(rows),
+        "size_bytes": size_bytes,
+        "path":      save_path,
+    }
+
+
 # ─── HuggingFace Dataset Import ──────────────────────────────────────────────
 
 _hf_import_jobs: dict = {}  # job_id → {status, progress, log, bucket, error, done_files, total_files}
@@ -6532,6 +9321,12 @@ class HFImportRequest(BaseModel):
     hf_dataset_id: str
     bucket_name: str
     max_files: int = 20
+    # Optional explicit list of file paths inside the repo. When
+    # provided, these are used verbatim (subject to max_files cap and
+    # the 200 MB per-file size guard). When None, the legacy
+    # "first N by priority (parquet → jsonl/json/csv → images → other)"
+    # behaviour is used as a fallback.
+    selected_files: list[str] | None = None
 
 
 def _log_hf(job_id: str, line: str):
@@ -6580,7 +9375,12 @@ def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
             raise Exception(f"HuggingFace API returned HTTP {r.status_code} — dataset not found or is private")
 
         entries = r.json()
-        blobs = [e for e in entries if e.get("type") == "blob"]
+        # HF tree API returns type='file' or 'lfs' (LFS pointer), NOT
+        # 'blob'. The old filter (`type == "blob"`) silently matched
+        # nothing, so every HF import was uploading 0 files even though
+        # the user had selected a real repo. This is what the picker
+        # in the UI is fixing too (src/pages/Datasets.tsx).
+        blobs = [e for e in entries if e.get("type") in ("file", "lfs")]
 
         # If no blobs at root, try data/ subdirectory
         if not blobs:
@@ -6603,7 +9403,17 @@ def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
             if p.endswith(".txt"): return 3
             return 9
 
-        blobs.sort(key=_prio)
+        # If the user picked specific files in the UI, use those
+        # verbatim. Otherwise fall back to "first N by priority".
+        if req.selected_files:
+            wanted = set(req.selected_files)
+            blobs = [b for b in blobs if b["path"] in wanted]
+            blobs.sort(key=_prio)
+            not_found = wanted - {b["path"] for b in blobs}
+            if not_found:
+                _log_hf(job_id, f"⚠ {len(not_found)} selected file(s) not in repo: {', '.join(list(not_found)[:3])}{'…' if len(not_found) > 3 else ''}")
+        else:
+            blobs.sort(key=_prio)
         blobs = blobs[:req.max_files]
         _log_hf(job_id, f"Found {len(blobs)} file(s) to download")
         job["progress"] = 15
@@ -6652,6 +9462,274 @@ def _run_hf_import(job_id: str, req: HFImportRequest, user_id: str = ""):
         job["status"] = "error"
         job["error"] = str(e)
         _log_hf(job_id, f"ERROR: {e}")
+
+
+@app.get("/api/datasets/inspect-hf-file")
+def inspect_hf_file(repo_id: str, path: str, request: Request):
+    """Inspect a file in a HuggingFace dataset repo.
+
+    For .zip archives: list the central directory via two HTTP Range
+    requests (last 256 KB to find the EOCD record, then the central
+    directory itself). NO full download — works even for multi-GB
+    archives. The user sees the file's internal structure before
+    committing to download hundreds of MB.
+
+    For .tar / .tar.gz / .tgz archives: we need the full file because
+    tar has no central directory — the entry headers are interleaved
+    with the file data. Capped at 200 MB.
+
+    For other files: return a stub (download URL) so the frontend can
+    show a "preview not supported for this file type" message.
+    """
+    import requests as _req
+    import zipfile as _zlib
+    import tarfile as _tarlib
+    import struct as _struct
+    import io as _io
+
+    _user_id = _current_user_id(request)
+    _hf_token = _load_user_hf_token(_user_id) or os.getenv("HF_TOKEN", "") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+    _hf_headers = {"Authorization": f"Bearer {_hf_token}"} if _hf_token else {}
+    _hf_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{path}"
+
+    p_lower = path.lower()
+    is_zip  = p_lower.endswith(".zip")
+    is_tar  = p_lower.endswith(".tar") or p_lower.endswith(".tar.gz") or p_lower.endswith(".tgz")
+    # Text-previewable file types: markdown, plain text, json, csv,
+    # yaml/yml, log. For these, we fetch a HEAD to get the size and a
+    # capped Range download for the body so big files don't pin the
+    # API. The body is returned as a UTF-8 string in the response.
+    is_text = any(p_lower.endswith(ext) for ext in (
+        ".md", ".txt", ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".log", ".xml", ".html", ".py", ".js", ".ts",
+    ))
+
+    if not (is_zip or is_tar or is_text):
+        return {
+            "kind": "unsupported",
+            "repo_id": repo_id,
+            "path": path,
+            "message": "Preview is available for archives (.zip / .tar / .tar.gz) and text files (.md / .txt / .json / .csv / .yaml / …).",
+            "download_url": _hf_url,
+        }
+
+    try:
+        if is_zip:
+            # ── Two-Range-request zip central directory parser ──────────
+            # 1) Get file size via HEAD (HF CDN returns Content-Length).
+            # 2) Range-fetch the last 256 KB to find the EOCD record
+            #    (EOCD signature PK\x05\x06 is at the very end, with up
+            #    to 65535 bytes of comment + 22 bytes of record — the last
+            #    256 KB window catches every EOCD even with max-length
+            #    comments and disk-spanning data descriptors).
+            # 3) Parse EOCD to find central directory offset + size.
+            # 4) Range-fetch exactly the central directory bytes.
+            # 5) Walk central directory entries, decoding per-entry
+            #    fields. No full file download — works for 10 GB zips.
+
+            head = _req.head(_hf_url, headers=_hf_headers, timeout=15, allow_redirects=True)
+            file_size = int(head.headers.get("Content-Length") or 0)
+            if file_size <= 0:
+                # Some HF mirrors don't return Content-Length on HEAD
+                # (LFS). Fall back to a single range request sized to
+                # a safe window starting at file_size-256KB.
+                file_size = None
+                tail = b""
+                r = _req.get(_hf_url, headers={**_hf_headers, "Range": "bytes=-262144"}, timeout=30)
+                if r.status_code == 206:
+                    tail = r.content
+                elif r.status_code == 200:
+                    # Server ignored Range and returned full file —
+                    # bail to the legacy full-download path below.
+                    tail = r.content
+                    file_size = len(tail)
+                # else: server returned 416 or error — fall through.
+            else:
+                tail_size = min(262144, file_size)
+                r = _req.get(
+                    _hf_url,
+                    headers={**_hf_headers, "Range": f"bytes={file_size - tail_size}-{file_size - 1}"},
+                    timeout=30,
+                )
+                tail = r.content if r.status_code == 206 else b""
+
+            if not tail:
+                # HEAD didn't return a size, or range request failed.
+                # Fall back to legacy full download (capped at 200 MB).
+                r = _req.get(_hf_url, headers=_hf_headers, timeout=120, stream=True)
+                buf = b""
+                total = 0
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    buf += chunk
+                    total += len(chunk)
+                    if total > 200 * 1024 * 1024:
+                        return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": total, "message": "Archive >200 MB; partial listing not supported yet."}
+                zf = _zlib.ZipFile(_io.BytesIO(buf))
+                entries = [{"path": i.filename, "size": i.file_size, "compressed": i.compress_size, "is_dir": i.is_dir()} for i in zf.infolist()]
+                zf.close()
+                entries.sort(key=lambda e: (not e["is_dir"], e["path"]))
+                return {
+                    "kind": "zip", "repo_id": repo_id, "path": path,
+                    "size_bytes": total, "entry_count": len(entries),
+                    "entries": entries[:500], "truncated": len(entries) > 500,
+                    "method": "full_download_fallback",
+                }
+
+            # 2) Find EOCD. Search backwards for the 4-byte signature.
+            eocd_idx = tail.rfind(b"PK\x05\x06")
+            if eocd_idx < 0:
+                # EOCD not in last 256 KB — file is malformed, or has
+                # a comment longer than 256 KB (ZIP spec max is 65535,
+                # so this means the file is broken). Fall back to full.
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Could not locate EOCD record in last 256 KB; archive may be malformed."}
+            eocd = tail[eocd_idx:eocd_idx + 22]
+            if len(eocd) < 22:
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Truncated EOCD record."}
+            _sig, disk_num, cd_disk, n_entries_this, n_entries_total, cd_size, cd_offset, comment_len = _struct.unpack("<IHHHHIIH", eocd)
+            if disk_num != 0 or cd_disk != 0:
+                # Multi-disk zip — not supported in partial-read mode
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Multi-disk zip not supported; full download required."}
+            if file_size is None:
+                # No Content-Length from HEAD; can't safely compute
+                # absolute offsets for the next Range request.
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": len(tail), "message": "Server did not return file size; cannot range-fetch central directory."}
+            # 3+4) Range-fetch the central directory (cd_offset is
+            # relative to the start of the archive).
+            cd_start = cd_offset
+            cd_end   = cd_offset + cd_size - 1
+            if cd_start + cd_size > file_size:
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": file_size, "message": "Central directory offset exceeds file size; archive may be truncated."}
+            r = _req.get(
+                _hf_url,
+                headers={**_hf_headers, "Range": f"bytes={cd_start}-{cd_end}"},
+                timeout=60,
+            )
+            if r.status_code != 206:
+                return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": file_size, "message": f"Central directory range request returned HTTP {r.status_code}."}
+            cd_bytes = r.content
+
+            # 5) Walk central directory entries. Each CD entry:
+            #   signature "PK\x01\x02" (4 bytes) + 42 bytes of fixed
+            #   fields + variable filename + extra + comment.
+            # Fixed fields (after sig): 11 H's + 5 I's = 16 placeholders,
+            # 42 bytes. Field order: ver ver_need flags method mod_time
+            #   mod_date crc(I) comp_size(I) uncomp_size(I) fname_len
+            #   extra_len comment_len disk_no int_attr ext_attr(I)
+            #   local_header_offset(I)
+            entries = []
+            i = 0
+            while i < len(cd_bytes) - 46:
+                if cd_bytes[i:i+4] != b"PK\x01\x02":
+                    break
+                (
+                    _v, _vm, _flags, _method, _mod_time, _mod_date,
+                    _crc, comp_size, uncomp_size,
+                    fname_len, extra_len, comment_len, _disk_no,
+                    _int_attr, _ext_attr, _local_off
+                ) = _struct.unpack(
+                    "<HHHHHHIIIHHHHHII", cd_bytes[i + 4:i + 46]
+                )
+                # Data-descriptor variant: if the GP flag is set, the
+                # 12-byte CRC/sizes are in a trailing data descriptor
+                # after the file data, not here. uncomp_size will be 0
+                # in that case. We don't need the real size for preview,
+                # so 0 is fine.
+                name = cd_bytes[i+46:i+46+fname_len].decode("utf-8", errors="replace")
+                # local_header_offset (start of the local file entry)
+                # is the most reliable pointer to the file's actual
+                # bytes — but we don't fetch the local headers for the
+                # preview, only the central directory.
+                is_dir = name.endswith("/")
+                entries.append({
+                    "path": name,
+                    "size": uncomp_size,
+                    "compressed": comp_size,
+                    "is_dir": is_dir,
+                })
+                i += 46 + fname_len + extra_len + comment_len
+            entries.sort(key=lambda e: (not e["is_dir"], e["path"]))
+            return {
+                "kind": "zip",
+                "repo_id": repo_id,
+                "path": path,
+                "size_bytes": file_size,
+                "entry_count": len(entries),
+                "entries": entries[:500],
+                "truncated": len(entries) > 500,
+                "method": "central_directory_range",  # the fast path
+            }
+        elif is_tar:
+            # tar — index is at the end too, but tar has no central
+            # directory. We need the whole file. Cap at 200 MB.
+            r = _req.get(_hf_url, headers=_hf_headers, timeout=300, stream=True)
+            total = 0
+            buf = b""
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                buf += chunk
+                total += len(chunk)
+                if total > 200 * 1024 * 1024:
+                    return {"kind": "too_large", "repo_id": repo_id, "path": path, "size_bytes": total, "message": "Archive >200 MB; partial listing not supported yet."}
+            tf = _tarlib.open(fileobj=_io.BytesIO(buf), mode="r:*")
+            entries = []
+            for info in tf:
+                entries.append({
+                    "path": info.name,
+                    "size": info.size,
+                    "is_dir": info.isdir(),
+                })
+            tf.close()
+            entries.sort(key=lambda e: (not e["is_dir"], e["path"]))
+            return {
+                "kind": "tar",
+                "repo_id": repo_id,
+                "path": path,
+                "size_bytes": total,
+                "entry_count": len(entries),
+                "entries": entries[:500],
+                "truncated": len(entries) > 500,
+            }
+        elif is_text:
+            # ── Text-file preview (.md / .txt / .json / .csv / …) ──
+            # Cap at 256 KB — enough for a README, JSON schema, or the
+            # first chunk of a CSV. Bigger files get truncated + a flag.
+            TEXT_PREVIEW_CAP = 256 * 1024
+            head = _req.head(_hf_url, headers=_hf_headers, timeout=15, allow_redirects=True)
+            file_size = int(head.headers.get("Content-Length") or 0) or None
+            r = _req.get(
+                _hf_url,
+                headers={**_hf_headers, "Range": f"bytes=0-{TEXT_PREVIEW_CAP - 1}"},
+                timeout=60,
+            )
+            if r.status_code == 206:
+                body_bytes = r.content
+            elif r.status_code == 200:
+                # Server ignored Range — cap the response ourselves.
+                body_bytes = r.content[:TEXT_PREVIEW_CAP]
+            else:
+                raise _req.HTTPError(r.status_code, f"HTTP {r.status_code}")
+            # Decode UTF-8 with replacement for binary files that
+            # happen to share an extension. The frontend renders
+            # whatever comes out as text.
+            try:
+                body_text = body_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                body_text = body_bytes.decode("utf-8", errors="replace")
+            truncated = (file_size is None and len(body_bytes) == TEXT_PREVIEW_CAP) or \
+                        (file_size is not None and file_size > len(body_bytes))
+            return {
+                "kind": "text",
+                "repo_id": repo_id,
+                "path": path,
+                "size_bytes": file_size,
+                "preview_bytes": len(body_bytes),
+                "truncated": truncated,
+                "content": body_text,
+            }
+    except _req.HTTPError as e:
+        raise HTTPException(e.response.status_code, f"HF download failed: {e.response.reason}")
+    except _zlib.BadZipFile:
+        raise HTTPException(400, "File is not a valid zip archive")
+    except Exception as e:
+        raise HTTPException(500, f"Inspect failed: {e}")
 
 
 @app.post("/api/datasets/import-hf")
@@ -7041,6 +10119,257 @@ def _normalize_inference_response(data: dict, training_type: str, model_name: st
     return data
 
 
+@app.get("/api/inference/history")
+async def list_inference_history(limit: int = 50, before: float = 0):
+    """List inference history, newest first. Pass `before` (timestamp) to paginate."""
+    limit = max(1, min(200, limit))
+    with get_db() as conn:
+        if before > 0:
+            rows = conn.execute(
+                "SELECT id, created_at, mode, model_id, model_name, model_type, "
+                "image_name, thumbnail_key, image_key, user_prompt, system_prompt, result_json, "
+                "inference_time_ms "
+                "FROM inference_history WHERE created_at < ? ORDER BY created_at DESC LIMIT ?",
+                (before, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, created_at, mode, model_id, model_name, model_type, "
+                "image_name, thumbnail_key, image_key, user_prompt, system_prompt, result_json, "
+                "inference_time_ms "
+                "FROM inference_history ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["result"] = json.loads(d.pop("result_json") or "{}")
+        except Exception:
+            d["result"] = {}
+        out.append(d)
+    return {"history": out}
+
+
+@app.get("/api/inference/thumbnail/{history_id}")
+async def get_inference_thumbnail(history_id: str):
+    """Stream the thumbnail image bytes from MinIO (no auth, no presign — internal only)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT thumbnail_key FROM inference_history WHERE id = ?",
+            (history_id,),
+        ).fetchone()
+    if not row or not row["thumbnail_key"]:
+        raise HTTPException(404, "Thumbnail not found")
+    key = row["thumbnail_key"]
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        from fastapi.responses import Response
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        obj = s3.get_object(Bucket="medimage-thumbnails", Key=key)
+        data = obj["Body"].read()
+        return Response(content=data, media_type="image/jpeg",
+                      headers={"Cache-Control": "private, max-age=3600"})
+    except HTTPException:
+        raise
+    except Exception as _e:
+        raise HTTPException(502, f"Could not fetch thumbnail: {_e}")
+
+
+@app.get("/api/inference/image/{history_id}")
+async def get_inference_image(history_id: str):
+    """Stream the ORIGINAL (full-res) image bytes from MinIO."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT image_key, image_name FROM inference_history WHERE id = ?",
+            (history_id,),
+        ).fetchone()
+    if not row or not row["image_key"]:
+        raise HTTPException(404, "Image not found")
+    key = row["image_key"]
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        from fastapi.responses import Response
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        obj = s3.get_object(Bucket="medimage-thumbnails", Key=key)
+        data = obj["Body"].read()
+        # Detect content type from extension
+        ext = key.rsplit(".", 1)[-1].lower() if "." in key else "jpg"
+        ct = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+              "webp": "image/webp", "bmp": "image/bmp", "gif": "image/gif",
+              "tif": "image/tiff", "tiff": "image/tiff", "dcm": "application/dicom"}.get(ext, "image/jpeg")
+        return Response(content=data, media_type=ct,
+                      headers={"Cache-Control": "private, max-age=3600"})
+    except HTTPException:
+        raise
+    except Exception as _e:
+        raise HTTPException(502, f"Could not fetch image: {_e}")
+
+
+@app.delete("/api/inference/history/{history_id}")
+async def delete_inference_history(history_id: str):
+    """Delete one history entry + its thumbnail."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT thumbnail_key FROM inference_history WHERE id = ?",
+            (history_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Not found")
+        conn.execute("DELETE FROM inference_history WHERE id = ?", (history_id,))
+        conn.commit()
+    if row["thumbnail_key"]:
+        try:
+            import boto3 as _boto3
+            from botocore.config import Config as _BConfig
+            s3 = _boto3.client(
+                "s3", endpoint_url=MINIO_URL,
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY,
+                config=_BConfig(signature_version="s3v4"),
+            )
+            s3.delete_object(Bucket="medimage-thumbnails", Key=row["thumbnail_key"])
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@app.delete("/api/inference/history")
+async def clear_inference_history():
+    """Delete ALL history entries + their thumbnails."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT thumbnail_key FROM inference_history").fetchall()
+        conn.execute("DELETE FROM inference_history")
+        conn.commit()
+    if rows:
+        try:
+            import boto3 as _boto3
+            from botocore.config import Config as _BConfig
+            s3 = _boto3.client(
+                "s3", endpoint_url=MINIO_URL,
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY,
+                config=_BConfig(signature_version="s3v4"),
+            )
+            keys = [{"Key": r["thumbnail_key"]} for r in rows if r["thumbnail_key"]]
+            if keys:
+                for i in range(0, len(keys), 1000):
+                    s3.delete_objects(Bucket="medimage-thumbnails", Delete={"Objects": keys[i:i+1000]})
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@app.get("/api/internal/weights-url")
+async def get_presigned_weights_url(bucket: str, key: str, expires: int = 600):
+    """Generate a presigned S3 URL for a weights object. Used by Ray actors
+    to download model weights via plain HTTP (avoids boto3 incompatibilities
+    on heterogeneous worker nodes)."""
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        url = s3.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires,
+        )
+        return {"url": url}
+    except Exception as _e:
+        raise HTTPException(502, f"Could not generate presigned URL: {_e}")
+
+
+@app.post("/api/inference/history")
+async def save_inference_history(req: Request):
+    """Save a new history entry. `thumbnail_base64` (optional) is decoded and uploaded to MinIO."""
+    import base64 as _b64, time as _time, uuid as _uuid
+    body = await req.json()
+    hist_id = body.get("id") or str(_uuid.uuid4())
+    user_id = body.get("user_id", "default")
+    mode = body.get("mode", "text")
+    model_id = body.get("model_id", "")
+    model_name = body.get("model_name", "")
+    model_type = body.get("model_type", "")
+    image_name = body.get("image_name", "")
+    user_prompt = body.get("user_prompt", "")
+    system_prompt = body.get("system_prompt", "")
+    result = body.get("result", {})
+    inference_time_ms = body.get("inference_time_ms", 0)
+    thumb_b64 = body.get("thumbnail_base64", "")
+    image_b64_input = body.get("image_base64", "")
+    thumbnail_key = ""
+    image_key = ""
+    try:
+        import boto3 as _boto3
+        from botocore.config import Config as _BConfig
+        s3 = _boto3.client(
+            "s3", endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=_BConfig(signature_version="s3v4"),
+        )
+        try:
+            s3.head_bucket(Bucket="medimage-thumbnails")
+        except Exception:
+            s3.create_bucket(Bucket="medimage-thumbnails")
+        # Thumbnail (small, used in history list)
+        if thumb_b64:
+            if "," in thumb_b64:
+                thumb_b64 = thumb_b64.split(",", 1)[1]
+            img_bytes = _b64.b64decode(thumb_b64)
+            if len(img_bytes) > 0:
+                thumbnail_key = f"{hist_id}_thumb.jpg"
+                s3.put_object(
+                    Bucket="medimage-thumbnails", Key=thumbnail_key,
+                    Body=img_bytes, ContentType="image/jpeg",
+                )
+        # Original image (full resolution, used to restore the drop box)
+        if image_b64_input:
+            if "," in image_b64_input:
+                image_b64_input = image_b64_input.split(",", 1)[1]
+            orig_bytes = _b64.b64decode(image_b64_input)
+            if len(orig_bytes) > 0:
+                ext = (image_name or "").split(".")[-1] if "." in (image_name or "") else "jpg"
+                # Cap at 25 MB to avoid quota bloat
+                if len(orig_bytes) <= 25 * 1024 * 1024:
+                    image_key = f"{hist_id}_orig.{ext}"
+                    s3.put_object(
+                        Bucket="medimage-thumbnails", Key=image_key,
+                        Body=orig_bytes,
+                        ContentType="image/jpeg" if ext == "jpg" else f"image/{ext}",
+                    )
+    except Exception as _e:
+        print(f"[history] upload failed: {_e}", flush=True)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO inference_history "
+            "(id, user_id, created_at, mode, model_id, model_name, model_type, "
+            " image_name, thumbnail_key, image_key, user_prompt, system_prompt, result_json, "
+            " inference_time_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hist_id, user_id, _time.time(), mode, model_id, model_name, model_type,
+             image_name, thumbnail_key, image_key, user_prompt, system_prompt,
+             json.dumps(result), inference_time_ms),
+        )
+        conn.commit()
+    return {"id": hist_id, "thumbnail_key": thumbnail_key, "image_key": image_key}
+
+
 @app.post("/api/inference")
 async def run_inference(
     model_id: str = FForm(...),
@@ -7067,29 +10396,114 @@ async def run_inference(
 
     # ── Universal external routing (Modal or Ray Serve) ──────────────────────
     async def _route_ray_client(serve_url: str, job_id_: str) -> dict:
-        """Call model Ray Actor via Ray Client (no Ray Serve dependency)."""
-        import ray as _ray, asyncio as _asyncio
-        _ray_addr = "ray://100.68.53.118:10001"
-        if not _ray.is_initialized():
-            _ray.init(address=_ray_addr, ignore_reinit_error=True, log_to_driver=False)
+        """Call model Ray Actor via Ray Jobs API (avoids Ray Client port issues)."""
+        import requests as _req, json as _json, logging as _logging, asyncio as _asyncio
+        import base64 as _b64, tempfile, os as _os
+        _log = _logging.getLogger("ray_infer")
+        _dashboard = "http://100.68.53.118:8265"
         _actor_name = f"model-{job_id_}"
-        try:
-            _actor = _ray.get_actor(_actor_name, namespace="default")
-        except Exception:
-            raise RuntimeError(f"Model actor '{_actor_name}' is not running. Please deploy the model first.")
+        _log.warning(f"[infer] Calling actor {_actor_name} via Ray Jobs API...")
+
         _img_bytes = None
         if image:
             _img_bytes = await image.read()
-        # ray.get() is blocking — run in executor to avoid blocking the async loop
-        _result = await _asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _ray.get(_actor.infer.remote(
-                _img_bytes, conf_threshold, prompt, system_prompt
-            ), timeout=120),
+
+        _img_b64 = _b64.b64encode(_img_bytes).decode() if _img_bytes else ""
+        _infer_timeout = (
+            600 if training_type in ("llm-text", "vlm-finetune")
+            else 600 if training_type == "segmentation"  # Mask R-CNN on CPU can be slow
+            else 120
         )
-        if isinstance(_result, dict) and _result.get("error"):
-            raise RuntimeError(_result["error"])
-        return _result
+
+        _script = textwrap.dedent("""\
+            import ray, json, sys, base64, time, os
+            ray.init(address="auto", ignore_reinit_error=True)
+            actor_name = os.environ.get("MEDIMAGE_ACTOR_NAME", "")
+            img_b64 = os.environ.get("MEDIMAGE_IMG_B64", "")
+            prompt = os.environ.get("MEDIMAGE_PROMPT", "")
+            sys_prompt = os.environ.get("MEDIMAGE_SYSTEM_PROMPT", "")
+            conf = float(os.environ.get("MEDIMAGE_CONF", "0.5"))
+            infer_timeout = int(os.environ.get("MEDIMAGE_INFER_TIMEOUT", "300"))
+            try:
+                actor = ray.get_actor(actor_name, namespace="default")
+            except Exception as e:
+                print(json.dumps({"error": f"Actor not found: {e}"}))
+                sys.exit(1)
+            for _i in range(120):
+                try:
+                    h = ray.get(actor.health.remote(), timeout=30)
+                    if h.get("ok") and h.get("model_loaded"):
+                        break
+                    if h.get("load_error"):
+                        print(json.dumps({"error": f"Model load failed: {h['load_error']}"}))
+                        sys.exit(1)
+                except Exception:
+                    time.sleep(5)
+            else:
+                print(json.dumps({"error": "Actor not ready after 600s"}))
+                sys.exit(1)
+            result = ray.get(actor.infer.remote(
+                img_b64, conf, prompt, sys_prompt
+            ), timeout=infer_timeout)
+            print("INFERENCE_RESULT:" + json.dumps(result))
+        """)
+        _script_b64 = _b64.b64encode(_script.encode()).decode()
+        # Send image + prompt via env vars (no argv limit)
+        _infer_env = {
+            "MEDIMAGE_IMG_B64": _img_b64,
+            "MEDIMAGE_PROMPT": prompt,
+            "MEDIMAGE_SYSTEM_PROMPT": system_prompt,
+            "MEDIMAGE_CONF": str(conf_threshold),
+            "MEDIMAGE_INFER_TIMEOUT": str(_infer_timeout),
+            "MEDIMAGE_ACTOR_NAME": _actor_name,
+        }
+        _payload = {
+            "entrypoint": "bash -c 'echo $MEDIMAGE_INFER_SCRIPT_B64 | base64 -d > /tmp/infer_runner.py && python3 /tmp/infer_runner.py'",
+            "runtime_env": {"env_vars": {**_infer_env, "MEDIMAGE_INFER_SCRIPT_B64": _script_b64}},
+        }
+        try:
+            _resp = _req.post(f"{_dashboard}/api/jobs/", json=_payload, timeout=15)
+            _resp.raise_for_status()
+            _submit_id = _resp.json().get("submission_id") or _resp.json().get("job_id")
+            _log.warning(f"[infer] Job submitted: {_submit_id}")
+        except Exception as _e:
+            _log.error(f"[infer] Job submit failed: {_e}")
+            raise RuntimeError(f"Failed to submit inference job: {_e}")
+
+        _deadline = time.time() + _infer_timeout + 60
+        while time.time() < _deadline:
+            try:
+                _st = _req.get(f"{_dashboard}/api/jobs/{_submit_id}", timeout=10).json()
+                _status = _st.get("status", "")
+            except Exception:
+                _status = "UNKNOWN"
+            if _status in ("SUCCEEDED", "FAILED", "STOPPED"):
+                break
+            await _asyncio.sleep(3)
+        else:
+            raise RuntimeError(f"Inference job timed out after {_infer_timeout + 60}s")
+
+        try:
+            _logs_resp = _req.get(f"{_dashboard}/api/jobs/{_submit_id}/logs", timeout=15)
+            _logs = _logs_resp.json().get("logs", "") if _logs_resp.ok else ""
+        except Exception:
+            _logs = ""
+
+        if _status != "SUCCEEDED":
+            _tail = _logs[-500:] if _logs else "no logs"
+            _log.error(f"[infer] Job {_submit_id} status={_status}: {_tail}")
+            raise RuntimeError(f"Inference failed ({_status}): {_tail}")
+
+        for _line in _logs.splitlines():
+            if _line.startswith("INFERENCE_RESULT:"):
+                _result = _json.loads(_line[len("INFERENCE_RESULT:"):])
+                _log.warning(f"[infer] Got result: {str(_result)[:200]}")
+                if isinstance(_result, dict) and _result.get("error"):
+                    raise RuntimeError(_result["error"])
+                return _result
+
+        _log.error(f"[infer] No INFERENCE_RESULT in logs: {_logs[-500:]}")
+        raise RuntimeError(f"Inference completed but no result found in output")
 
     async def _route_external(base_url: str, api_key: str) -> dict:
         # Modal fastapi_endpoint URLs are the endpoint itself (no path needed)
