@@ -4011,7 +4011,12 @@ def _run_on_ray_cluster(job: dict) -> None:
                                 if _payload.startswith("s3://"):
                                     _weights_path = _payload
                                 elif "/" in _payload and _payload.count("/") == 1:
-                                    _weights_path = f"s3://{_payload}"
+                                    # 2-part path like "jobid/best.pt" — assume
+                                    # the default medimage-weights bucket
+                                    # because the inline _VISION_TRAIN_SCRIPT's
+                                    # `print(f"WEIGHTS_UPLOADED:{w_key}")` (line
+                                    # ~2907) only emits the key, not the full URI.
+                                    _weights_path = f"s3://medimage-weights/{_payload}"
                                 else:
                                     _weights_path = f"s3://medimage-weights/{_payload}"
                     if _weights_path:
