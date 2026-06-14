@@ -2743,10 +2743,26 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
                                 cls_id, cx, cy, w, h = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
                                 boxes.append([cx, cy, w, h])
                                 labels.append(cls_id)
-                # DETR expects center format [cx,cy,w,h] normalised — matches YOLO
+                # COCO format expected by DETR/YOLOS ImageProcessor:
+                #   bbox = [x_top_left, y_top_left, width, height]  in ABSOLUTE pixels
+                #   category_id = int class index
+                #   area = w * h
+                #   iscrowd = 0
+                # The image processor's do_convert_annotations=True (default)
+                # then re-projects these to relative [cx, cy, w, h] in [0, 1] and
+                # builds the final {"class_labels": LongTensor, "boxes": FloatTensor}
+                # entry that YolosForObjectDetection.forward expects.
+                img_w, img_h = image.size
                 annotations = {"image_id": idx, "annotations": [
-                    {"bbox": b, "category_id": l, "area": b[2]*b[3], "iscrowd": 0}
-                    for b, l in zip(boxes, labels)
+                    {
+                        "bbox": [cx * img_w - w * img_w / 2,
+                                 cy * img_h - h * img_h / 2,
+                                 w * img_w, h * img_h],
+                        "category_id": l,
+                        "area": (w * img_w) * (h * img_h),
+                        "iscrowd": 0,
+                    }
+                    for (cx, cy, w, h), l in zip(boxes, labels)
                 ]}
                 return image, annotations
 
