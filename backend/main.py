@@ -2565,6 +2565,27 @@ def train_self_supervised(img_dir, model_name, epochs, imgsz, batch, lr, job_id,
     print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
 
 
+def _move_batch_to_device(batch, device):
+    """Recursively move every tensor inside a batch dict/list to ``device``.
+
+    HuggingFace detection pipelines return a dict like
+    ``{"pixel_values": Tensor, "labels": [{"boxes": Tensor, "class_labels": Tensor}, ...]}``
+    where ``labels`` is a list of per-image dicts. The simple top-level
+    ``{k: v.to(device) ...}`` loop only handles flat Tensor values and
+    leaves nested tensors on CPU, which then crashes the matcher with
+    ``Expected all tensors to be on the same device, but found at least
+    two devices, cuda:0 and cpu!``.
+    """
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: _move_batch_to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        moved = [_move_batch_to_device(v, device) for v in batch]
+        return type(batch)(moved) if isinstance(batch, tuple) else moved
+    return batch
+
+
 def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, optimizer,
                     job_id, w_bucket, w_key, minio_url, minio_access, minio_secret):
     """Fine-tune a HuggingFace vision model (DETR detection or ViT classification)."""
@@ -2686,7 +2707,9 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
                     f"\nUnderlying error: {_probe_err}"
                 ) from _probe_err
 
-    processor = AutoImageProcessor.from_pretrained(model_name)
+    processor = AutoImageProcessor.from_pretrained(
+        model_name, trust_remote_code=True, token=_hf_token or True
+    )
 
     if training_type == "detection":
         from transformers import AutoModelForObjectDetection
@@ -2729,7 +2752,9 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         _UNSUPPORTED_DET = ("grounding_dino", "owlvit", "owlv2", "sam", "gdino")
         try:
             from transformers import AutoConfig
-            _cfg_type = type(AutoConfig.from_pretrained(model_name)).__name__.lower()
+            _cfg_type = type(AutoConfig.from_pretrained(
+                model_name, trust_remote_code=True, token=_hf_token or True
+            )).__name__.lower()
             if any(u in _cfg_type for u in _UNSUPPORTED_DET):
                 raise RuntimeError(
                     f"Model '{model_name}' ({_cfg_type}) is a zero-shot / open-vocabulary detector "
@@ -2745,7 +2770,8 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         model = AutoModelForObjectDetection.from_pretrained(
             model_name, num_labels=num_classes,
             id2label=id2label, label2id=label2id,
-            ignore_mismatched_sizes=True
+            ignore_mismatched_sizes=True,
+            trust_remote_code=True, token=_hf_token or True,
         )
 
     elif training_type == "classification":
@@ -2777,7 +2803,8 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         model = AutoModelForImageClassification.from_pretrained(
             model_name, num_labels=num_classes,
             id2label=id2label, label2id=label2id,
-            ignore_mismatched_sizes=True
+            ignore_mismatched_sizes=True,
+            trust_remote_code=True, token=_hf_token or True,
         )
     else:
         raise RuntimeError(f"HuggingFace training not supported for type={training_type}")
@@ -2803,8 +2830,7 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         model.train()
         total_loss = 0.0
         for batch_enc in train_dl:
-            batch_enc = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                         for k, v in batch_enc.items()}
+            batch_enc = _move_batch_to_device(batch_enc, device)
             optimizer_fn.zero_grad()
             outputs = model(**batch_enc)
             loss = outputs.loss
@@ -2818,8 +2844,7 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
         val_loss = 0.0
         with torch.no_grad():
             for batch_enc in val_dl:
-                batch_enc = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch_enc.items()}
+                batch_enc = _move_batch_to_device(batch_enc, device)
                 outputs = model(**batch_enc)
                 val_loss += outputs.loss.item()
         avg_val = val_loss / max(len(val_dl), 1)
