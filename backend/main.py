@@ -3616,7 +3616,8 @@ main()
 '''
 
 
-def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO") -> str | None:
+def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO",
+                        training_type: str = "detection") -> str | None:
     """Export Label Studio YOLO dataset, upload zip to MinIO, return presigned download URL."""
     try:
         import requests as _req
@@ -3882,7 +3883,9 @@ def _run_on_ray_cluster(job: dict) -> None:
             or training_type_for_export == "classification"  # classification needs LS JSON for image + label lookup
         )
         _export_fmt = "JSON" if _needs_json else "YOLO"
-        dataset_url = _export_ls_to_minio(project_id, job_id, preferred_fmt=_export_fmt)
+        dataset_url = _export_ls_to_minio(project_id, job_id,
+                                       preferred_fmt=_export_fmt,
+                                       training_type=training_type_for_export)
         _append_log(job_id, "[cluster] Dataset exported and staged in MinIO ✓")
 
     weights_bucket = "medimage-weights"
