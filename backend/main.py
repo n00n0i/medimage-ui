@@ -2904,7 +2904,11 @@ def train_hf_vision(data_dir, model_name, training_type, epochs, batch, lr, opti
 
     print(f"[train] Best val_loss: {best_loss:.4f}")
     upload_to_minio(best_path, w_bucket, w_key, minio_url, minio_access, minio_secret)
-    print(f"WEIGHTS_UPLOADED:{w_key}")
+    # Emit the full s3:// URI, not just the key. The outer reconciler
+    # parses WEIGHTS_UPLOADED lines and verifies the object exists in
+    # MinIO; if the line only has the key, the parser has to guess
+    # the bucket (and the previous version of that guesser was buggy).
+    print(f"[train] WEIGHTS_UPLOADED: s3://{w_bucket}/{w_key}")
 
 
 def train_ultralytics(yaml_path, data_dir, model_name, training_type, epochs, imgsz, batch, lr, optimizer, job_id, w_bucket, w_key, minio_url, minio_access, minio_secret):
