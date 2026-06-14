@@ -153,6 +153,9 @@ export default function Jobs() {
 
   const connectWs = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState <= 1) return
+    if (keycloak.authenticated) {
+      keycloak.updateToken(30).catch(() => { /* refresh failed — try with what we have */ })
+    }
     const ws = new WebSocket(wsUrl())
     ws.onopen = () => setWsConnected(true)
     ws.onclose = () => {
