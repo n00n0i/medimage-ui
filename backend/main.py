@@ -3444,15 +3444,26 @@ def main():
 
     # 3e. MONAI medical imaging (classification or segmentation)
     elif engine == "MONAI":
-        # Auto-prepare images/ + masks/ from LS JSON annotations if not already present
-        med_data_dir = os.path.join(tmpdir, "monai_data")
-        if training_type == "segmentation" and not os.path.isdir(os.path.join(data_dir, "images")):
+        # Auto-prepare images/ + masks/ from LS JSON annotations. For
+        # segmentation we MUST build pixel-level masks — a YOLO-format
+        # zip (images/ + labels/.txt with polygon coords) is useless to
+        # MONAI's DiceLoss which expects a 1-channel mask per image.
+        # The check `not os.path.isdir(... images/)` is intentionally
+        # skipped: even when the YOLO conversion wrote images/, the
+        # labels/ siblings are polygons not masks, so we have to redo
+        # the prepare step. The data_dir name `monai_data` is kept
+        # separate from data_dir to avoid mixing the two layouts.
+        if training_type == "segmentation":
             json_data = _find_ls_json()
-            if json_data:
-                print("[monai] Auto-converting LS annotations → images/ + masks/")
-                prepare_segmentation_masks_from_json(json_data, med_data_dir, ls_url, ls_token)
-            else:
-                med_data_dir = data_dir  # fallback: use raw extracted zip
+            if not json_data:
+                raise RuntimeError(
+                    "MONAI segmentation needs the raw Label Studio JSON "
+                    "(annotations.json in the dataset zip) to build pixel "
+                    "masks. No JSON was found in the extracted zip."
+                )
+            med_data_dir = os.path.join(tmpdir, "monai_data")
+            print("[monai] Auto-converting LS annotations → images/ + masks/")
+            prepare_segmentation_masks_from_json(json_data, med_data_dir, ls_url, ls_token)
         elif training_type == "classification" and not os.path.isdir(os.path.join(data_dir, "images")):
             json_data = _find_ls_json()
             if json_data:
