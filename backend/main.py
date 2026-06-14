@@ -10,6 +10,7 @@ import os
 import sys
 import uuid
 import time
+import shutil
 import threading
 import sqlite3
 import json
@@ -1363,6 +1364,132 @@ def upload_to_minio(local_path, bucket, key, minio_url, minio_access, minio_secr
     return f"s3://{bucket}/{key}"
 
 
+def _convert_ls_json_to_yolo_zip(json_data: list, ls_url: str, ls_token: str,
+                                task: str, image_bytes_map: dict | None = None) -> bytes:
+    """Convert a Label Studio JSON export into a YOLO-format zip in memory.
+
+    Used by main()'s JSON→YOLO branch in the dataset prep stage. Lives
+    at module top level (rather than inside the _VISION_TRAIN_SCRIPT
+    raw string) so the API container can call it directly at runtime.
+
+    task='detect'  → cls + cx cy w h (normalised, 5 cols per line)
+    task='segment' → cls + polygon points (variable cols; rectanglelabels
+                     get expanded to a 4-corner polygon since LS
+                     rectanglelabels don't carry their own polygon
+                     vertices — that's enough for YOLO-seg's
+                     assign_targets stage which only needs the bbox
+                     anyway and won't crash on degenerate "boxes" that
+                     span the full image).
+    """
+    import base64 as _b64
+    import requests as _req
+    from PIL import Image as _Image
+    import io as _io
+    import tempfile as _tmpf
+    import zipfile as _zf
+    ls_url = ls_url.rstrip("/")
+    tmp = _tmpf.mkdtemp(prefix="yolozip_")
+    try:
+        images_dir = os.path.join(tmp, "images")
+        labels_dir = os.path.join(tmp, "labels")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        class_map: dict[str, int] = {}
+        for task_item in json_data:
+            image_url = task_item.get("data", {}).get("image", "")
+            if not image_url:
+                continue
+            task_id = task_item.get("id", "unknown")
+            fname = f"task_{task_id}.jpg"
+            img_path = os.path.join(images_dir, fname)
+            try:
+                if image_bytes_map and fname in image_bytes_map:
+                    img_bytes = image_bytes_map[fname]
+                elif image_url.startswith("data:"):
+                    _, data = image_url.split(",", 1)
+                    img_bytes = _b64.b64decode(data)
+                else:
+                    url = re.sub(r"https?://[^/]+", ls_url, image_url)
+                    r = _req.get(url, headers={"Authorization": f"Token {ls_token}"}, timeout=60)
+                    r.raise_for_status()
+                    img_bytes = r.content
+                _Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path, "JPEG")
+            except Exception as e:
+                print(f"[warn] Cannot fetch image task {task_id}: {e}")
+                continue
+            yolo_lines: list[str] = []
+            for ann in task_item.get("annotations", []):
+                for res in ann.get("result", []):
+                    val = res.get("value", {})
+                    res_type = res.get("type", "")
+                    if res_type == "polygonlabels" or "polygonlabels" in val:
+                        labels_list = val.get("polygonlabels", [])
+                        if not labels_list:
+                            continue
+                        label = labels_list[0]
+                        if label not in class_map:
+                            class_map[label] = len(class_map)
+                        cls_id = class_map[label]
+                        points = val.get("points", [])
+                        if len(points) < 3:
+                            continue
+                        norm_pts = " ".join(f"{p[0]/100:.6f} {p[1]/100:.6f}" for p in points)
+                        yolo_lines.append(f"{cls_id} {norm_pts}")
+                    elif res_type == "rectanglelabels" or "rectanglelabels" in val:
+                        labels_list = val.get("rectanglelabels", [])
+                        if not labels_list:
+                            continue
+                        label = labels_list[0]
+                        if label not in class_map:
+                            class_map[label] = len(class_map)
+                        cls_id = class_map[label]
+                        x_pct = float(val.get("x", 0))
+                        y_pct = float(val.get("y", 0))
+                        w_pct = float(val.get("width", 0))
+                        h_pct = float(val.get("height", 0))
+                        if task == "segment":
+                            # bbox → 4-corner polygon (YOLO-seg format)
+                            x1, y1 = x_pct / 100.0, y_pct / 100.0
+                            x2, y2 = (x_pct + w_pct) / 100.0, y1
+                            x3, y3 = x2, (y_pct + h_pct) / 100.0
+                            x4, y4 = x1, y3
+                            yolo_lines.append(
+                                f"{cls_id} {x1:.6f} {y1:.6f} {x2:.6f} {y2:.6f} "
+                                f"{x3:.6f} {y3:.6f} {x4:.6f} {y4:.6f}"
+                            )
+                        else:
+                            # YOLO detect: cx cy w h
+                            cx = (x_pct + w_pct / 2) / 100.0
+                            cy = (y_pct + h_pct / 2) / 100.0
+                            nw = w_pct / 100.0
+                            nh = h_pct / 100.0
+                            yolo_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+            if yolo_lines:
+                label_path = os.path.join(labels_dir, fname.replace(".jpg", ".txt"))
+                with open(label_path, "w") as lf:
+                    lf.write("\n".join(yolo_lines) + "\n")
+        if not class_map:
+            raise RuntimeError("No labelled bounding boxes found in JSON export")
+        names_list = [k for k, _ in sorted(class_map.items(), key=lambda kv: kv[1])]
+        yaml_path = os.path.join(tmp, "dataset.yaml")
+        with open(yaml_path, "w") as yf:
+            yf.write(f"path: .\n")
+            yf.write(f"train: images\n")
+            yf.write(f"val: images\n")
+            yf.write(f"nc: {len(names_list)}\n")
+            yf.write(f"names: {json.dumps(names_list)}\n")
+        buf = _io.BytesIO()
+        with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(tmp):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    arc = os.path.relpath(full, tmp)
+                    zf.write(full, arc)
+        return buf.getvalue()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # Vision training script (runs on Ray cluster — supports Ultralytics YOLO and PyTorch/TIMM)
 _VISION_TRAIN_SCRIPT = r'''
 import os, sys, re, json, zipfile, tempfile, shutil, random
@@ -1432,10 +1559,21 @@ def download_images_from_ls(json_data, out_dir, ls_url, ls_token):
     return downloaded
 
 
-def prepare_yolo_dataset_from_json(json_data, out_dir, ls_url, ls_token, task="detect"):
+def prepare_yolo_dataset_from_json(json_data, out_dir, ls_url, ls_token, task="detect",
+                                  image_bytes_map=None):
     """Convert Label Studio JSON export → YOLO detection or segmentation format.
-    task='detect'  → cx cy w h (normalised)
-    task='segment' → polygon points (4-corner rect from bbox, or actual polygonlabels)
+
+    task='detect'  → cls + cx cy w h (normalised, 5 cols per line)
+    task='segment' → cls + polygon points (variable cols; rectanglelabels get
+                     converted to a 4-corner polygon since LS rectanglelabels
+                     don't carry their own polygon vertices).
+
+    image_bytes_map (optional): dict[str, bytes] mapping filename → raw image
+    bytes. When provided, the function uses these instead of fetching via
+    ls_url/ls_token. Used by the inline JSON→YOLO zip conversion in
+    main() which already has the data-URI images decoded in memory and
+    needs to avoid a second round-trip through the Label Studio server.
+
     Creates out_dir/images/ and out_dir/labels/, then writes dataset.yaml.
     Returns path to dataset.yaml.
     """
@@ -1461,7 +1599,10 @@ def prepare_yolo_dataset_from_json(json_data, out_dir, ls_url, ls_token, task="d
 
         # Download / decode image
         try:
-            if image_url.startswith("data:"):
+            if fname in (image_bytes_map or {}):
+                # Caller already decoded the data URI / fetched the URL.
+                img_bytes = image_bytes_map[fname]
+            elif image_url.startswith("data:"):
                 _, data = image_url.split(",", 1)
                 img_bytes = _b64.b64decode(data)
             else:
@@ -3568,101 +3709,69 @@ def _export_ls_to_minio(project_id: int, job_id: str, preferred_fmt: str = "YOLO
         # found". Converting the JSON export to a proper YOLO zip
         # ourselves bypasses that plugin bug entirely.
         if fmt == "JSON":
-            import io, zipfile as _zipfile, json as _json
+            import io as _io, zipfile as _zipfile, json as _json
             json_data = _json.loads(export_data)
-            buf = io.BytesIO()
-            n_imgs = 0
-            n_lbls = 0
-            classes_seen: list[str] = []
-            class_to_idx: dict[str, int] = {}
-            with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
-                for _task in json_data:
-                    _img = _task.get("data", {}).get("image", "")
-                    if not _img:
-                        continue
-                    _stem = f"task_{_task.get('id', n_imgs)}"
-                    if _img.startswith("data:image/"):
-                        _m = _img.split(";", 1)[0].split("/", 2)[1]
-                        _ext = {"jpeg": "jpg", "jpg": "jpg", "png": "png"}.get(_m, "jpg")
-                        _b64 = _img.split(",", 1)[1]
-                        _zf_bytes = __import__("base64").b64decode(_b64)
-                    else:
-                        # URL — download later in training script via ls_url
-                        # (matches old YOLO export behaviour). Write a stub so
-                        # the dataset has the right structure, but the
-                        # training script's image downloader will fill it in.
-                        _ext = "jpg"
-                        _zf_bytes = b""
-                    _img_path = f"images/{_stem}.{_ext}"
-                    if _zf_bytes:
-                        zf.writestr(_img_path, _zf_bytes)
-                    n_imgs += 1
-                    # Labels: convert polygon/rectangle to YOLO bbox
-                    _lbl_lines: list[str] = []
-                    for _ann in _task.get("annotations", []):
-                        for _r in _ann.get("result", []):
-                            if _r.get("type") not in ("polygonlabels", "rectanglelabels", "labels"):
-                                continue
-                            _labels_in = _r.get("value", {}).get("rectanglelabels") or _r.get("value", {}).get("polygonlabels") or _r.get("value", {}).get("labels") or []
-                            if not _labels_in:
-                                continue
-                            _cls_name = _labels_in[0]
-                            if _cls_name not in class_to_idx:
-                                class_to_idx[_cls_name] = len(classes_seen)
-                                classes_seen.append(_cls_name)
-                            _cls = class_to_idx[_cls_name]
-                            # Read image dims (LS YOLO export uses image dims
-                            # from the original image; we use 100% of the
-                            # image as the box if the annotation is a polygon
-                            # spanning the whole image — close enough for
-                            # smoke-test data).
-                            _w = 1.0
-                            _h = 1.0
-                            if _r.get("type") == "rectanglelabels":
-                                _v = _r.get("value", {})
-                                _x = (_v.get("x", 0) + _v.get("width", 0) / 2) / 100
-                                _y = (_v.get("y", 0) + _v.get("height", 0) / 2) / 100
-                                _w = _v.get("width", 0) / 100
-                                _h = _v.get("height", 0) / 100
-                                _lbl_lines.append(f"{_cls} {_x:.6f} {_y:.6f} {_w:.6f} {_h:.6f}")
-                            elif _r.get("type") == "polygonlabels":
-                                # Polygon → bbox: take min/max of points.
-                                # The points are in percentages 0..100.
-                                _pts = _r.get("value", {}).get("points", [])
-                                if _pts:
-                                    _xs = [p[0] for p in _pts]
-                                    _ys = [p[1] for p in _pts]
-                                    _xmin, _xmax = min(_xs), max(_xs)
-                                    _ymin, _ymax = min(_ys), max(_ys)
-                                    _x = (_xmin + _xmax) / 2 / 100
-                                    _y = (_ymin + _ymax) / 2 / 100
-                                    _w = (_xmax - _xmin) / 100
-                                    _h = (_ymax - _ymin) / 100
-                                    _lbl_lines.append(f"{_cls} {_x:.6f} {_y:.6f} {_w:.6f} {_h:.6f}")
-                    if _lbl_lines:
-                        zf.writestr(f"labels/{_stem}.txt", "\n".join(_lbl_lines) + "\n")
-                        n_lbls += 1
-                # YOLO dataset.yaml
-                _yaml = (
-                    f"path: .\n"
-                    f"train: images\n"
-                    f"val: images\n"
-                    f"nc: {len(classes_seen)}\n"
-                    f"names: {classes_seen!r}\n"
+            # Pre-decode every data-URI image into a dict so the shared
+            # prepare_yolo_dataset_from_json() helper can reuse the bytes
+            # without round-tripping back through the Label Studio server.
+            # URL-only images are skipped here and fetched by the helper
+            # via ls_url/ls_token at the usual endpoint.
+            import base64 as _b64
+            _image_bytes_map: dict[str, bytes] = {}
+            for _task in json_data:
+                _img_url = _task.get("data", {}).get("image", "")
+                if not _img_url or not _img_url.startswith("data:"):
+                    continue
+                _stem = f"task_{_task.get('id', len(_image_bytes_map))}.jpg"
+                try:
+                    _, _b64data = _img_url.split(",", 1)
+                    _image_bytes_map[_stem] = _b64.b64decode(_b64data)
+                except Exception:
+                    pass
+
+            # Delegate to the module-level helper. For YOLO detection we
+            # use the standard bbox format (cx cy w h); for segmentation
+            # we use polygon points — both honour rectangle→polygon or
+            # polygon→polygon natively.
+            _yolo_task = "segment" if training_type == "segmentation" else "detect"
+            try:
+                export_data = _convert_ls_json_to_yolo_zip(
+                    json_data, ls_url, ls_token,
+                    task=_yolo_task, image_bytes_map=_image_bytes_map,
                 )
-                zf.writestr("dataset.yaml", _yaml)
-                # Also bundle the raw Label Studio JSON as
-                # annotations.json so engines that need it for
-                # re-parsing (SMP, TorchVision segmentation, MedSAM,
-                # Anomalib, MONAI) can find it via
-                # `_find_ls_json()` in the worker. Detection /
-                # classification YOLO scripts ignore it. The file
-                # duplicates the data already encoded in labels/,
-                # but it lets every engine share the same zip
-                # format without re-exporting from LS.
-                zf.writestr("annotations.json", json.dumps(json_data, ensure_ascii=False))
-            export_data = buf.getvalue()
-            _append_log(job_id, f"[export] JSON→YOLO conversion: {n_imgs} images, {n_lbls} labels, {len(classes_seen)} classes")
+            except RuntimeError as _prep_err:
+                raise RuntimeError(
+                    f"Failed to convert LS JSON → YOLO {_yolo_task} format: {_prep_err}"
+                )
+            # Re-bundle the raw LS JSON for engines that look for any
+            # *.json list-of-tasks manifest (_find_ls_json helper in
+            # train_hf_vision / train_pytorch_segmentation).
+            import io as _io2, zipfile as _zf2
+            _tmp_buf = _io2.BytesIO(export_data)
+            _out_buf = _io2.BytesIO()
+            with _zf2.ZipFile(_tmp_buf, "r") as _src_zf, _zf2.ZipFile(_out_buf, "w", _zf2.ZIP_DEFLATED) as _out_zf:
+                for _item in _src_zf.namelist():
+                    _out_zf.writestr(_item, _src_zf.read(_item))
+                _out_zf.writestr("annotations.json", json.dumps(json_data, ensure_ascii=False))
+            export_data = _out_buf.getvalue()
+            _n_imgs = sum(1 for _ in _image_bytes_map)
+            # Count labels in zip
+            _n_lbls = 0
+            with _zf2.ZipFile(_io2.BytesIO(export_data), "r") as _cnt_zf:
+                for _n in _cnt_zf.namelist():
+                    if _n.startswith("labels/") and _n.endswith(".txt"):
+                        _n_lbls += 1
+            _classes_seen: list[str] = []
+            try:
+                with _zf2.ZipFile(_io2.BytesIO(export_data), "r") as _cfg_zf:
+                    if "dataset.yaml" in _cfg_zf.namelist():
+                        import yaml as _yl
+                        _yd = _yl.safe_load(_cfg_zf.read("dataset.yaml"))
+                        if isinstance(_yd, dict) and "names" in _yd:
+                            _classes_seen = list(_yd["names"])
+            except Exception:
+                pass
+            _append_log(job_id, f"[export] JSON→YOLO ({_yolo_task}) conversion: {_n_imgs} images, {_n_lbls} labels, {len(_classes_seen)} classes")
             _append_log(job_id, f"[export] Wrapped converted YOLO into zip ({len(export_data)//1024} KB)")
             fmt = "YOLO"  # downstream code already handles YOLO zip
 
